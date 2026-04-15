@@ -84,6 +84,7 @@ class DynamicsNetwork(nn.Module):
             nn.Flatten(),
             mlp_head(latent_h * latent_w, fc_hidden, reward_out),
         )
+        _zero_init_last_linear(self.reward_head)
 
     def forward(self, hidden_state: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -134,6 +135,7 @@ class PredictionNetwork(nn.Module):
             nn.Flatten(),
             nn.Linear(2 * latent_h * latent_w, action_space_size),
         )
+        _zero_init_last_linear(self.policy_head)
 
         # Value head outputs categorical distribution
         value_out = 2 * value_support_size + 1
@@ -144,6 +146,7 @@ class PredictionNetwork(nn.Module):
             nn.Flatten(),
             mlp_head(latent_h * latent_w, fc_hidden, value_out),
         )
+        _zero_init_last_linear(self.value_head)
 
     def forward(self, hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -278,7 +281,10 @@ class MultiGameMuZeroNetwork(nn.Module):
         value_out = 2 * value_support_size + 1
         reward_out = 2 * reward_support_size + 1
 
-        # Game ID embeddings
+        # Game ID embeddings — defined but not yet wired up.
+        # To use: concatenate the embedding for the current game onto the hidden state
+        # before the shared backbone, so the network has an explicit "which game am I playing"
+        # signal. This may improve multi-game alignment if shared training underperforms.
         self.game_embeddings = nn.Embedding(len(self.game_names), game_id_dim)
 
         # Per-game input projections
@@ -314,6 +320,8 @@ class MultiGameMuZeroNetwork(nn.Module):
                 nn.Flatten(),
                 nn.Linear(2 * latent_h * latent_w, cfg["action_space"]),
             )
+            _zero_init_last_linear(self.policy_heads[name])
+
             self.value_heads[name] = nn.Sequential(
                 nn.Conv2d(hidden_planes, 1, 1, bias=False),
                 nn.BatchNorm2d(1),
@@ -321,16 +329,19 @@ class MultiGameMuZeroNetwork(nn.Module):
                 nn.Flatten(),
                 mlp_head(latent_h * latent_w, fc_hidden, value_out),
             )
+            _zero_init_last_linear(self.value_heads[name])
+
             self.reward_heads[name] = nn.Sequential(
                 nn.Conv2d(hidden_planes, 1, 1),
                 nn.Flatten(),
                 mlp_head(latent_h * latent_w, fc_hidden, reward_out),
             )
+            _zero_init_last_linear(self.reward_heads[name])
 
     def initial_inference(self, obs: torch.Tensor, game_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         proj = self.input_projections[game_name](obs)
         if proj.shape[-2:] != (self.latent_h, self.latent_w):
-            proj = F.interpolate(proj, size=(self.latent_h, self.latent_w), mode="bilinear", align_corners=False)
+            proj = _pad_to_size(proj, self.latent_h, self.latent_w)
         hidden = self.shared_repr_blocks(proj)
         hidden = _min_max_normalize(hidden)
         policy_logits = self.policy_heads[game_name](hidden)
@@ -365,7 +376,7 @@ class MultiGameMuZeroNetwork(nn.Module):
         """Returns (hidden_state, policy_logits, value_logits) for training."""
         proj = self.input_projections[game_name](obs)
         if proj.shape[-2:] != (self.latent_h, self.latent_w):
-            proj = F.interpolate(proj, size=(self.latent_h, self.latent_w), mode="bilinear", align_corners=False)
+            proj = _pad_to_size(proj, self.latent_h, self.latent_w)
         hidden = self.shared_repr_blocks(proj)
         hidden = _min_max_normalize(hidden)
         policy_logits = self.policy_heads[game_name](hidden)
@@ -403,11 +414,81 @@ class MultiGameMuZeroNetwork(nn.Module):
 
 
 def _min_max_normalize(x: torch.Tensor) -> torch.Tensor:
-    """Normalize tensor to [0, 1] per sample."""
-    b = x.shape[0]
-    x_flat = x.view(b, -1)
-    x_min = x_flat.min(dim=1, keepdim=True).values
-    x_max = x_flat.max(dim=1, keepdim=True).values
-    denom = (x_max - x_min).clamp(min=1e-8)
+    """Normalize hidden state to [0, 1] per (sample, channel).
+
+    Normalizes each channel independently rather than globally across all channels.
+    This preserves relative scale differences between channels — e.g. a channel
+    encoding piece count and a channel encoding mobility can have different ranges
+    and both get correctly scaled. Matches the muzero-general ResNet implementation
+    (see models.py representation/dynamics methods).
+
+    Previous implementation normalized globally per sample (view(b, -1)), which
+    collapsed all inter-channel scale information into a single [0,1] range.
+    """
+    b, c = x.shape[0], x.shape[1]
+    x_flat = x.view(b, c, -1)                                  # (B, C, H*W)
+    x_min = x_flat.min(dim=2, keepdim=True).values             # (B, C, 1)
+    x_max = x_flat.max(dim=2, keepdim=True).values             # (B, C, 1)
+    denom = (x_max - x_min).clamp(min=1e-5)
     x_flat = (x_flat - x_min) / denom
     return x_flat.view_as(x)
+
+
+def _zero_init_last_linear(module: nn.Module) -> None:
+    """Zero-initialize the last Linear layer in a module or nested Sequential.
+
+    Initializing output layers to zero means all heads predict zero at the start
+    of training. This avoids large initial gradients from random predictions and
+    improves early convergence stability. Used by LightZero (last_linear_layer_init_zero)
+    and recommended practice for value/policy/reward heads in MuZero variants.
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.zeros_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Sequential):
+        _zero_init_last_linear(module[-1])
+
+
+def _pad_to_size(x: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """Zero-pad a spatial tensor (B, C, H, W) to (B, C, target_h, target_w).
+
+    Padding is distributed evenly on both sides; if the difference is odd the
+    extra row/col goes on the right/bottom.
+
+    Why padding instead of bilinear interpolation:
+        Bilinear rescaling produces non-integer blended values that distort the
+        discrete piece-identity semantics of board games (e.g. Connect4 6x7 ->
+        8x8 via bilinear creates fractional "half-pieces"). Zero-padding
+        preserves every original cell exactly, and the network learns to ignore
+        the constant-zero border.
+
+    Alternatives considered:
+        1. Per-task encoder -> flat latent vector (ScaleZero 2025, current SOTA):
+           Each game's encoder maps its board to a fixed-size 1D vector; shared
+           dynamics operates on vectors rather than spatial tensors. Avoids the
+           alignment problem entirely but sacrifices the spatial inductive bias
+           of convolutions in the shared backbone.
+
+        2. Convert all game boards to native 8x8 (e.g. extend Connect4 to 8
+           columns, play tic-tac-toe on an 8x8 board with standard rules):
+           Cleanest option for the shared backbone — no padding artefacts — but
+           changes game semantics and requires rewriting game logic.
+
+        3. ViT / GNN backbone: patch tokenisation or graph message-passing
+           naturally handles variable board sizes without any spatial alignment.
+           Best choice if cross-size generalisation within a game family is a
+           goal (AlphaViT 2024, ScalableAlphaZero 2021).
+
+    Current choice: zero-padding to target_h x target_w (default 8x8).
+    Revisit if multi-game training underperforms single-game baselines.
+    """
+    h, w = x.shape[-2], x.shape[-1]
+    pad_h = target_h - h
+    pad_w = target_w - w
+    # F.pad format: (left, right, top, bottom)
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    return F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
