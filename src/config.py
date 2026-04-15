@@ -16,11 +16,12 @@ class MuZeroConfig:
     latent_h: int = 3
     latent_w: int = 3
     fc_hidden: int = 64
-    reward_support_size: int = 1  # scalar reward for board games
+    value_support_size: int = 10  # half-width of categorical support for value
+    reward_support_size: int = 1  # half-width of categorical support for reward
 
     # MCTS
     num_simulations: int = 25
-    c_puct: float = 1.25
+    c_puct: float = 1.25  # unused (dynamic pb_c used instead), kept for reference
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     temperature_init: float = 1.0
@@ -31,6 +32,7 @@ class MuZeroConfig:
     batch_size: int = 64
     lr: float = 1e-3
     weight_decay: float = 1e-4
+    value_loss_weight: float = 0.25  # downweight value loss (Reanalyze paper)
     num_unroll_steps: int = 5  # K: number of future steps to unroll
     td_steps: int = -1  # -1 means use full game return
     discount: float = 1.0  # 1.0 for board games (no discounting)

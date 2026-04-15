@@ -6,13 +6,14 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from ..config import MuZeroConfig, get_config
 from ..games import GAME_REGISTRY
 from ..model.muzero_net import MultiGameMuZeroNetwork
+from ..model.utils import scalar_transform, scalar_to_support
 from .replay_buffer import ReplayBuffer
 from .self_play import run_self_play
 
@@ -68,7 +69,7 @@ class MultiGameTrainer:
             self.network.parameters(), lr=1e-3, weight_decay=1e-4
         )
         use_amp = device.startswith("cuda")
-        self.scaler = GradScaler(enabled=use_amp)
+        self.scaler = GradScaler("cuda", enabled=use_amp)
         self.use_amp = use_amp
 
         self.writer = SummaryWriter(log_dir=log_dir)
@@ -147,25 +148,31 @@ class MultiGameTrainer:
         target_rewards = batch["target_rewards"].to(self.device)
         target_policies = batch["target_policies"].to(self.device)
 
+        value_support = self.network.value_support_size
+        reward_support = self.network.reward_support_size
+
         with autocast(device_type=self.device.split(":")[0], enabled=self.use_amp):
-            hidden, policy_logits, value = self.network.initial_inference(obs, game_name)
+            hidden, policy_logits, value_logits = self.network.initial_inference_logits(obs, game_name)
 
             policy_loss = -(target_policies[:, 0] * F.log_softmax(policy_logits, dim=1)).sum(1).mean()
-            value_loss = F.mse_loss(value.squeeze(-1), target_values[:, 0])
+            value_loss = self._categorical_loss(value_logits, target_values[:, 0], value_support)
             reward_loss = torch.tensor(0.0, device=self.device)
 
             for k in range(config.num_unroll_steps):
-                hidden, reward, policy_logits, value = self.network.recurrent_inference(
-                    hidden, actions[:, k], game_name
-                )
+                hidden, reward_logits, policy_logits, value_logits = \
+                    self.network.recurrent_inference_logits(hidden, actions[:, k], game_name)
                 hidden.register_hook(lambda grad: grad * 0.5)
 
                 policy_loss += -(target_policies[:, k+1] * F.log_softmax(policy_logits, dim=1)).sum(1).mean()
-                value_loss += F.mse_loss(value.squeeze(-1), target_values[:, k+1])
-                reward_loss += F.mse_loss(reward.squeeze(-1), target_rewards[:, k+1])
+                value_loss += self._categorical_loss(value_logits, target_values[:, k+1], value_support)
+                reward_loss += self._categorical_loss(reward_logits, target_rewards[:, k+1], reward_support)
 
             scale = 1.0 / (config.num_unroll_steps + 1)
-            total_loss = scale * (policy_loss + value_loss + reward_loss)
+            total_loss = scale * (
+                policy_loss
+                + config.value_loss_weight * value_loss
+                + reward_loss
+            )
 
         self.optimizer.zero_grad()
         self.scaler.scale(total_loss).backward()
@@ -177,9 +184,16 @@ class MultiGameTrainer:
         return {
             "total_loss": total_loss.item(),
             "policy_loss": (scale * policy_loss).item(),
-            "value_loss": (scale * value_loss).item(),
+            "value_loss": (scale * config.value_loss_weight * value_loss).item(),
             "reward_loss": (scale * reward_loss).item(),
         }
+
+    def _categorical_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,
+                          support_size: int) -> torch.Tensor:
+        """Cross-entropy loss for categorical value/reward prediction."""
+        transformed = scalar_transform(target_scalar)
+        target_dist = scalar_to_support(transformed, support_size).to(logits.device)
+        return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
 
     @torch.no_grad()
     def _evaluate(self, game_name: str, step: int):

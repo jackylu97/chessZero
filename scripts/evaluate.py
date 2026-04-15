@@ -40,6 +40,8 @@ def load_model(checkpoint_path: str, game, config, device: str):
         input_h=game.board_size[0],
         input_w=game.board_size[1],
         fc_hidden=config.fc_hidden,
+        value_support_size=config.value_support_size,
+        reward_support_size=config.reward_support_size,
     )
     checkpoint = torch.load(checkpoint_path, map_location=device)
     network.load_state_dict(checkpoint["model_state_dict"])

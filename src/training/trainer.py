@@ -5,13 +5,14 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from ..config import MuZeroConfig
 from ..games.base import Game
 from ..model.muzero_net import MuZeroNetwork
+from ..model.utils import scalar_transform, scalar_to_support
 from .replay_buffer import ReplayBuffer
 from .self_play import run_self_play
 
@@ -37,7 +38,7 @@ class MuZeroTrainer:
             lr=config.lr,
             weight_decay=config.weight_decay,
         )
-        self.scaler = GradScaler(enabled=config.use_amp)
+        self.scaler = GradScaler("cuda", enabled=config.use_amp)
         self.replay_buffer = ReplayBuffer(config.replay_buffer_size)
 
         self.writer = SummaryWriter(log_dir=os.path.join(log_dir, config.game))
@@ -125,30 +126,36 @@ class MuZeroTrainer:
         target_policies = batch["target_policies"].to(self.device)
 
         with autocast(device_type=self.device.split(":")[0], enabled=self.config.use_amp):
-            # Initial inference
-            hidden, policy_logits, value = self.network.initial_inference(obs)
+            # Initial inference (use logits variant for training)
+            hidden, policy_logits, value_logits = self.network.initial_inference_logits(obs)
 
             # Loss at root position (k=0)
             policy_loss = self._policy_loss(policy_logits, target_policies[:, 0])
-            value_loss = self._value_loss(value, target_values[:, 0])
+            value_loss = self._value_loss(value_logits, target_values[:, 0],
+                                          self.network.value_support_size)
             reward_loss = torch.tensor(0.0, device=self.device)  # no reward at root
 
             # Unroll K steps
             for k in range(self.config.num_unroll_steps):
-                hidden, reward, policy_logits, value = self.network.recurrent_inference(
-                    hidden, actions[:, k]
-                )
+                hidden, reward_logits, policy_logits, value_logits = \
+                    self.network.recurrent_inference_logits(hidden, actions[:, k])
 
                 # Scale gradient for dynamics network (MuZero paper Section 3)
                 hidden.register_hook(lambda grad: grad * 0.5)
 
                 policy_loss += self._policy_loss(policy_logits, target_policies[:, k + 1])
-                value_loss += self._value_loss(value, target_values[:, k + 1])
-                reward_loss += self._reward_loss(reward, target_rewards[:, k + 1])
+                value_loss += self._value_loss(value_logits, target_values[:, k + 1],
+                                               self.network.value_support_size)
+                reward_loss += self._reward_loss(reward_logits, target_rewards[:, k + 1],
+                                                 self.network.reward_support_size)
 
-            # Average losses over unroll steps
+            # Scale by 1/K and apply value loss weight (0.25 following Reanalyze paper)
             scale = 1.0 / (self.config.num_unroll_steps + 1)
-            total_loss = scale * (policy_loss + value_loss + reward_loss)
+            total_loss = scale * (
+                policy_loss
+                + self.config.value_loss_weight * value_loss
+                + reward_loss
+            )
 
         self.optimizer.zero_grad()
         self.scaler.scale(total_loss).backward()
@@ -160,7 +167,7 @@ class MuZeroTrainer:
         return {
             "total_loss": total_loss.item(),
             "policy_loss": (scale * policy_loss).item(),
-            "value_loss": (scale * value_loss).item(),
+            "value_loss": (scale * self.config.value_loss_weight * value_loss).item(),
             "reward_loss": (scale * reward_loss).item(),
         }
 
@@ -168,13 +175,24 @@ class MuZeroTrainer:
         """Cross-entropy loss between predicted policy and MCTS visit distribution."""
         return -(targets * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
 
-    def _value_loss(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """MSE loss for value prediction."""
-        return F.mse_loss(predicted.squeeze(-1), target)
+    def _value_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,
+                    support_size: int) -> torch.Tensor:
+        """Cross-entropy loss for categorical value prediction.
 
-    def _reward_loss(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """MSE loss for reward prediction."""
-        return F.mse_loss(predicted.squeeze(-1), target)
+        Target scalars are transformed and projected onto the discrete support.
+        """
+        # Apply scalar transform and convert to categorical target
+        transformed = scalar_transform(target_scalar)
+        target_dist = scalar_to_support(transformed, support_size).to(logits.device)
+        # Cross-entropy between predicted logits and target distribution
+        return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+
+    def _reward_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,
+                     support_size: int) -> torch.Tensor:
+        """Cross-entropy loss for categorical reward prediction."""
+        transformed = scalar_transform(target_scalar)
+        target_dist = scalar_to_support(transformed, support_size).to(logits.device)
+        return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
 
     def _log(self, loss_info: dict, step: int):
         """Log metrics to TensorBoard."""

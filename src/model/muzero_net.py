@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import ResidualBlock, mlp_head
+from .utils import ResidualBlock, mlp_head, support_to_scalar, inverse_scalar_transform
 
 
 class RepresentationNetwork(nn.Module):
@@ -42,7 +42,6 @@ class RepresentationNetwork(nn.Module):
         if self.needs_resize:
             x = F.interpolate(x, size=(self.latent_h, self.latent_w), mode="bilinear", align_corners=False)
         x = self.blocks(x)
-        # Normalize hidden state to [0, 1] range (MuZero paper recommendation)
         x = _min_max_normalize(x)
         return x
 
@@ -50,7 +49,8 @@ class RepresentationNetwork(nn.Module):
 class DynamicsNetwork(nn.Module):
     """g(hidden_state, action) -> (next_hidden_state, reward)
 
-    Action is encoded as a one-hot spatial plane broadcast over latent dims.
+    Action is encoded as a normalized scalar plane broadcast over latent dims.
+    Includes a residual skip connection from input hidden state.
     """
 
     def __init__(
@@ -61,27 +61,28 @@ class DynamicsNetwork(nn.Module):
         latent_h: int,
         latent_w: int,
         fc_hidden: int,
+        reward_support_size: int = 1,
     ):
         super().__init__()
         self.action_space_size = action_space_size
         self.latent_h = latent_h
         self.latent_w = latent_w
+        self.reward_support_size = reward_support_size
 
-        # Action encoded as a plane: hidden_planes + 1 action plane
-        self.conv_in = nn.Sequential(
-            nn.Conv2d(hidden_planes + 1, hidden_planes, 3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_planes),
-            nn.ReLU(),
-        )
+        # Conv to reduce channels after concatenating action plane
+        self.conv_in = nn.Conv2d(hidden_planes + 1, hidden_planes, 3, padding=1, bias=False)
+        self.bn_in = nn.BatchNorm2d(hidden_planes)
+
         self.blocks = nn.Sequential(
             *[ResidualBlock(hidden_planes) for _ in range(num_blocks)]
         )
 
-        # Reward head
+        # Reward head outputs categorical distribution
+        reward_out = 2 * reward_support_size + 1
         self.reward_head = nn.Sequential(
             nn.Conv2d(hidden_planes, 1, 1),
             nn.Flatten(),
-            mlp_head(latent_h * latent_w, fc_hidden, 1),
+            mlp_head(latent_h * latent_w, fc_hidden, reward_out),
         )
 
     def forward(self, hidden_state: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,7 +92,7 @@ class DynamicsNetwork(nn.Module):
             action: (B,) integer action indices
         Returns:
             next_hidden_state: (B, C, H, W)
-            reward: (B, 1)
+            reward_logits: (B, 2*support_size+1)
         """
         b = hidden_state.shape[0]
         # Encode action as a normalized scalar broadcast over spatial dims
@@ -100,11 +101,14 @@ class DynamicsNetwork(nn.Module):
 
         x = torch.cat([hidden_state, action_plane], dim=1)
         x = self.conv_in(x)
+        x = self.bn_in(x)
+        # Residual skip connection from input hidden state
+        x = F.relu(x + hidden_state)
         x = self.blocks(x)
         x = _min_max_normalize(x)
 
-        reward = self.reward_head(hidden_state)  # predict reward from current state
-        return x, reward
+        reward_logits = self.reward_head(x)
+        return x, reward_logits
 
 
 class PredictionNetwork(nn.Module):
@@ -117,8 +121,11 @@ class PredictionNetwork(nn.Module):
         latent_h: int,
         latent_w: int,
         fc_hidden: int,
+        value_support_size: int = 1,
     ):
         super().__init__()
+        self.value_support_size = value_support_size
+
         # Policy head
         self.policy_head = nn.Sequential(
             nn.Conv2d(hidden_planes, 2, 1, bias=False),
@@ -128,27 +135,32 @@ class PredictionNetwork(nn.Module):
             nn.Linear(2 * latent_h * latent_w, action_space_size),
         )
 
-        # Value head
+        # Value head outputs categorical distribution
+        value_out = 2 * value_support_size + 1
         self.value_head = nn.Sequential(
             nn.Conv2d(hidden_planes, 1, 1, bias=False),
             nn.BatchNorm2d(1),
             nn.ReLU(),
             nn.Flatten(),
-            mlp_head(latent_h * latent_w, fc_hidden, 1),
-            nn.Tanh(),  # value in [-1, 1] for board games
+            mlp_head(latent_h * latent_w, fc_hidden, value_out),
         )
 
     def forward(self, hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             policy_logits: (B, action_space_size)
-            value: (B, 1) in [-1, 1]
+            value_logits: (B, 2*support_size+1)
         """
         return self.policy_head(hidden_state), self.value_head(hidden_state)
 
 
 class MuZeroNetwork(nn.Module):
-    """Full MuZero network combining representation, dynamics, prediction."""
+    """Full MuZero network combining representation, dynamics, prediction.
+
+    Value and reward are represented as categorical distributions over a
+    discrete support {-support_size, ..., 0, ..., support_size}, following
+    the MuZero paper. This is more stable than scalar regression.
+    """
 
     def __init__(
         self,
@@ -161,9 +173,13 @@ class MuZeroNetwork(nn.Module):
         input_h: int = 6,
         input_w: int = 7,
         fc_hidden: int = 128,
+        value_support_size: int = 10,
+        reward_support_size: int = 1,
     ):
         super().__init__()
         self.action_space_size = action_space_size
+        self.value_support_size = value_support_size
+        self.reward_support_size = reward_support_size
 
         self.representation = RepresentationNetwork(
             observation_channels, hidden_planes, num_blocks,
@@ -171,32 +187,65 @@ class MuZeroNetwork(nn.Module):
         )
         self.dynamics = DynamicsNetwork(
             hidden_planes, num_blocks, action_space_size,
-            latent_h, latent_w, fc_hidden,
+            latent_h, latent_w, fc_hidden, reward_support_size,
         )
         self.prediction = PredictionNetwork(
             hidden_planes, action_space_size,
-            latent_h, latent_w, fc_hidden,
+            latent_h, latent_w, fc_hidden, value_support_size,
         )
 
     def initial_inference(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run representation + prediction on observation.
 
-        Returns: (hidden_state, policy_logits, value)
+        Returns: (hidden_state, policy_logits, value_scalar)
         """
         hidden = self.representation(obs)
-        policy, value = self.prediction(hidden)
-        return hidden, policy, value
+        policy_logits, value_logits = self.prediction(hidden)
+        # Decode categorical value to scalar for MCTS
+        value = self._value_logits_to_scalar(value_logits)
+        return hidden, policy_logits, value
 
     def recurrent_inference(
         self, hidden_state: torch.Tensor, action: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run dynamics + prediction on hidden state + action.
 
-        Returns: (next_hidden_state, reward, policy_logits, value)
+        Returns: (next_hidden_state, reward_scalar, policy_logits, value_scalar)
         """
-        next_hidden, reward = self.dynamics(hidden_state, action)
-        policy, value = self.prediction(next_hidden)
-        return next_hidden, reward, policy, value
+        next_hidden, reward_logits = self.dynamics(hidden_state, action)
+        policy_logits, value_logits = self.prediction(next_hidden)
+        # Decode to scalars for MCTS
+        value = self._value_logits_to_scalar(value_logits)
+        reward = self._reward_logits_to_scalar(reward_logits)
+        return next_hidden, reward, policy_logits, value
+
+    def initial_inference_logits(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Like initial_inference but returns raw logits (for training).
+
+        Returns: (hidden_state, policy_logits, value_logits)
+        """
+        hidden = self.representation(obs)
+        policy_logits, value_logits = self.prediction(hidden)
+        return hidden, policy_logits, value_logits
+
+    def recurrent_inference_logits(
+        self, hidden_state: torch.Tensor, action: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Like recurrent_inference but returns raw logits (for training).
+
+        Returns: (next_hidden_state, reward_logits, policy_logits, value_logits)
+        """
+        next_hidden, reward_logits = self.dynamics(hidden_state, action)
+        policy_logits, value_logits = self.prediction(next_hidden)
+        return next_hidden, reward_logits, policy_logits, value_logits
+
+    def _value_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
+        scalar = support_to_scalar(logits, self.value_support_size)
+        return inverse_scalar_transform(scalar).unsqueeze(-1)
+
+    def _reward_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
+        scalar = support_to_scalar(logits, self.reward_support_size)
+        return inverse_scalar_transform(scalar).unsqueeze(-1)
 
 
 class MultiGameMuZeroNetwork(nn.Module):
@@ -209,7 +258,8 @@ class MultiGameMuZeroNetwork(nn.Module):
 
     def __init__(self, game_configs: dict, hidden_planes: int = 128,
                  num_blocks: int = 8, latent_h: int = 8, latent_w: int = 8,
-                 fc_hidden: int = 128, game_id_dim: int = 16):
+                 fc_hidden: int = 128, game_id_dim: int = 16,
+                 value_support_size: int = 10, reward_support_size: int = 1):
         """
         Args:
             game_configs: dict mapping game_name -> {
@@ -222,6 +272,11 @@ class MultiGameMuZeroNetwork(nn.Module):
         self.latent_h = latent_h
         self.latent_w = latent_w
         self.hidden_planes = hidden_planes
+        self.value_support_size = value_support_size
+        self.reward_support_size = reward_support_size
+
+        value_out = 2 * value_support_size + 1
+        reward_out = 2 * reward_support_size + 1
 
         # Game ID embeddings
         self.game_embeddings = nn.Embedding(len(self.game_names), game_id_dim)
@@ -241,16 +296,13 @@ class MultiGameMuZeroNetwork(nn.Module):
         )
 
         # Shared dynamics backbone
-        self.dynamics_conv_in = nn.Sequential(
-            nn.Conv2d(hidden_planes + 1, hidden_planes, 3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_planes),
-            nn.ReLU(),
-        )
+        self.dynamics_conv_in = nn.Conv2d(hidden_planes + 1, hidden_planes, 3, padding=1, bias=False)
+        self.dynamics_bn_in = nn.BatchNorm2d(hidden_planes)
         self.shared_dynamics_blocks = nn.Sequential(
             *[ResidualBlock(hidden_planes) for _ in range(num_blocks)]
         )
 
-        # Per-game policy heads and reward heads
+        # Per-game heads
         self.policy_heads = nn.ModuleDict()
         self.value_heads = nn.ModuleDict()
         self.reward_heads = nn.ModuleDict()
@@ -267,13 +319,12 @@ class MultiGameMuZeroNetwork(nn.Module):
                 nn.BatchNorm2d(1),
                 nn.ReLU(),
                 nn.Flatten(),
-                mlp_head(latent_h * latent_w, fc_hidden, 1),
-                nn.Tanh(),
+                mlp_head(latent_h * latent_w, fc_hidden, value_out),
             )
             self.reward_heads[name] = nn.Sequential(
                 nn.Conv2d(hidden_planes, 1, 1),
                 nn.Flatten(),
-                mlp_head(latent_h * latent_w, fc_hidden, 1),
+                mlp_head(latent_h * latent_w, fc_hidden, reward_out),
             )
 
     def initial_inference(self, obs: torch.Tensor, game_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -282,27 +333,73 @@ class MultiGameMuZeroNetwork(nn.Module):
             proj = F.interpolate(proj, size=(self.latent_h, self.latent_w), mode="bilinear", align_corners=False)
         hidden = self.shared_repr_blocks(proj)
         hidden = _min_max_normalize(hidden)
-        policy = self.policy_heads[game_name](hidden)
-        value = self.value_heads[game_name](hidden)
-        return hidden, policy, value
+        policy_logits = self.policy_heads[game_name](hidden)
+        value_logits = self.value_heads[game_name](hidden)
+        value = self._value_logits_to_scalar(value_logits)
+        return hidden, policy_logits, value
 
     def recurrent_inference(
         self, hidden_state: torch.Tensor, action: torch.Tensor, game_name: str
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         b = hidden_state.shape[0]
-        max_action = max(1, action.max().item() + 1)  # avoid div by zero
+        max_action = max(1, action.max().item() + 1)
         action_plane = action.float() / max_action
         action_plane = action_plane.view(b, 1, 1, 1).expand(b, 1, self.latent_h, self.latent_w)
 
         x = torch.cat([hidden_state, action_plane], dim=1)
         x = self.dynamics_conv_in(x)
+        x = self.dynamics_bn_in(x)
+        # Residual skip connection
+        x = F.relu(x + hidden_state)
         x = self.shared_dynamics_blocks(x)
         x = _min_max_normalize(x)
 
-        reward = self.reward_heads[game_name](hidden_state)
-        policy = self.policy_heads[game_name](x)
-        value = self.value_heads[game_name](x)
-        return x, reward, policy, value
+        reward_logits = self.reward_heads[game_name](x)
+        reward = self._reward_logits_to_scalar(reward_logits)
+        policy_logits = self.policy_heads[game_name](x)
+        value_logits = self.value_heads[game_name](x)
+        value = self._value_logits_to_scalar(value_logits)
+        return x, reward, policy_logits, value
+
+    def initial_inference_logits(self, obs: torch.Tensor, game_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (hidden_state, policy_logits, value_logits) for training."""
+        proj = self.input_projections[game_name](obs)
+        if proj.shape[-2:] != (self.latent_h, self.latent_w):
+            proj = F.interpolate(proj, size=(self.latent_h, self.latent_w), mode="bilinear", align_corners=False)
+        hidden = self.shared_repr_blocks(proj)
+        hidden = _min_max_normalize(hidden)
+        policy_logits = self.policy_heads[game_name](hidden)
+        value_logits = self.value_heads[game_name](hidden)
+        return hidden, policy_logits, value_logits
+
+    def recurrent_inference_logits(
+        self, hidden_state: torch.Tensor, action: torch.Tensor, game_name: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (next_hidden, reward_logits, policy_logits, value_logits) for training."""
+        b = hidden_state.shape[0]
+        max_action = max(1, action.max().item() + 1)
+        action_plane = action.float() / max_action
+        action_plane = action_plane.view(b, 1, 1, 1).expand(b, 1, self.latent_h, self.latent_w)
+
+        x = torch.cat([hidden_state, action_plane], dim=1)
+        x = self.dynamics_conv_in(x)
+        x = self.dynamics_bn_in(x)
+        x = F.relu(x + hidden_state)
+        x = self.shared_dynamics_blocks(x)
+        x = _min_max_normalize(x)
+
+        reward_logits = self.reward_heads[game_name](x)
+        policy_logits = self.policy_heads[game_name](x)
+        value_logits = self.value_heads[game_name](x)
+        return x, reward_logits, policy_logits, value_logits
+
+    def _value_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
+        scalar = support_to_scalar(logits, self.value_support_size)
+        return inverse_scalar_transform(scalar).unsqueeze(-1)
+
+    def _reward_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
+        scalar = support_to_scalar(logits, self.reward_support_size)
+        return inverse_scalar_transform(scalar).unsqueeze(-1)
 
 
 def _min_max_normalize(x: torch.Tensor) -> torch.Tensor:

@@ -72,6 +72,8 @@ def main():
         input_h=game.board_size[0],
         input_w=game.board_size[1],
         fc_hidden=config.fc_hidden,
+        value_support_size=config.value_support_size,
+        reward_support_size=config.reward_support_size,
     )
 
     trainer = MuZeroTrainer(config, game, network, device, args.log_dir)
