@@ -229,6 +229,8 @@ class MuZeroTrainer:
         chunk = max(1, getattr(self.config, "num_parallel_games", 1))
 
         positions_updated = 0
+        num_games = len(games)
+        tqdm.write(f"Step {self.global_step}: reanalyzing {num_games} games ({len(items)} positions)...")
         for start in range(0, len(items), chunk):
             batch = items[start : start + chunk]
             obs_list = [x[0] for x in batch]
@@ -248,6 +250,7 @@ class MuZeroTrainer:
                 game.root_values[pos] = root.value
                 positions_updated += 1
 
+        tqdm.write(f"Step {self.global_step}: reanalyze done ({positions_updated} positions updated)")
         self.writer.add_scalar("reanalyze/positions_updated", positions_updated, self.global_step)
 
     def _policy_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:

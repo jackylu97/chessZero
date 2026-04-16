@@ -91,7 +91,7 @@ def get_config(game: str) -> MuZeroConfig:
             num_residual_blocks=2,
             latent_h=3, latent_w=3,
             fc_hidden=64,
-            num_simulations=25,
+            num_simulations=100,
             batch_size=64,
             training_steps=5000,
             replay_buffer_size=5000,
