@@ -193,6 +193,88 @@ class MCTS:
             value = node.reward + self.config.discount * value
 
 
+class BatchedMCTS(MCTS):
+    """MCTS over N games simultaneously, batching all network calls across games.
+
+    Each simulation step does one recurrent_inference call of batch size N
+    instead of N calls of batch size 1. For small models on GPU this gives a
+    large throughput improvement since kernel launch overhead dominates over
+    actual compute at batch size 1.
+    """
+
+    @torch.no_grad()
+    def run_batch(
+        self,
+        observations: list[torch.Tensor],
+        legal_actions_list: list[list[int]],
+        add_noise: bool = True,
+    ) -> list[MCTSNode]:
+        """Run MCTS for N games in parallel.
+
+        Args:
+            observations: list of N (C, H, W) tensors
+            legal_actions_list: list of N legal-action lists
+            add_noise: whether to add Dirichlet noise at roots
+
+        Returns:
+            list of N root MCTSNodes with search statistics
+        """
+        n = len(observations)
+        roots = [MCTSNode() for _ in range(n)]
+        min_max_stats = [MinMaxStats() for _ in range(n)]
+
+        # Batch initial inference for all N roots
+        obs_batch = torch.stack(observations).to(self.device)  # (N, C, H, W)
+        hidden_batch, policy_batch, value_batch = self.network.initial_inference(obs_batch)
+
+        for g in range(n):
+            roots[g].hidden_state = hidden_batch[g]
+            self._expand(roots[g], policy_batch[g], legal_actions_list[g])
+            if add_noise and roots[g].children:
+                noise = np.random.dirichlet(
+                    [self.config.dirichlet_alpha] * len(roots[g].children)
+                )
+                eps = self.config.dirichlet_epsilon
+                for i, child in enumerate(roots[g].children.values()):
+                    child.prior = child.prior * (1 - eps) + noise[i] * eps
+
+        all_actions = list(range(self.game.action_space_size))
+
+        for _ in range(self.config.num_simulations):
+            search_paths = []
+            parent_hiddens = []
+            leaf_actions = []
+
+            # SELECT phase — pure CPU, one pass per game
+            for g in range(n):
+                node = roots[g]
+                path = [node]
+                last_action = None
+                while node.expanded():
+                    last_action, child = self._select_child(node, min_max_stats[g])
+                    node = child
+                    path.append(node)
+                search_paths.append(path)
+                parent_hiddens.append(path[-2].hidden_state)
+                leaf_actions.append(last_action)
+
+            # EXPAND — single batched network call
+            hidden_batch = torch.stack(parent_hiddens).to(self.device)       # (N, C, H, W)
+            action_batch = torch.tensor(leaf_actions, device=self.device)    # (N,)
+            next_hiddens, rewards, policy_batch, value_batch = \
+                self.network.recurrent_inference(hidden_batch, action_batch)
+
+            # BACKPROPAGATE — distribute results
+            for g in range(n):
+                leaf = search_paths[g][-1]
+                leaf.hidden_state = next_hiddens[g]
+                leaf.reward = rewards[g].item()
+                self._expand(leaf, policy_batch[g], all_actions)
+                self._backpropagate(search_paths[g], value_batch[g].item(), min_max_stats[g])
+
+        return roots
+
+
 def select_action(root: MCTSNode, temperature: float = 1.0) -> tuple[int, list[float]]:
     """Select action from MCTS visit counts using temperature.
 

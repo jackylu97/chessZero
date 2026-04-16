@@ -79,11 +79,7 @@ def main():
     trainer = MuZeroTrainer(config, game, network, device, args.log_dir)
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
-        trainer.network.load_state_dict(checkpoint["model_state_dict"])
-        trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        trainer.global_step = checkpoint["step"]
-        print(f"Resumed from step {checkpoint['step']}")
+        trainer.load_checkpoint(args.resume)
 
     trainer.train()
 

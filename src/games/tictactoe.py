@@ -1,5 +1,6 @@
 """Tic-Tac-Toe game implementation."""
 
+import functools
 import numpy as np
 import torch
 
@@ -69,7 +70,79 @@ class TicTacToe(Game):
     def render(self, state: GameState) -> str:
         symbols = {0: ".", 1: "X", -1: "O"}
         board = state.board.reshape(3, 3)
-        lines = []
-        for row in board:
-            lines.append(" ".join(symbols[c] for c in row))
+        lines = ["  1 2 3"]
+        for r, row in enumerate(board):
+            cells = " ".join(symbols[c] for c in row)
+            lines.append(f"{r + 1} {cells}")
         return "\n".join(lines)
+
+    def render_with_moves(self, state: GameState) -> str:
+        """Render board showing available move coordinates on empty squares."""
+        symbols = {1: "X", -1: "O"}
+        board = state.board.reshape(3, 3)
+        lines = ["  1 2 3"]
+        for r, row in enumerate(board):
+            cells = []
+            for c, val in enumerate(row):
+                if val == 0:
+                    cells.append(f"{r + 1}{c + 1}")  # e.g. "11", "23"
+                else:
+                    cells.append(f" {symbols[val]} ")
+            lines.append(f"{r + 1} {'|'.join(cells)}")
+        return "\n".join(lines)
+
+
+class MinimaxPlayer:
+    """Perfect tic-tac-toe player via minimax with alpha-beta pruning.
+
+    The full game tree is tiny (~5477 terminal nodes) so results are cached
+    after the first call — subsequent lookups are O(1).
+    """
+
+    _WIN_LINES = TicTacToe._WIN_LINES
+
+    def best_action(self, board: np.ndarray, player: int) -> int:
+        """Return the optimal action for `player` given flat `board`."""
+        _, action = self._minimax(tuple(board), player, -2, 2)
+        return action
+
+    @functools.lru_cache(maxsize=None)
+    def _minimax(self, board: tuple, player: int, alpha: float, beta: float) -> tuple[float, int]:
+        score = self._terminal_score(board)
+        if score is not None:
+            return score, -1
+
+        best_action = -1
+        best_score = -2 * player  # -inf for maximiser, +inf for minimiser
+
+        for action in range(9):
+            if board[action] != 0:
+                continue
+            next_board = list(board)
+            next_board[action] = player
+            score, _ = self._minimax(tuple(next_board), -player, alpha, beta)
+
+            if player == 1:
+                if score > best_score:
+                    best_score, best_action = score, action
+                alpha = max(alpha, best_score)
+            else:
+                if score < best_score:
+                    best_score, best_action = score, action
+                beta = min(beta, best_score)
+
+            if beta <= alpha:
+                break
+
+        return best_score, best_action
+
+    def _terminal_score(self, board: tuple) -> float | None:
+        for line in self._WIN_LINES:
+            s = board[line[0]] + board[line[1]] + board[line[2]]
+            if s == 3:
+                return 1.0
+            if s == -3:
+                return -1.0
+        if all(b != 0 for b in board):
+            return 0.0
+        return None

@@ -43,43 +43,79 @@ def load_model(checkpoint_path: str, game, config, device: str):
         value_support_size=config.value_support_size,
         reward_support_size=config.reward_support_size,
     )
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    from src.config import MuZeroConfig
+    torch.serialization.add_safe_globals([MuZeroConfig])
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     network.load_state_dict(checkpoint["model_state_dict"])
     network.to(device)
     network.eval()
     return network
 
 
+def parse_tictactoe_move(move_str: str) -> int | None:
+    """Parse 'row col' or 'row,col' (1-indexed) into a flat action index."""
+    move_str = move_str.strip().replace(",", " ")
+    parts = move_str.split()
+    if len(parts) != 2:
+        return None
+    try:
+        row, col = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (1 <= row <= 3 and 1 <= col <= 3):
+        return None
+    return (row - 1) * 3 + (col - 1)
+
+
 def play_interactive(game, network, config, device):
     """Play interactively against the trained model."""
+    from src.games.tictactoe import TicTacToe
+    is_tictactoe = isinstance(game, TicTacToe)
+
     mcts = MCTS(network, game, config, device)
     state = game.reset()
 
     print("You are O (player -1). Model is X (player 1).")
-    print(game.render(state))
+    if is_tictactoe:
+        print("Enter moves as 'row col' (e.g. '2 3' for row 2, column 3).\n")
+        print(game.render_with_moves(state))
+    else:
+        print(game.render(state))
 
     while not state.done:
         legal = game.legal_actions(state)
         if state.current_player == 1:
-            # Model plays
             obs = game.to_tensor(state)
             root = mcts.run(obs, legal, add_noise=False)
             action, _ = select_action(root, temperature=0)
-            print(f"\nModel plays: {action}")
+            if is_tictactoe:
+                row, col = divmod(action, 3)
+                print(f"\nModel plays: row {row + 1}, col {col + 1}")
+            else:
+                print(f"\nModel plays: {action}")
         else:
-            # Human plays
-            print(f"\nLegal moves: {legal}")
             while True:
                 try:
-                    action = int(input("Your move: "))
+                    if is_tictactoe:
+                        raw = input("\nYour move (row col): ")
+                        action = parse_tictactoe_move(raw)
+                        if action is None:
+                            print("Enter row and column as two numbers, e.g. '2 3'.")
+                            continue
+                    else:
+                        action = int(input(f"\nLegal moves: {legal}\nYour move: "))
                     if action in legal:
                         break
-                    print("Illegal move!")
+                    print("That square is taken — pick an empty one.")
                 except ValueError:
                     print("Enter a number.")
 
         state, reward, done = game.step(state, action)
-        print(game.render(state))
+        print()
+        if is_tictactoe and not state.done:
+            print(game.render_with_moves(state))
+        else:
+            print(game.render(state))
 
     if state.winner == 1:
         print("\nModel wins!")
