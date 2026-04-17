@@ -205,3 +205,48 @@ Replaces PUCT + visit-count policy targets with a statistically more efficient a
 
 ### Recommended combination for chess
 Sampled MuZero + EfficientZero consistency loss + curriculum transfer from connect4. Sampled MuZero is close to required given the action space; the consistency loss is a relatively contained addition to the training loop; curriculum transfer is free given the existing architecture.
+
+---
+
+## Chess Self-Play — Catastrophic Leaf Expansion (and Fix)
+
+### Symptom
+Initial chess self-play stalled indefinitely. Overnight run showed 0 games completed across 9+ hours of wall-clock, with 103% CPU on one core, 12% GPU utilization, and ~10GB of RSS memory accumulating. `ctrl-C` landed inside `MCTS._expand` creating child nodes.
+
+### Root cause
+The Python MCTS expands every leaf with **all 4672 chess actions** (`mcts.py:272`). Two consequences:
+
+1. **Expansion cost**: per simulation across 64 parallel games, ~300K `MCTSNode` objects are created. At 50 simulations per move, that's ~15M Python object allocations per move advancement. With Python's per-object overhead, the first move of the first batch never completed.
+2. **Selection cost**: `_select_child` iterates `node.children.items()` to find the max UCB. With 4672 children, every selection step within the MCTS tree is also O(4672) in Python.
+
+This was **known issue #1** in `CLAUDE.md` — tolerable for tictactoe (9 actions) and connect4 (7 actions), catastrophic at chess's 4672.
+
+### How AlphaZero/MuZero avoid it
+**AlphaZero does not have this problem** — it uses the real chess engine at every tree node, so it only ever creates ~35 children (the legal moves). MuZero introduces the problem because leaves live in learned latent space with no access to game rules, so legality can't be known.
+
+**DeepMind's MuZero paper handles 4672-way expansion by (a) implementing MCTS in C++ with preallocated node pools, making expansion cost nanoseconds per node, (b) vectorizing UCB selection as a single AVX `argmax` over a flat prior array, and (c) relying on the network learning to put near-zero prior on illegal moves after early training — in practice >99% of the 4672 children get ignored in selection because the prior is negligible.** None of these translate directly to Python.
+
+The "proper" Python-compatible fix is **Sampled MuZero** (Hubert et al. 2021): sample K actions from the prior distribution at each node and use an importance-weighted MCTS target. Listed in the "Scaling to Chess" section above as a deferred improvement.
+
+### Implemented fix: top-K leaf expansion
+Added `leaf_top_k` config field. When set, `_expand` keeps only the top-K children by prior using `torch.topk` instead of materializing all `action_space_size` children.
+
+- **At the root**: unchanged. Legal actions come from `python-chess`, all expanded (~35 children). Visit-count policy target remains faithful.
+- **At latent leaves**: only the top-K priors become children. Chess config uses `leaf_top_k=50`, roughly 50× the average number of legal chess moves.
+- **Other games unaffected**: tictactoe/connect4 configs leave `leaf_top_k=None`, behavior identical.
+
+Expected speedup: ~90× on both expansion and per-node UCB selection. Chess self-play should now complete an initial batch in ~5-15 minutes instead of hanging forever.
+
+### Why top-K is a defensible baseline (not just a hack)
+- Chess's ~35 legal moves almost always fall inside the network's top-50 priors after a few thousand training steps
+- Actions outside top-K still get their prior computed (since softmax happens pre-topk) and contribute to the statistics via the Dirichlet root noise; they just can't be selected past a leaf
+- MCTS literature (muzero-general, similar Python reimplementations) uses equivalent heuristics for large action spaces — this is the standard baseline
+
+### Why top-K is still wrong in principle
+- Bottom-ranked actions can never be explored at a leaf — if the network's prior is badly miscalibrated for a particular position, MCTS can't correct it via visitation. Sampled MuZero fixes this by giving every action positive sampling probability.
+- Visit counts at the root are only over top-K (at leaves), so the policy target is mildly biased toward concentrated priors.
+
+### Secondary fix: move cap
+Added `max_plies = 400` to `ChessGame`. Forces draw (`winner=0`, `reward=0.0`) on games that run past 400 plies. With `leaf_top_k` in place, games should terminate via normal chess rules long before the cap; this stays as a safety net against pathological repetition loops that evade python-chess's 5-fold repetition check (which requires exact position matches including castling rights, en passant, and side-to-move).
+
+AlphaZero used a 512-ply cap for the same reason. 400 is a conservative choice — longest recorded master game is ~540 plies, but the longest meaningful MuZero self-play game is much shorter.

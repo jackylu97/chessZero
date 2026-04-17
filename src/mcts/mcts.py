@@ -125,23 +125,35 @@ class MCTS:
             # For leaf expansion, we use all actions as potentially legal
             # (MCTS in latent space doesn't have access to game rules at leaves)
             all_actions = list(range(self.game.action_space_size))
-            self._expand(node, policy_logits.squeeze(0), all_actions)
+            self._expand(node, policy_logits.squeeze(0), all_actions,
+                         top_k=getattr(self.config, "leaf_top_k", None))
 
             # BACKPROPAGATE
             self._backpropagate(search_path, value.item(), min_max_stats)
 
         return root
 
-    def _expand(self, node: MCTSNode, policy_logits: torch.Tensor, legal_actions: list[int]):
-        """Expand node with children for each legal action."""
-        # Mask illegal actions and compute policy
+    def _expand(self, node: MCTSNode, policy_logits: torch.Tensor,
+                legal_actions: list[int], top_k: int | None = None):
+        """Expand node with children.
+
+        At the root, `legal_actions` comes from the game engine (true legal moves).
+        At latent-space leaves, `legal_actions` is all action_space indices —
+        pass `top_k` to restrict expansion to the top-K priors for tractability
+        on large action spaces (e.g. chess's 4672).
+        """
         policy = torch.full_like(policy_logits, float("-inf"))
         legal_idx = torch.tensor(legal_actions, dtype=torch.long)
         policy[legal_idx] = policy_logits[legal_idx]
         policy = torch.softmax(policy, dim=0)
 
-        for action in legal_actions:
-            node.children[action] = MCTSNode(prior=policy[action].item())
+        if top_k is not None and len(legal_actions) > top_k:
+            topk = torch.topk(policy, top_k)
+            for idx, p in zip(topk.indices.tolist(), topk.values.tolist()):
+                node.children[idx] = MCTSNode(prior=p)
+        else:
+            for action in legal_actions:
+                node.children[action] = MCTSNode(prior=policy[action].item())
 
     def _select_child(self, node: MCTSNode, min_max_stats: MinMaxStats) -> tuple[int, MCTSNode]:
         """Select child with highest UCB score (PUCT formula from AlphaZero/MuZero)."""
@@ -265,11 +277,12 @@ class BatchedMCTS(MCTS):
                 self.network.recurrent_inference(hidden_batch, action_batch)
 
             # BACKPROPAGATE — distribute results
+            leaf_top_k = getattr(self.config, "leaf_top_k", None)
             for g in range(n):
                 leaf = search_paths[g][-1]
                 leaf.hidden_state = next_hiddens[g]
                 leaf.reward = rewards[g].item()
-                self._expand(leaf, policy_batch[g], all_actions)
+                self._expand(leaf, policy_batch[g], all_actions, top_k=leaf_top_k)
                 self._backpropagate(search_paths[g], value_batch[g].item(), min_max_stats[g])
 
         return roots

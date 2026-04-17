@@ -76,6 +76,11 @@ class MuZeroConfig:
     reanalyze_interval: int = 0   # training steps between reanalyze calls; 0 = disabled
     reanalyze_batch_size: int = 20  # number of games to reanalyze per call
 
+    # Leaf expansion: cap children per latent-space leaf node (MCTS has no game rules in latent space)
+    # None = expand all action_space_size children (tractable only for small action spaces)
+    # Integer = expand only top-K actions by prior (required for chess's 4672 action space)
+    leaf_top_k: int | None = None
+
     # Multi-game (Phase 2)
     multi_game: bool = False
     games: list[str] = field(default_factory=lambda: ["tictactoe"])
@@ -133,9 +138,14 @@ def get_config(game: str) -> MuZeroConfig:
             min_buffer_size=500,
             num_self_play_games=100,
             self_play_interval=500,
-            lr=2e-4,
+            lr=5e-4,
             dirichlet_alpha=0.03,
             td_steps=5,              # bootstrap over 5 steps; full return too noisy for 60-move games
+            temperature_drop_step=30,  # paper: drop after move 30
+            reanalyze_interval=500,    # matches self_play_interval: 1:1 refresh per self-play round
+            reanalyze_batch_size=20,   # 20 games ≈ 1.2k positions per reanalyze call
+            num_parallel_games=64,
+            leaf_top_k=50,             # expand only top-50 priors at leaves (vs 4672) — ~90x CPU speedup
         ),
         "checkers": MuZeroConfig(
             game="checkers",
