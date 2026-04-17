@@ -152,11 +152,15 @@ class ChessGame(Game):
         board = state.board
         planes = np.zeros((self.num_planes, 8, 8), dtype=np.float32)
 
-        # Piece planes: P=0, N=1, B=2, R=3, Q=4, K=5 for white; +6 for black
+        # Piece planes: P=0, N=1, B=2, R=3, Q=4, K=5 for white; +6 for black.
+        # Always encoded from white's perspective (row 0 = rank 1).
+        # The network learns separate white/black strategies via the turn plane.
+        # Proper perspective flipping (like AlphaZero) would also require flipping
+        # action indices in legal_actions() — deferred as a future improvement.
         piece_map = board.piece_map()
         for sq, piece in piece_map.items():
             row, col = divmod(sq, 8)
-            plane_idx = (piece.piece_type - 1)  # 0-5
+            plane_idx = piece.piece_type - 1  # 0-5
             if piece.color == chess.BLACK:
                 plane_idx += 6
             planes[plane_idx, row, col] = 1.0
@@ -176,7 +180,7 @@ class ChessGame(Game):
         planes[17, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
 
         # Move count (normalized)
-        planes[18, :, :] = min(board.fullmove_number / 100.0, 1.0)
+        planes[18, :, :] = min(board.fullmove_number / 200.0, 1.0)
 
         return torch.from_numpy(planes)
 

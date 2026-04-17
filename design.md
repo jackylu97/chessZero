@@ -32,6 +32,14 @@ Actions are encoded as `action / action_space_size`, broadcast to a `(B, 1, H, W
 
 Revisit if multi-game dynamics training is unstable.
 
+### Observation perspective (chess)
+`to_tensor` encodes from white's fixed perspective (row 0 = rank 1, white pieces in planes 0–5, black in 6–11). The turn plane (plane 17) tells the network whose move it is.
+
+**Why not perspective-flip like AlphaZero?**
+Proper perspective flipping requires flipping both the observation AND the action indices — `legal_actions()` would return indices in the flipped coordinate system, and `_action_to_move()` would un-flip before applying. Flipping only the observation while keeping action indices unflipped creates a spatial mismatch: CNN features computed on a flipped board don't align with the unflipped action space, making the mapping harder to learn than the consistent-but-asymmetric alternative.
+
+**Deferred:** Implement full perspective flipping (observation + action index flip) as a future improvement. The network will need more capacity to represent both colors independently, but for a 256-plane, 16-block network this is not a meaningful cost.
+
 ### Chess action space (4672 = 8×8×73)
 Follows the AlphaZero encoding. Each source square has 73 possible move planes:
 - 56 queen-style moves (7 distances × 8 compass directions)
@@ -165,3 +173,35 @@ Loss functions return per-sample tensors (not reduced means). IS weights are app
 **LR:** Piecewise constant decay via `MultiStepLR`. Milestones as fractions of `training_steps` (default: 0.5, 0.75) with `lr_decay_factor=0.1`. This matches the schedule used in muzero-general for longer runs.
 
 **Temperature:** `temperature_schedule` is a list of `(step_fraction, temperature)` pairs that lower `temperature_init` as training matures. Applied at the start of each self-play batch. Within a game, `temperature_drop_step` still switches to `temperature_final` after a fixed move count (unchanged).
+
+---
+
+## Scaling to Chess — Training Speed Strategies
+
+Chess has two properties that make naive MuZero slow: a 4672-action space and games that are 40-80 moves long. The following approaches are candidates for Phase 1 chess training, ordered roughly by expected impact.
+
+### 1. Sampled MuZero (highest priority for chess)
+Instead of expanding all 4672 actions at each MCTS node, sample a small subset (20-50 actions) from the policy prior. Since only ~30 legal moves exist per chess position, most of the 4672 actions are illegal anyway — full expansion wastes compute evaluating them. Sampled MuZero makes each simulation dramatically cheaper and is effectively mandatory for large action spaces.
+
+**Paper:** "Learning and Planning in Complex Action Spaces" (Hubert et al. 2021)
+
+### 2. EfficientZero consistency loss
+Adds a self-supervised auxiliary loss: the latent state produced by rolling the dynamics network forward (`g(h_t, a_t)`) should match the latent state produced by running the representation network on the actual next observation (`h(o_{t+1})`). This keeps the dynamics network grounded in reality rather than drifting in latent space, dramatically improving sample efficiency.
+
+EfficientZero achieved AlphaZero-level Atari performance with ~200x less data than MuZero. The consistency loss is the core contribution and is largely orthogonal to other improvements — it can be added on top of the existing architecture.
+
+**Paper:** "Mastering Atari Games with Limited Data" (Ye et al. 2021)
+
+### 3. Curriculum transfer via multi-game training (Phase 2 overlap)
+Train tictactoe → connect4 → chess sequentially, transferring the shared backbone. The representation and dynamics networks learn general game reasoning on simpler games before chess, giving a much better initialization than random weights. This is directly enabled by the existing `MultiGameMuZeroNetwork` architecture and is essentially free to implement given Phase 2 is already planned.
+
+### 4. Higher train/self-play ratio
+Currently 1:1 for tictactoe (100 training steps per 100 self-play games). Increasing to 5:1 or 10:1 means the network improves more before generating new self-play games, so each batch is higher quality. Cheaper than generating more games and easy to tune via `self_play_interval` and `num_self_play_games`.
+
+### 5. Gumbel MuZero
+Replaces PUCT + visit-count policy targets with a statistically more efficient action selection scheme based on Gumbel-top-k sampling. Gets equivalent policy quality with ~10x fewer simulations, which directly reduces the cost of both self-play and reanalyze.
+
+**Paper:** "Policy Improvement by Planning with Gumbel" (Danihelka et al. 2022)
+
+### Recommended combination for chess
+Sampled MuZero + EfficientZero consistency loss + curriculum transfer from connect4. Sampled MuZero is close to required given the action space; the consistency loss is a relatively contained addition to the training loop; curriculum transfer is free given the existing architecture.

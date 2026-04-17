@@ -126,7 +126,7 @@ def get_config(game: str) -> MuZeroConfig:
             num_residual_blocks=16,
             latent_h=8, latent_w=8,
             fc_hidden=256,
-            num_simulations=200,
+            num_simulations=50,      # baseline: validate training before scaling up
             batch_size=256,
             training_steps=500000,
             replay_buffer_size=100000,
@@ -135,6 +135,7 @@ def get_config(game: str) -> MuZeroConfig:
             self_play_interval=500,
             lr=2e-4,
             dirichlet_alpha=0.03,
+            td_steps=5,              # bootstrap over 5 steps; full return too noisy for 60-move games
         ),
         "checkers": MuZeroConfig(
             game="checkers",
