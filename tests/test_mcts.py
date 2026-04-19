@@ -31,7 +31,7 @@ class StubConfig:
     num_simulations: int = 16
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
-    leaf_top_k: int | None = None
+    sample_k: int | None = None
 
 
 class StubNetwork:
@@ -214,18 +214,6 @@ def test_expand_from_priors_populates_arrays():
     assert len(node.children) == 3
     for i, c in enumerate(node.children):
         assert c.prior == pytest.approx(float(priors[i]))
-
-
-def test_expand_with_top_k_filters_legals():
-    mcts = MCTS(StubNetwork(20), StubGame(20), StubConfig(), device="cpu")
-    node = MCTSNode()
-    logits = torch.tensor([float(i) for i in range(20)])
-    legal = list(range(20))
-    mcts._expand(node, logits, legal, top_k=3)
-
-    # top_k=3 should pick actions 19, 18, 17 (highest logits).
-    assert sorted(node.child_actions.tolist()) == [17, 18, 19]
-    assert len(node.children) == 3
 
 
 # --- _add_dirichlet_noise ---------------------------------------------------

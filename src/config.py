@@ -59,8 +59,8 @@ class MuZeroConfig:
     # Device
     device: str = "cuda"
 
-    # LR scheduling — piecewise constant decay
-    lr_decay_milestones: list = field(default_factory=lambda: [0.5, 0.75])  # fractions of training_steps
+    # LR scheduling — piecewise constant decay. Empty list = no decay.
+    lr_decay_milestones: list = field(default_factory=list)  # fractions of training_steps
     lr_decay_factor: float = 0.1
 
     # Prioritized Experience Replay (PER)
@@ -76,15 +76,10 @@ class MuZeroConfig:
     reanalyze_interval: int = 0   # training steps between reanalyze calls; 0 = disabled
     reanalyze_batch_size: int = 20  # number of games to reanalyze per call
 
-    # Leaf expansion: cap children per latent-space leaf node (MCTS has no game rules in latent space)
-    # None = expand all action_space_size children (tractable only for small action spaces)
-    # Integer = expand only top-K actions by prior (required for chess's 4672 action space)
-    leaf_top_k: int | None = None
-
-    # Sampled MuZero (Hubert 2021): replaces deterministic top-K at leaves with
-    # Gumbel-Top-K sampling. Policy target becomes IS-corrected: N(a) / π_net(a).
-    # None = disabled (falls back to leaf_top_k behavior).
-    # Integer = sample K distinct actions per node (applied uniformly at root + leaves).
+    # Sampled MuZero (Hubert 2021, Proposed Modification): sample K distinct
+    # actions per node via Gumbel-Top-K; PUCT prior is π_net renormalized over σ,
+    # training target is raw N(a)/ΣN(a). Required for large action spaces (chess).
+    # None = expand all legal actions at root / all actions at leaves (tiny action spaces only).
     sample_k: int | None = None
 
     # Multi-game (Phase 2)
@@ -151,9 +146,8 @@ def get_config(game: str) -> MuZeroConfig:
             reanalyze_interval=1500,   # keep 1:1 with self_play_interval
             reanalyze_batch_size=100,
             num_parallel_games=128,    # bumped from 64 — batched-sync run_batch fits 24GB
-            leaf_top_k=50,             # top-K heuristic — replaced by Sampled MuZero in phase 2
+            sample_k=50,               # Sampled MuZero: sample K distinct actions per node (Hubert 2021 Proposed Modification)
             eval_interval=2500,
-            lr_decay_milestones=[0.8, 0.95],  # later decay — previous [0.5, 0.75] cut LR too early
         ),
         "checkers": MuZeroConfig(
             game="checkers",

@@ -37,7 +37,6 @@ class _StubConfig:
     num_simulations: int = 8
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
-    leaf_top_k: int | None = None
     sample_k: int | None = None
 
 
@@ -341,7 +340,7 @@ def test_sample_k_config_field_exists():
     from src.config import MuZeroConfig
     cfg = MuZeroConfig()
     assert hasattr(cfg, "sample_k"), \
-        "MuZeroConfig needs sample_k field (replaces leaf_top_k)"
+        "MuZeroConfig needs sample_k field"
 
 
 # --- BatchedMCTS integration: sample_k at root and leaves ------------------

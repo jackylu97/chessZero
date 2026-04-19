@@ -121,8 +121,7 @@ class MCTS:
             node.reward = reward.item()
 
             all_actions = list(range(self.game.action_space_size))
-            self._expand(node, policy_logits.squeeze(0), all_actions,
-                         top_k=getattr(self.config, "leaf_top_k", None))
+            self._expand(node, policy_logits.squeeze(0), all_actions)
 
             self._backpropagate(search_path, path_indices, value.item(), min_max_stats)
 
@@ -139,25 +138,21 @@ class MCTS:
             child.prior = float(node.child_priors[i])
 
     def _expand(self, node: MCTSNode, policy_logits: torch.Tensor,
-                legal_actions: list[int], top_k: int | None = None):
+                legal_actions: list[int]):
         """Expand node with children, populating the parallel-array storage.
 
         Does its own GPU softmax + CPU transfer. `BatchedMCTS.run_batch` bypasses
-        this for per-sim leaves — it batches softmax/topk across all N games into
-        one transfer, then calls `_expand_from_priors` below.
+        this for per-sim leaves — it batches softmax across all N games into one
+        transfer, then calls `_expand_from_priors` below. Leaf sampling (Sampled
+        MuZero) is only implemented in the batched path.
         """
         policy = torch.full_like(policy_logits, float("-inf"))
         legal_idx = torch.tensor(legal_actions, dtype=torch.long)
         policy[legal_idx] = policy_logits[legal_idx]
         policy = torch.softmax(policy, dim=0)
 
-        if top_k is not None and len(legal_actions) > top_k:
-            topk = torch.topk(policy, top_k)
-            actions_np = topk.indices.detach().cpu().numpy().astype(np.int64)
-            priors_np = topk.values.detach().cpu().numpy().astype(np.float64)
-        else:
-            actions_np = np.asarray(legal_actions, dtype=np.int64)
-            priors_np = policy[torch.from_numpy(actions_np)].detach().cpu().numpy().astype(np.float64)
+        actions_np = np.asarray(legal_actions, dtype=np.int64)
+        priors_np = policy[torch.from_numpy(actions_np)].detach().cpu().numpy().astype(np.float64)
 
         self._expand_from_priors(node, actions_np, priors_np)
 
@@ -294,18 +289,19 @@ class BatchedMCTS(MCTS):
 
     Sync budget per simulation: **3 GPU→CPU transfers** regardless of N —
     one bulk `.tolist()` for rewards, one for values, one `.cpu()` for
-    policy top-K (or full softmax if no `leaf_top_k`). The previous
-    implementation did 3N transfers (one per game per step); at N=64 this
-    is a ~60× reduction in sync-barrier count.
+    policy indices+priors. The previous implementation did 3N transfers
+    (one per game per step); at N=64 this is a ~60× reduction in
+    sync-barrier count.
 
     If `config.sample_k` is set, uses Gumbel-Top-K sampling (Kool 2019) at
-    roots and leaves instead of deterministic top-K — the Sampled MuZero
-    policy-improvement operator (Hubert 2021, Proposed Modification). After
-    sampling σ, priors are renormalized over σ so PUCT uses π_net restricted
-    to the sampled subspace; the training target is then raw `N(a)/ΣN` —
-    Theorem 1 gives that this already approximates the improved policy
-    Î_β π. No post-hoc β̂/β correction at target time (the Naive variant
-    the paper flags as unstable).
+    roots and leaves — the Sampled MuZero policy-improvement operator
+    (Hubert 2021, Proposed Modification). After sampling σ, priors are
+    renormalized over σ so PUCT uses π_net restricted to the sampled
+    subspace; the training target is then raw `N(a)/ΣN` — Theorem 1 gives
+    that this already approximates the improved policy Î_β π. No post-hoc
+    β̂/β correction at target time (the Naive variant the paper flags as
+    unstable). `sample_k=None` expands the full action space at each leaf
+    (tractable only for small action spaces).
     """
 
     @torch.no_grad()
@@ -321,9 +317,7 @@ class BatchedMCTS(MCTS):
 
         action_space_size = self.game.action_space_size
         sample_k = getattr(self.config, "sample_k", None)
-        leaf_top_k = getattr(self.config, "leaf_top_k", None)
         use_gumbel = sample_k is not None and sample_k < action_space_size
-        use_topk = (not use_gumbel) and leaf_top_k is not None and leaf_top_k < action_space_size
         all_actions_np = np.arange(action_space_size, dtype=np.int64)
 
         obs_batch = torch.stack(observations).to(self.device)
@@ -393,10 +387,6 @@ class BatchedMCTS(MCTS):
                 sampled_priors = sampled_priors / sampled_priors.sum(dim=-1, keepdim=True)
                 topk_actions_np = sampled_idx.detach().cpu().numpy().astype(np.int64)
                 topk_priors_np = sampled_priors.detach().cpu().numpy().astype(np.float64)
-            elif use_topk:
-                topk = torch.topk(probs_gpu, leaf_top_k, dim=-1)
-                topk_actions_np = topk.indices.detach().cpu().numpy().astype(np.int64)
-                topk_priors_np = topk.values.detach().cpu().numpy().astype(np.float64)
             else:
                 probs_np = probs_gpu.detach().cpu().numpy().astype(np.float64)
 
@@ -404,7 +394,7 @@ class BatchedMCTS(MCTS):
                 leaf = search_paths[g][-1]
                 leaf.hidden_state = next_hiddens[g]
                 leaf.reward = rewards_list[g]
-                if use_gumbel or use_topk:
+                if use_gumbel:
                     self._expand_from_priors(leaf, topk_actions_np[g], topk_priors_np[g])
                 else:
                     self._expand_from_priors(leaf, all_actions_np, probs_np[g])
