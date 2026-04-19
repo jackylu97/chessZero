@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from src.mcts.sampling import sample_topk_gumbel
+
 
 class MinMaxStats:
     """Tracks min/max values seen during search for Q-value normalization."""
@@ -43,7 +45,8 @@ class MCTSNode:
     value_sum: float = 0.0
     children: list["MCTSNode"] = field(default_factory=list)
     child_actions: np.ndarray | None = None       # (K,) int64
-    child_priors: np.ndarray | None = None        # (K,) float64
+    child_priors: np.ndarray | None = None        # (K,) float64 — search-time priors (used by PUCT; mutated by Dirichlet noise)
+    child_priors_net: np.ndarray | None = None    # (K,) float64 — raw network priors π_net(a); used for Sampled MuZero IS correction
     child_visits: np.ndarray | None = None        # (K,) float64 (stored float for vectorized math)
     child_rewards: np.ndarray | None = None       # (K,) float64
     child_value_sums: np.ndarray | None = None    # (K,) float64
@@ -75,6 +78,8 @@ class MCTS:
         self.game = game
         self.config = config
         self.device = device
+        # RNG for Gumbel-Top-K sampling at root. Leaves use torch RNG inline on GPU.
+        self._rng = np.random.default_rng()
 
     @torch.no_grad()
     def run(
@@ -163,10 +168,17 @@ class MCTS:
 
         Pure numpy — no GPU ops, no CPU↔GPU transfer. Callers batch the softmax
         and .cpu() transfer across all games in a sim step, then hand off here.
+
+        Stores two copies:
+          - `child_priors_net`: raw π_net(a), never mutated; used by IS correction.
+          - `child_priors`: search-time priors (= net priors initially; root gets
+            Dirichlet mixed in). Drives PUCT.
+        The copies must not alias — Dirichlet noise mutates `child_priors`.
         """
         k = len(actions_np)
         node.child_actions = actions_np
-        node.child_priors = priors_np.astype(np.float64, copy=False)
+        node.child_priors_net = np.array(priors_np, dtype=np.float64)
+        node.child_priors = np.array(priors_np, dtype=np.float64)
         node.child_visits = np.zeros(k, dtype=np.float64)
         node.child_rewards = np.zeros(k, dtype=np.float64)
         node.child_value_sums = np.zeros(k, dtype=np.float64)
@@ -287,6 +299,11 @@ class BatchedMCTS(MCTS):
     policy top-K (or full softmax if no `leaf_top_k`). The previous
     implementation did 3N transfers (one per game per step); at N=64 this
     is a ~60× reduction in sync-barrier count.
+
+    If `config.sample_k` is set, uses Gumbel-Top-K sampling (Kool 2019) at
+    roots and leaves instead of deterministic top-K — the Sampled MuZero
+    policy-improvement operator (Hubert 2021). `child_priors_net` stores the
+    raw π_net used for the IS correction at training target computation time.
     """
 
     @torch.no_grad()
@@ -300,6 +317,13 @@ class BatchedMCTS(MCTS):
         roots = [MCTSNode() for _ in range(n)]
         min_max_stats = [MinMaxStats() for _ in range(n)]
 
+        action_space_size = self.game.action_space_size
+        sample_k = getattr(self.config, "sample_k", None)
+        leaf_top_k = getattr(self.config, "leaf_top_k", None)
+        use_gumbel = sample_k is not None and sample_k < action_space_size
+        use_topk = (not use_gumbel) and leaf_top_k is not None and leaf_top_k < action_space_size
+        all_actions_np = np.arange(action_space_size, dtype=np.int64)
+
         obs_batch = torch.stack(observations).to(self.device)
         hidden_batch_gpu, policy_batch, _ = self.network.initial_inference(obs_batch)
 
@@ -308,15 +332,19 @@ class BatchedMCTS(MCTS):
         for g in range(n):
             roots[g].hidden_state = hidden_batch_gpu[g]
             legals_np = np.asarray(legal_actions_list[g], dtype=np.int64)
-            priors_np = _masked_softmax_np(root_logits_cpu[g], legals_np)
-            self._expand_from_priors(roots[g], legals_np, priors_np)
+            full_priors = _masked_softmax_np(root_logits_cpu[g], legals_np)
+            if use_gumbel and len(legals_np) > sample_k:
+                # Sample K distinct legal actions via Gumbel-Top-K over their logits.
+                legal_logits = root_logits_cpu[g][legals_np]
+                sampled_local, _ = sample_topk_gumbel(legal_logits, sample_k, rng=self._rng)
+                actions_np = legals_np[sampled_local]
+                priors_np = full_priors[sampled_local]
+            else:
+                actions_np = legals_np
+                priors_np = full_priors
+            self._expand_from_priors(roots[g], actions_np, priors_np)
             if add_noise and roots[g].children:
                 self._add_dirichlet_noise(roots[g])
-
-        action_space_size = self.game.action_space_size
-        leaf_top_k = getattr(self.config, "leaf_top_k", None)
-        use_topk = leaf_top_k is not None and leaf_top_k < action_space_size
-        all_actions_np = np.arange(action_space_size, dtype=np.int64)
 
         for _ in range(self.config.num_simulations):
             search_paths = []
@@ -348,7 +376,17 @@ class BatchedMCTS(MCTS):
             rewards_list = rewards.view(-1).tolist()
             values_list = value_batch.view(-1).tolist()
             probs_gpu = torch.softmax(policy_batch, dim=-1)
-            if use_topk:
+            if use_gumbel:
+                # Gumbel-Top-K: argmax(logits + Gumbel) = sample K distinct actions
+                # from softmax(logits) without replacement (Kool 2019).
+                u = torch.rand_like(policy_batch).clamp_(1e-20, 1 - 1e-20)
+                gumbel = -torch.log(-torch.log(u))
+                perturbed = policy_batch + gumbel
+                sampled_idx = torch.topk(perturbed, sample_k, dim=-1).indices
+                sampled_priors = torch.gather(probs_gpu, dim=-1, index=sampled_idx)
+                topk_actions_np = sampled_idx.detach().cpu().numpy().astype(np.int64)
+                topk_priors_np = sampled_priors.detach().cpu().numpy().astype(np.float64)
+            elif use_topk:
                 topk = torch.topk(probs_gpu, leaf_top_k, dim=-1)
                 topk_actions_np = topk.indices.detach().cpu().numpy().astype(np.int64)
                 topk_priors_np = topk.values.detach().cpu().numpy().astype(np.float64)
@@ -359,7 +397,7 @@ class BatchedMCTS(MCTS):
                 leaf = search_paths[g][-1]
                 leaf.hidden_state = next_hiddens[g]
                 leaf.reward = rewards_list[g]
-                if use_topk:
+                if use_gumbel or use_topk:
                     self._expand_from_priors(leaf, topk_actions_np[g], topk_priors_np[g])
                 else:
                     self._expand_from_priors(leaf, all_actions_np, probs_np[g])
@@ -369,29 +407,56 @@ class BatchedMCTS(MCTS):
         return roots
 
 
-def select_action(root: MCTSNode, temperature: float = 1.0) -> tuple[int, list[float]]:
+def select_action(
+    root: MCTSNode,
+    temperature: float = 1.0,
+    use_importance_sampling: bool = False,
+) -> tuple[int, list[float]]:
     """Select action from MCTS visit counts using temperature.
+
+    Args:
+        root: MCTS root node after search.
+        temperature: temperature for action sampling (0 = greedy).
+        use_importance_sampling: if True, the returned policy target uses the
+            Sampled MuZero IS correction `π_target(a) ∝ N(a) / π_net(a)` over
+            sampled actions; 0 elsewhere. The returned *action* is always chosen
+            from raw visit counts (the correction is a training target, not a
+            play-time policy).
 
     Returns:
         action: selected action index
-        action_probs: probability distribution over all children (dense up to max action)
+        action_probs: dense policy distribution over [0, max(actions)+1)
     """
     actions = root.child_actions
     visits = root.child_visits.astype(np.float64)
 
+    # Action selection: visit-count based (unchanged under IS).
     if temperature == 0:
-        best = int(np.argmax(visits))
-        probs = np.zeros(len(actions))
-        probs[best] = 1.0
-        action = int(actions[best])
+        action = int(actions[int(np.argmax(visits))])
     else:
         visits_temp = visits ** (1.0 / temperature)
-        total = visits_temp.sum()
-        if total <= 0:
+        total_v = visits_temp.sum()
+        if total_v <= 0:
+            visit_probs = np.ones(len(actions)) / len(actions)
+        else:
+            visit_probs = visits_temp / total_v
+        action = int(np.random.choice(actions, p=visit_probs))
+
+    # Policy target distribution.
+    if use_importance_sampling:
+        priors_net = np.asarray(root.child_priors_net, dtype=np.float64)
+        weights = visits / np.maximum(priors_net, 1e-12)
+        total_w = weights.sum()
+        if total_w <= 0:
             probs = np.ones(len(actions)) / len(actions)
         else:
-            probs = visits_temp / total
-        action = int(np.random.choice(actions, p=probs))
+            probs = weights / total_w
+    else:
+        if temperature == 0:
+            probs = np.zeros(len(actions))
+            probs[int(np.argmax(visits))] = 1.0
+        else:
+            probs = visit_probs
 
     max_action = int(actions.max()) + 1
     action_probs = np.zeros(max_action, dtype=np.float64)

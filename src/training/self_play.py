@@ -33,6 +33,7 @@ def play_game(
     network.eval()
     mcts = MCTS(network, game, config, device)
     temp_init = get_temperature(training_step, config)
+    use_is = getattr(config, "sample_k", None) is not None
 
     state = game.reset()
     history = GameHistory(game_name=config.game)
@@ -45,7 +46,7 @@ def play_game(
         root = mcts.run(obs, legal, add_noise=True)
 
         temp = temp_init if move_count < config.temperature_drop_step else config.temperature_final
-        action, action_probs = select_action(root, temperature=temp)
+        action, action_probs = select_action(root, temperature=temp, use_importance_sampling=use_is)
 
         history.observations.append(obs)
         history.actions.append(action)
@@ -79,6 +80,7 @@ def play_games_parallel(
     network.eval()
     batched_mcts = BatchedMCTS(network, game, config, device)
     temp_init = get_temperature(training_step, config)
+    use_is = getattr(config, "sample_k", None) is not None
 
     states = [game.reset() for _ in range(num_games)]
     histories = [GameHistory(game_name=config.game) for _ in range(num_games)]
@@ -97,7 +99,7 @@ def play_games_parallel(
         still_active = []
         for i, g in enumerate(active):
             temp = temp_init if move_counts[g] < config.temperature_drop_step else config.temperature_final
-            action, action_probs = select_action(roots[i], temperature=temp)
+            action, action_probs = select_action(roots[i], temperature=temp, use_importance_sampling=use_is)
 
             histories[g].observations.append(obs_list[i])
             histories[g].actions.append(action)

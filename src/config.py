@@ -81,6 +81,12 @@ class MuZeroConfig:
     # Integer = expand only top-K actions by prior (required for chess's 4672 action space)
     leaf_top_k: int | None = None
 
+    # Sampled MuZero (Hubert 2021): replaces deterministic top-K at leaves with
+    # Gumbel-Top-K sampling. Policy target becomes IS-corrected: N(a) / π_net(a).
+    # None = disabled (falls back to leaf_top_k behavior).
+    # Integer = sample K distinct actions per node (applied uniformly at root + leaves).
+    sample_k: int | None = None
+
     # Multi-game (Phase 2)
     multi_game: bool = False
     games: list[str] = field(default_factory=lambda: ["tictactoe"])

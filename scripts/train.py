@@ -49,6 +49,8 @@ def main():
                         help="Run ID (default: auto-generate YYYY_MM_DD_NNNN). "
                              "Pass an existing ID to continue writing into that run's dirs.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--sample-k", type=int, default=None,
+                        help="Sampled MuZero K. None = deterministic top-K (legacy).")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -61,6 +63,8 @@ def main():
     config.device = device
     if args.steps is not None:
         config.training_steps = args.steps
+    if args.sample_k is not None:
+        config.sample_k = args.sample_k
 
     # Use CPU AMP settings appropriately
     if device == "cpu":

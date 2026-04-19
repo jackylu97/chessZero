@@ -230,7 +230,7 @@ class MuZeroTrainer:
         No Dirichlet noise: we want clean policy estimates, not exploratory ones
         (consistent with lightzero's reanalyze_noise=False default).
         """
-        from ..mcts.mcts import BatchedMCTS
+        from ..mcts.mcts import BatchedMCTS, select_action
 
         _, games = self.replay_buffer.sample_games_for_reanalyze(
             self.config.reanalyze_batch_size
@@ -250,6 +250,8 @@ class MuZeroTrainer:
         self.network.eval()
         batched_mcts = BatchedMCTS(self.network, self.game, self.config, self.device)
         chunk = max(1, getattr(self.config, "num_parallel_games", 1))
+        use_is = getattr(self.config, "sample_k", None) is not None
+        action_space_size = self.game.action_space_size
 
         positions_updated = 0
         num_games = len(games)
@@ -262,15 +264,15 @@ class MuZeroTrainer:
             roots = batched_mcts.run_batch(obs_list, legal_list, add_noise=False)
 
             for (_, _, game, pos), root in zip(batch, roots):
-                # Build full-length visit-count policy vector
-                visits = root.child_visits
-                total = float(visits.sum())
-                if total > 0:
-                    new_policy = [0.0] * self.game.action_space_size
-                    actions = root.child_actions
-                    probs = visits / total
-                    for a, p in zip(actions.tolist(), probs.tolist()):
-                        if a < self.game.action_space_size:
+                if float(root.child_visits.sum()) > 0:
+                    # temperature=1.0 → visits-proportional (or IS-corrected if use_is).
+                    _, action_probs = select_action(
+                        root, temperature=1.0, use_importance_sampling=use_is,
+                    )
+                    # Pad to full action space size.
+                    new_policy = [0.0] * action_space_size
+                    for a, p in enumerate(action_probs):
+                        if a < action_space_size:
                             new_policy[a] = p
                     game.policies[pos] = new_policy
                 game.root_values[pos] = root.value
