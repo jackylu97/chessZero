@@ -250,7 +250,6 @@ class MuZeroTrainer:
         self.network.eval()
         batched_mcts = BatchedMCTS(self.network, self.game, self.config, self.device)
         chunk = max(1, getattr(self.config, "num_parallel_games", 1))
-        use_is = getattr(self.config, "sample_k", None) is not None
         action_space_size = self.game.action_space_size
 
         positions_updated = 0
@@ -265,10 +264,11 @@ class MuZeroTrainer:
 
             for (_, _, game, pos), root in zip(batch, roots):
                 if float(root.child_visits.sum()) > 0:
-                    # temperature=1.0 → visits-proportional (or IS-corrected if use_is).
-                    _, action_probs = select_action(
-                        root, temperature=1.0, use_importance_sampling=use_is,
-                    )
+                    # temperature=1.0 → raw visit-count normalization. Under
+                    # Sampled MuZero the search prior was renormalized over σ,
+                    # so raw visits already approximate Î_β π (Hubert 2021
+                    # Proposed Modification).
+                    _, action_probs = select_action(root, temperature=1.0)
                     # Pad to full action space size.
                     new_policy = [0.0] * action_space_size
                     for a, p in enumerate(action_probs):

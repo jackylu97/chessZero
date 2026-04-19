@@ -45,8 +45,7 @@ class MCTSNode:
     value_sum: float = 0.0
     children: list["MCTSNode"] = field(default_factory=list)
     child_actions: np.ndarray | None = None       # (K,) int64
-    child_priors: np.ndarray | None = None        # (K,) float64 — search-time priors (used by PUCT; mutated by Dirichlet noise)
-    child_priors_net: np.ndarray | None = None    # (K,) float64 — raw network priors π_net(a); used for Sampled MuZero IS correction
+    child_priors: np.ndarray | None = None        # (K,) float64 — PUCT prior over σ. Under Sampled MuZero (Hubert 2021 Proposed Modification) this is π_net renormalized to sum to 1 over σ; Dirichlet noise mutates it at the root.
     child_visits: np.ndarray | None = None        # (K,) float64 (stored float for vectorized math)
     child_rewards: np.ndarray | None = None       # (K,) float64
     child_value_sums: np.ndarray | None = None    # (K,) float64
@@ -169,15 +168,14 @@ class MCTS:
         Pure numpy — no GPU ops, no CPU↔GPU transfer. Callers batch the softmax
         and .cpu() transfer across all games in a sim step, then hand off here.
 
-        Stores two copies:
-          - `child_priors_net`: raw π_net(a), never mutated; used by IS correction.
-          - `child_priors`: search-time priors (= net priors initially; root gets
-            Dirichlet mixed in). Drives PUCT.
-        The copies must not alias — Dirichlet noise mutates `child_priors`.
+        `priors_np` is the PUCT prior over the children being installed. For
+        Sampled MuZero the sampled call sites renormalize π_net over σ before
+        calling this; for full expansion it is the full masked softmax. Root
+        Dirichlet noise is applied later via `_add_dirichlet_noise` on
+        `child_priors`.
         """
         k = len(actions_np)
         node.child_actions = actions_np
-        node.child_priors_net = np.array(priors_np, dtype=np.float64)
         node.child_priors = np.array(priors_np, dtype=np.float64)
         node.child_visits = np.zeros(k, dtype=np.float64)
         node.child_rewards = np.zeros(k, dtype=np.float64)
@@ -302,8 +300,12 @@ class BatchedMCTS(MCTS):
 
     If `config.sample_k` is set, uses Gumbel-Top-K sampling (Kool 2019) at
     roots and leaves instead of deterministic top-K — the Sampled MuZero
-    policy-improvement operator (Hubert 2021). `child_priors_net` stores the
-    raw π_net used for the IS correction at training target computation time.
+    policy-improvement operator (Hubert 2021, Proposed Modification). After
+    sampling σ, priors are renormalized over σ so PUCT uses π_net restricted
+    to the sampled subspace; the training target is then raw `N(a)/ΣN` —
+    Theorem 1 gives that this already approximates the improved policy
+    Î_β π. No post-hoc β̂/β correction at target time (the Naive variant
+    the paper flags as unstable).
     """
 
     @torch.no_grad()
@@ -335,10 +337,13 @@ class BatchedMCTS(MCTS):
             full_priors = _masked_softmax_np(root_logits_cpu[g], legals_np)
             if use_gumbel and len(legals_np) > sample_k:
                 # Sample K distinct legal actions via Gumbel-Top-K over their logits.
+                # Renormalize π_net over σ so PUCT has a proper prior on the
+                # sampled subspace (Hubert 2021 Proposed Modification).
                 legal_logits = root_logits_cpu[g][legals_np]
                 sampled_local, _ = sample_topk_gumbel(legal_logits, sample_k, rng=self._rng)
                 actions_np = legals_np[sampled_local]
-                priors_np = full_priors[sampled_local]
+                sampled_priors = full_priors[sampled_local]
+                priors_np = sampled_priors / sampled_priors.sum()
             else:
                 actions_np = legals_np
                 priors_np = full_priors
@@ -378,12 +383,14 @@ class BatchedMCTS(MCTS):
             probs_gpu = torch.softmax(policy_batch, dim=-1)
             if use_gumbel:
                 # Gumbel-Top-K: argmax(logits + Gumbel) = sample K distinct actions
-                # from softmax(logits) without replacement (Kool 2019).
+                # from softmax(logits) without replacement (Kool 2019). Priors
+                # are renormalized over σ (Hubert 2021 Proposed Modification).
                 u = torch.rand_like(policy_batch).clamp_(1e-20, 1 - 1e-20)
                 gumbel = -torch.log(-torch.log(u))
                 perturbed = policy_batch + gumbel
                 sampled_idx = torch.topk(perturbed, sample_k, dim=-1).indices
                 sampled_priors = torch.gather(probs_gpu, dim=-1, index=sampled_idx)
+                sampled_priors = sampled_priors / sampled_priors.sum(dim=-1, keepdim=True)
                 topk_actions_np = sampled_idx.detach().cpu().numpy().astype(np.int64)
                 topk_priors_np = sampled_priors.detach().cpu().numpy().astype(np.float64)
             elif use_topk:
@@ -410,18 +417,15 @@ class BatchedMCTS(MCTS):
 def select_action(
     root: MCTSNode,
     temperature: float = 1.0,
-    use_importance_sampling: bool = False,
 ) -> tuple[int, list[float]]:
     """Select action from MCTS visit counts using temperature.
 
-    Args:
-        root: MCTS root node after search.
-        temperature: temperature for action sampling (0 = greedy).
-        use_importance_sampling: if True, the returned policy target uses the
-            Sampled MuZero IS correction `π_target(a) ∝ N(a) / π_net(a)` over
-            sampled actions; 0 elsewhere. The returned *action* is always chosen
-            from raw visit counts (the correction is a training target, not a
-            play-time policy).
+    The returned dense policy is raw-normalized visit counts `N(a)/ΣN(a)` over
+    the root's children. Under Sampled MuZero (Hubert 2021 Proposed
+    Modification) the search already accounts for the sampling via the
+    renormalized-over-σ prior inside PUCT, so no post-hoc β̂/β correction is
+    applied here — Theorem 1 gives that raw visit counts already approximate
+    the improved policy Î_β π.
 
     Returns:
         action: selected action index
@@ -430,9 +434,10 @@ def select_action(
     actions = root.child_actions
     visits = root.child_visits.astype(np.float64)
 
-    # Action selection: visit-count based (unchanged under IS).
     if temperature == 0:
         action = int(actions[int(np.argmax(visits))])
+        probs = np.zeros(len(actions))
+        probs[int(np.argmax(visits))] = 1.0
     else:
         visits_temp = visits ** (1.0 / temperature)
         total_v = visits_temp.sum()
@@ -441,22 +446,7 @@ def select_action(
         else:
             visit_probs = visits_temp / total_v
         action = int(np.random.choice(actions, p=visit_probs))
-
-    # Policy target distribution.
-    if use_importance_sampling:
-        priors_net = np.asarray(root.child_priors_net, dtype=np.float64)
-        weights = visits / np.maximum(priors_net, 1e-12)
-        total_w = weights.sum()
-        if total_w <= 0:
-            probs = np.ones(len(actions)) / len(actions)
-        else:
-            probs = weights / total_w
-    else:
-        if temperature == 0:
-            probs = np.zeros(len(actions))
-            probs[int(np.argmax(visits))] = 1.0
-        else:
-            probs = visit_probs
+        probs = visit_probs
 
     max_action = int(actions.max()) + 1
     action_probs = np.zeros(max_action, dtype=np.float64)
