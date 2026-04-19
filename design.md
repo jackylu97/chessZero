@@ -250,3 +250,48 @@ Expected speedup: ~90× on both expansion and per-node UCB selection. Chess self
 Added `max_plies = 400` to `ChessGame`. Forces draw (`winner=0`, `reward=0.0`) on games that run past 400 plies. With `leaf_top_k` in place, games should terminate via normal chess rules long before the cap; this stays as a safety net against pathological repetition loops that evade python-chess's 5-fold repetition check (which requires exact position matches including castling rights, en passant, and side-to-move).
 
 AlphaZero used a 512-ply cap for the same reason. 400 is a conservative choice — longest recorded master game is ~540 plies, but the longest meaningful MuZero self-play game is much shorter.
+
+---
+
+## Normalization: BatchNorm → LayerNorm (training stability)
+
+### Symptom
+Chess training run diverged at step 2650 of a 25k-step run: policy loss jumped from ~4.2 → 6.2, value and reward losses spiked simultaneously. Loss never fully recovered over the remaining 400 steps before the run crashed on NaN at step 3048.
+
+### Diagnosis via checkpoint diff
+Compared per-parameter weight deltas across `checkpoint_2500 → checkpoint_3000` (contains the spike) against `checkpoint_2000 → checkpoint_2500` (a baseline 500-step window with no spike). The 15 largest-ratio parameters were all BatchNorm `running_mean` / `running_var`, not trainable weights:
+
+- `dynamics.bn_in.running_var`: 0.22 → 16.94 (76× baseline delta)
+- `dynamics.blocks.0.bn1.running_var`: 0.31 → 18.35 (60×)
+- `dynamics.blocks.1.bn1.running_var`: 0.58 → 26.75 (46×)
+- `prediction.value_head.1.running_mean`: 5.23 → 52.95 (10×)
+
+Trainable weights in the spike window moved only 3–5× baseline — consistent with normal gradient descent adapting to shifted inputs. Median layer delta ratio was 0.95 (most layers looked normal). The anomaly was strictly in BN running stats, concentrated in the dynamics stack.
+
+### Root cause
+MuZero's dynamics network is applied **recurrently** during training unroll (K=5 times per sample, each time consuming its own output). BatchNorm's `running_var` / `running_mean` are EMAs that assume IID batch statistics, but unrolled hidden states at different timesteps are causally correlated — not IID. One outlier batch pulled the running_var on dynamics BN layers by 30–80×, and the corrupted running stats then distorted every subsequent forward pass. Because the net keeps ingesting hidden states through corrupted BN at each unroll step, the stats can't self-correct within a few iterations — hence the 400-step slow-recovery-never-completes pattern observed in the run.
+
+### Fix: replace BatchNorm with LayerNorm throughout
+- `src/model/utils.py`: added `norm_layer(num_channels, spatial_shape) → nn.LayerNorm([C, H, W])`. `ResidualBlock` now takes a required `spatial_shape` argument (needed because LayerNorm's affine params are per-(C,H,W), not per-channel as in BN/GN).
+- `src/model/muzero_net.py`: every `nn.BatchNorm2d(C)` call replaced with `norm_layer(C, (H, W))` in `MuZeroNetwork` (representation projection, dynamics bn_in, prediction policy/value heads) and `MultiGameMuZeroNetwork`.
+
+LayerNorm has no running statistics, so the recurrent-drift failure mode disappears entirely.
+
+### Reference check
+- **muzero-general**: uses BatchNorm2d throughout (susceptible to same failure).
+- **LightZero**: `norm_type` is configurable (`'BN'` or `'LN'`); **`'LN'` is the default**. Uses `nn.LayerNorm([C, H, W])` — we match exactly.
+- **DeepMind's updated MuZero architecture** (post-2020 papers): uses LayerNorm.
+
+Residual block ordering is **post-activation** (`Conv → Norm → ReLU → Conv → Norm → add → ReLU`), matching both muzero-general and LightZero's ResBlock. An earlier attempt to also adopt pre-activation (ResNet v2) was reverted — the claim came from an unverified web-search snippet, and the two actively-maintained reference implementations both use post-activation.
+
+### Param count
+LayerNorm's per-(C,H,W) affine adds parameters relative to BN's per-C. Chess net: 39.06M → 41.19M (+5%). Well within budget.
+
+### Monitoring added to catch future divergences early
+- `train/grad_norm`: pre-clip gradient norm. Sharp spike = bad gradient event.
+- `train/amp_scale`: `GradScaler` current scale. Staircase-down pattern during a loss spike = AMP overflow. Stable = overflow is not the cause.
+- `trainer._train_step` skips the optimizer step and priority update on non-finite loss.
+- `ReplayBuffer.sample_batch` / `update_priorities` sanitize non-finite priorities defensively.
+
+### Breaking change
+The norm-layer swap changes parameter names and shapes, so checkpoints trained under the BN architecture cannot be loaded into the new one. A fresh training run is the only path forward.

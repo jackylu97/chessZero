@@ -52,7 +52,9 @@ class GameHistory:
                     for j in range(idx, min(bootstrap_idx, len(self))):
                         r = self.rewards[j] if j < len(self.rewards) else 0.0
                         value += (discount ** (j - idx)) * r
-                    if bootstrap_idx < len(self):
+                    # root_values has one fewer entry than observations (no root_value
+                    # for the terminal observation), so guard against that off-by-one.
+                    if bootstrap_idx < len(self.root_values):
                         sign = 1.0 if ((bootstrap_idx % 2) == (idx % 2)) else -1.0
                         value += (discount ** td_steps) * sign * self.root_values[bootstrap_idx]
 
@@ -129,6 +131,8 @@ class ReplayBuffer:
         """
         n = len(self.buffer)
         priorities = np.array(self._priorities[:n], dtype=np.float64)
+        # Repair any non-finite priorities from past NaN/Inf TD errors.
+        priorities = np.where(np.isfinite(priorities) & (priorities > 0), priorities, 1.0)
         probs = priorities ** alpha
         probs /= probs.sum()
 
@@ -169,7 +173,11 @@ class ReplayBuffer:
         """Update game priorities from TD errors computed during training."""
         for idx, err in zip(game_indices, td_errors):
             if 0 <= idx < len(self._priorities):
-                self._priorities[idx] = float(abs(err)) + epsilon
+                err = float(abs(err))
+                # Guard against NaN/Inf from divergent training steps poisoning the buffer.
+                if not np.isfinite(err):
+                    err = 1.0
+                self._priorities[idx] = err + epsilon
 
     def save(self, path: str | Path):
         with open(path, "wb") as f:

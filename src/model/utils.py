@@ -4,15 +4,42 @@ import torch
 import torch.nn as nn
 
 
-class ResidualBlock(nn.Module):
-    """Standard residual block: Conv-BN-ReLU-Conv-BN + skip connection."""
+def norm_layer(num_channels: int, spatial_shape: tuple[int, int]) -> nn.Module:
+    """LayerNorm over (channels, height, width) per sample.
 
-    def __init__(self, planes: int):
+    Why LayerNorm and not BatchNorm: BN maintains running_mean/running_var EMAs
+    that assume IID batch statistics. MuZero's dynamics is applied recurrently
+    during training unroll (K=5 applications per sample), violating IID — one
+    outlier batch can pull running_var by 30-80x and the net takes hundreds of
+    steps to recover. Observed on a chess training run (checkpoint diff:
+    dynamics BN running_var jumped 0.3 -> 17 across a single loss-spike event).
+    LayerNorm has no running stats, so the failure mode disappears.
+
+    Choice of LayerNorm vs GroupNorm: both fix the running-stats issue. LN is
+    the canonical choice in MuZero derivatives — DeepMind's updated architecture
+    (post-2020) and LightZero (default: norm_type='LN') both use LN. We match.
+
+    Shape convention: nn.LayerNorm([C, H, W]) normalizes across all C*H*W
+    values per sample. This requires knowing spatial dims at construction time,
+    which is fine since each game's board size is fixed in config.
+    """
+    return nn.LayerNorm([num_channels, *spatial_shape], eps=1e-5)
+
+
+class ResidualBlock(nn.Module):
+    """Post-activation residual block: Conv -> Norm -> ReLU -> Conv -> Norm, add, ReLU.
+
+    Matches the AlphaZero-era residual block ordering (ResNet v1, He 2015) used
+    by both muzero-general and LightZero. The spatial_shape arg is required
+    because norm_layer uses nn.LayerNorm, which needs per-(C,H,W) affine params.
+    """
+
+    def __init__(self, planes: int, spatial_shape: tuple[int, int]):
         super().__init__()
         self.conv1 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
+        self.bn1 = norm_layer(planes, spatial_shape)
         self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
+        self.bn2 = norm_layer(planes, spatial_shape)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x

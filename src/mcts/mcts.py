@@ -26,13 +26,27 @@ class MinMaxStats:
 
 @dataclass
 class MCTSNode:
-    """A node in the MCTS search tree."""
-    hidden_state: torch.Tensor | None = None  # (C, H, W)
-    reward: float = 0.0
+    """A node in the MCTS search tree.
+
+    State is double-booked for performance:
+      - Each child has its own `prior`, `visit_count`, `value_sum`, `reward`
+        attributes (used by the Python-loop selection path at small K).
+      - The parent holds parallel numpy arrays `child_priors`, `child_visits`,
+        `child_value_sums`, `child_rewards` (used by the vectorized selection
+        path at large K).
+    `_backpropagate` keeps both copies in sync after each simulation.
+    """
+    hidden_state: torch.Tensor | None = None
     prior: float = 0.0
+    reward: float = 0.0
     visit_count: int = 0
     value_sum: float = 0.0
-    children: dict[int, "MCTSNode"] = field(default_factory=dict)
+    children: list["MCTSNode"] = field(default_factory=list)
+    child_actions: np.ndarray | None = None       # (K,) int64
+    child_priors: np.ndarray | None = None        # (K,) float64
+    child_visits: np.ndarray | None = None        # (K,) float64 (stored float for vectorized math)
+    child_rewards: np.ndarray | None = None       # (K,) float64
+    child_value_sums: np.ndarray | None = None    # (K,) float64
 
     @property
     def value(self) -> float:
@@ -47,7 +61,6 @@ class MCTSNode:
 class MCTS:
     """PUCT-based MCTS for MuZero."""
 
-    # Constants from the MuZero/AlphaZero paper
     PB_C_BASE = 19652
     PB_C_INIT = 1.25
 
@@ -70,49 +83,30 @@ class MCTS:
         legal_actions: list[int],
         add_noise: bool = True,
     ) -> MCTSNode:
-        """Run MCTS simulations from root observation.
-
-        Args:
-            observation: (C, H, W) tensor
-            legal_actions: list of legal action indices
-            add_noise: whether to add Dirichlet noise at root
-
-        Returns:
-            Root MCTSNode with search statistics.
-        """
+        """Run MCTS simulations from root observation."""
         root = MCTSNode()
         min_max_stats = MinMaxStats()
 
-        # Initial inference
         obs_batch = observation.unsqueeze(0).to(self.device)
         hidden, policy_logits, value = self.network.initial_inference(obs_batch)
 
         root.hidden_state = hidden.squeeze(0)
-
-        # Expand root
         self._expand(root, policy_logits.squeeze(0), legal_actions)
 
-        # Add Dirichlet noise at root for exploration
         if add_noise and len(root.children) > 0:
-            noise = np.random.dirichlet(
-                [self.config.dirichlet_alpha] * len(root.children)
-            )
-            eps = self.config.dirichlet_epsilon
-            for i, (action, child) in enumerate(root.children.items()):
-                child.prior = child.prior * (1 - eps) + noise[i] * eps
+            self._add_dirichlet_noise(root)
 
-        # Run simulations
         for _ in range(self.config.num_simulations):
             node = root
             search_path = [node]
+            path_indices: list[int] = [-1]  # root has no parent index; sentinel
 
-            # SELECT: traverse tree until we find an unexpanded node
             while node.expanded():
-                action, child = self._select_child(node, min_max_stats)
+                action, idx, child = self._select_child(node, min_max_stats)
                 node = child
                 search_path.append(node)
+                path_indices.append(idx)
 
-            # EXPAND and EVALUATE
             parent = search_path[-2]
             parent_hidden = parent.hidden_state.unsqueeze(0).to(self.device)
             action_tensor = torch.tensor([action], device=self.device)
@@ -122,25 +116,31 @@ class MCTS:
             node.hidden_state = next_hidden.squeeze(0)
             node.reward = reward.item()
 
-            # For leaf expansion, we use all actions as potentially legal
-            # (MCTS in latent space doesn't have access to game rules at leaves)
             all_actions = list(range(self.game.action_space_size))
             self._expand(node, policy_logits.squeeze(0), all_actions,
                          top_k=getattr(self.config, "leaf_top_k", None))
 
-            # BACKPROPAGATE
-            self._backpropagate(search_path, value.item(), min_max_stats)
+            self._backpropagate(search_path, path_indices, value.item(), min_max_stats)
 
         return root
 
+    def _add_dirichlet_noise(self, node: MCTSNode):
+        """Mix Dirichlet noise into a node's child priors (applied only at root)."""
+        k = len(node.children)
+        noise = np.random.dirichlet([self.config.dirichlet_alpha] * k)
+        eps = self.config.dirichlet_epsilon
+        node.child_priors = node.child_priors * (1.0 - eps) + noise * eps
+        # Mirror into child.prior so the loop selection path sees the noise too.
+        for i, child in enumerate(node.children):
+            child.prior = float(node.child_priors[i])
+
     def _expand(self, node: MCTSNode, policy_logits: torch.Tensor,
                 legal_actions: list[int], top_k: int | None = None):
-        """Expand node with children.
+        """Expand node with children, populating the parallel-array storage.
 
-        At the root, `legal_actions` comes from the game engine (true legal moves).
-        At latent-space leaves, `legal_actions` is all action_space indices —
-        pass `top_k` to restrict expansion to the top-K priors for tractability
-        on large action spaces (e.g. chess's 4672).
+        Does its own GPU softmax + CPU transfer. `BatchedMCTS.run_batch` bypasses
+        this for per-sim leaves — it batches softmax/topk across all N games into
+        one transfer, then calls `_expand_from_priors` below.
         """
         policy = torch.full_like(policy_logits, float("-inf"))
         legal_idx = torch.tensor(legal_actions, dtype=torch.long)
@@ -149,69 +149,144 @@ class MCTS:
 
         if top_k is not None and len(legal_actions) > top_k:
             topk = torch.topk(policy, top_k)
-            for idx, p in zip(topk.indices.tolist(), topk.values.tolist()):
-                node.children[idx] = MCTSNode(prior=p)
+            actions_np = topk.indices.detach().cpu().numpy().astype(np.int64)
+            priors_np = topk.values.detach().cpu().numpy().astype(np.float64)
         else:
-            for action in legal_actions:
-                node.children[action] = MCTSNode(prior=policy[action].item())
+            actions_np = np.asarray(legal_actions, dtype=np.int64)
+            priors_np = policy[torch.from_numpy(actions_np)].detach().cpu().numpy().astype(np.float64)
 
-    def _select_child(self, node: MCTSNode, min_max_stats: MinMaxStats) -> tuple[int, MCTSNode]:
-        """Select child with highest UCB score (PUCT formula from AlphaZero/MuZero)."""
-        best_score = -float("inf")
-        best_action = -1
-        best_child = None
+        self._expand_from_priors(node, actions_np, priors_np)
 
-        # Dynamic exploration constant (grows logarithmically with visits)
+    def _expand_from_priors(self, node: MCTSNode,
+                            actions_np: np.ndarray, priors_np: np.ndarray):
+        """Populate parallel-array storage from pre-computed numpy priors.
+
+        Pure numpy — no GPU ops, no CPU↔GPU transfer. Callers batch the softmax
+        and .cpu() transfer across all games in a sim step, then hand off here.
+        """
+        k = len(actions_np)
+        node.child_actions = actions_np
+        node.child_priors = priors_np.astype(np.float64, copy=False)
+        node.child_visits = np.zeros(k, dtype=np.float64)
+        node.child_rewards = np.zeros(k, dtype=np.float64)
+        node.child_value_sums = np.zeros(k, dtype=np.float64)
+        node.children = [MCTSNode(prior=float(priors_np[i])) for i in range(k)]
+
+    # Dispatch threshold: numpy has ~7us fixed overhead per call; the Python loop
+    # (reading attrs directly off child objects) wins through K~50. Measured
+    # crossover: loop 7.35us / numpy 7.45us at K=50; loop 8.64us / numpy 7.47us
+    # at K=60. Threshold chosen so both paths are used where each is clearly faster.
+    _VECTORIZE_THRESHOLD = 60
+
+    def _select_child(self, node: MCTSNode, min_max_stats: MinMaxStats) -> tuple[int, int, MCTSNode]:
+        """PUCT selection. Returns (action, child_index, child_node).
+
+        `child_index` is the position in the parent's parallel arrays —
+        `_backpropagate` needs it to sync updated child stats back into the parent.
+        """
+        k = len(node.children)
+        if k >= self._VECTORIZE_THRESHOLD:
+            return self._select_child_vectorized(node, min_max_stats)
+        return self._select_child_loop(node, min_max_stats)
+
+    def _select_child_loop(self, node: MCTSNode, min_max_stats: MinMaxStats) -> tuple[int, int, MCTSNode]:
+        """Python-loop PUCT — faster than numpy for small child counts (tictactoe/connect4).
+
+        Reads child stats from the child object attributes (attribute access is ~2x
+        faster than numpy scalar indexing for this size of loop).
+        """
         pb_c = math.log((node.visit_count + self.PB_C_BASE + 1) / self.PB_C_BASE) + self.PB_C_INIT
+        sqrt_n = math.sqrt(node.visit_count)
+        discount = self.config.discount
+        mm_min, mm_max = min_max_stats.minimum, min_max_stats.maximum
+        has_range = mm_max > mm_min
+        mm_span = mm_max - mm_min if has_range else 1.0
 
-        for action, child in node.children.items():
-            # Prior score (exploration)
-            prior_score = pb_c * child.prior * math.sqrt(node.visit_count) / (1 + child.visit_count)
-
-            # Value score (exploitation) — includes reward from transition
-            if child.visit_count > 0:
-                # Q-value = immediate reward + discounted future value, negated for opponent
-                raw_value = -child.reward - self.config.discount * child.value
-                value_score = min_max_stats.normalize(raw_value)
+        best_score = -float("inf")
+        best_idx = -1
+        for i, child in enumerate(node.children):
+            v = child.visit_count
+            prior_score = pb_c * child.prior * sqrt_n / (1.0 + v)
+            if v > 0:
+                raw_q = -child.reward - discount * (child.value_sum / v)
+                value_score = (raw_q - mm_min) / mm_span if has_range else raw_q
             else:
                 value_score = 0.0
-
             score = prior_score + value_score
-
             if score > best_score:
                 best_score = score
-                best_action = action
-                best_child = child
+                best_idx = i
+        return int(node.child_actions[best_idx]), best_idx, node.children[best_idx]
 
-        return best_action, best_child
+    def _select_child_vectorized(self, node: MCTSNode, min_max_stats: MinMaxStats) -> tuple[int, int, MCTSNode]:
+        """Numpy-vectorized PUCT — faster for large child counts (chess leaves)."""
+        priors = node.child_priors
+        visits = node.child_visits
+        rewards = node.child_rewards
+        value_sums = node.child_value_sums
 
-    def _backpropagate(self, search_path: list[MCTSNode], value: float, min_max_stats: MinMaxStats):
-        """Backpropagate value through the search path.
+        pb_c = math.log((node.visit_count + self.PB_C_BASE + 1) / self.PB_C_BASE) + self.PB_C_INIT
+        sqrt_n = math.sqrt(node.visit_count)
 
-        Value alternates sign for two-player games (opponent's gain = our loss).
+        prior_scores = pb_c * priors * sqrt_n / (1.0 + visits)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            child_values = np.where(visits > 0, value_sums / np.maximum(visits, 1.0), 0.0)
+        raw_q = -rewards - self.config.discount * child_values
+
+        if min_max_stats.maximum > min_max_stats.minimum:
+            normalized_q = (raw_q - min_max_stats.minimum) / (min_max_stats.maximum - min_max_stats.minimum)
+        else:
+            normalized_q = raw_q
+        value_scores = np.where(visits > 0, normalized_q, 0.0)
+
+        scores = prior_scores + value_scores
+        best_idx = int(np.argmax(scores))
+        return int(node.child_actions[best_idx]), best_idx, node.children[best_idx]
+
+    def _backpropagate(self, search_path: list[MCTSNode], path_indices: list[int],
+                       value: float, min_max_stats: MinMaxStats):
+        """Backprop the leaf value up the search path and sync parent arrays.
+
+        path_indices[i] is the index of search_path[i] in search_path[i-1]'s
+        child arrays (or -1 for the root, which has no parent).
         """
-        for i, node in enumerate(reversed(search_path)):
-            # Alternate perspective: even depth = current player, odd = opponent
-            sign = 1.0 if (i % 2 == 0) else -1.0
+        n = len(search_path)
+        for depth in range(n - 1, -1, -1):
+            node = search_path[depth]
+            sign = 1.0 if ((n - 1 - depth) % 2 == 0) else -1.0
             node.visit_count += 1
             node.value_sum += value * sign
 
-            # Update MinMaxStats with the Q-value that UCB will use for this node
-            # (from the parent's perspective: -reward - discount * value)
+            if depth > 0:
+                parent = search_path[depth - 1]
+                idx = path_indices[depth]
+                parent.child_visits[idx] = node.visit_count
+                parent.child_value_sums[idx] = node.value_sum
+                parent.child_rewards[idx] = node.reward
+
             if node.visit_count > 0:
                 min_max_stats.update(-node.reward - self.config.discount * node.value)
 
-            # Bootstrap value through the tree
             value = node.reward + self.config.discount * value
 
 
-class BatchedMCTS(MCTS):
-    """MCTS over N games simultaneously, batching all network calls across games.
+def _masked_softmax_np(logits: np.ndarray, legal_actions: np.ndarray) -> np.ndarray:
+    """Softmax over `legal_actions` only. Returns probs of shape (len(legal_actions),)."""
+    x = logits[legal_actions]
+    x = x - x.max()
+    e = np.exp(x)
+    return e / e.sum()
 
-    Each simulation step does one recurrent_inference call of batch size N
-    instead of N calls of batch size 1. For small models on GPU this gives a
-    large throughput improvement since kernel launch overhead dominates over
-    actual compute at batch size 1.
+
+class BatchedMCTS(MCTS):
+    """MCTS over N games simultaneously, batching all network calls.
+
+    Sync budget per simulation: **3 GPU→CPU transfers** regardless of N —
+    one bulk `.tolist()` for rewards, one for values, one `.cpu()` for
+    policy top-K (or full softmax if no `leaf_top_k`). The previous
+    implementation did 3N transfers (one per game per step); at N=64 this
+    is a ~60× reduction in sync-barrier count.
     """
 
     @torch.no_grad()
@@ -221,69 +296,75 @@ class BatchedMCTS(MCTS):
         legal_actions_list: list[list[int]],
         add_noise: bool = True,
     ) -> list[MCTSNode]:
-        """Run MCTS for N games in parallel.
-
-        Args:
-            observations: list of N (C, H, W) tensors
-            legal_actions_list: list of N legal-action lists
-            add_noise: whether to add Dirichlet noise at roots
-
-        Returns:
-            list of N root MCTSNodes with search statistics
-        """
         n = len(observations)
         roots = [MCTSNode() for _ in range(n)]
         min_max_stats = [MinMaxStats() for _ in range(n)]
 
-        # Batch initial inference for all N roots
-        obs_batch = torch.stack(observations).to(self.device)  # (N, C, H, W)
-        hidden_batch, policy_batch, value_batch = self.network.initial_inference(obs_batch)
+        obs_batch = torch.stack(observations).to(self.device)
+        hidden_batch_gpu, policy_batch, _ = self.network.initial_inference(obs_batch)
 
+        # One bulk transfer of all root logits; mask+softmax per game in numpy.
+        root_logits_cpu = policy_batch.detach().cpu().numpy().astype(np.float64)
         for g in range(n):
-            roots[g].hidden_state = hidden_batch[g]
-            self._expand(roots[g], policy_batch[g], legal_actions_list[g])
+            roots[g].hidden_state = hidden_batch_gpu[g]
+            legals_np = np.asarray(legal_actions_list[g], dtype=np.int64)
+            priors_np = _masked_softmax_np(root_logits_cpu[g], legals_np)
+            self._expand_from_priors(roots[g], legals_np, priors_np)
             if add_noise and roots[g].children:
-                noise = np.random.dirichlet(
-                    [self.config.dirichlet_alpha] * len(roots[g].children)
-                )
-                eps = self.config.dirichlet_epsilon
-                for i, child in enumerate(roots[g].children.values()):
-                    child.prior = child.prior * (1 - eps) + noise[i] * eps
+                self._add_dirichlet_noise(roots[g])
 
-        all_actions = list(range(self.game.action_space_size))
+        action_space_size = self.game.action_space_size
+        leaf_top_k = getattr(self.config, "leaf_top_k", None)
+        use_topk = leaf_top_k is not None and leaf_top_k < action_space_size
+        all_actions_np = np.arange(action_space_size, dtype=np.int64)
 
         for _ in range(self.config.num_simulations):
             search_paths = []
+            path_indices_all = []
             parent_hiddens = []
             leaf_actions = []
 
-            # SELECT phase — pure CPU, one pass per game
             for g in range(n):
                 node = roots[g]
                 path = [node]
+                path_indices = [-1]
                 last_action = None
                 while node.expanded():
-                    last_action, child = self._select_child(node, min_max_stats[g])
+                    last_action, idx, child = self._select_child(node, min_max_stats[g])
                     node = child
                     path.append(node)
+                    path_indices.append(idx)
                 search_paths.append(path)
+                path_indices_all.append(path_indices)
                 parent_hiddens.append(path[-2].hidden_state)
                 leaf_actions.append(last_action)
 
-            # EXPAND — single batched network call
-            hidden_batch = torch.stack(parent_hiddens).to(self.device)       # (N, C, H, W)
-            action_batch = torch.tensor(leaf_actions, device=self.device)    # (N,)
+            hidden_batch = torch.stack(parent_hiddens).to(self.device)
+            action_batch = torch.tensor(leaf_actions, device=self.device)
             next_hiddens, rewards, policy_batch, value_batch = \
                 self.network.recurrent_inference(hidden_batch, action_batch)
 
-            # BACKPROPAGATE — distribute results
-            leaf_top_k = getattr(self.config, "leaf_top_k", None)
+            # Batched GPU→CPU transfers: 3 syncs for the whole step, not 3×N.
+            rewards_list = rewards.view(-1).tolist()
+            values_list = value_batch.view(-1).tolist()
+            probs_gpu = torch.softmax(policy_batch, dim=-1)
+            if use_topk:
+                topk = torch.topk(probs_gpu, leaf_top_k, dim=-1)
+                topk_actions_np = topk.indices.detach().cpu().numpy().astype(np.int64)
+                topk_priors_np = topk.values.detach().cpu().numpy().astype(np.float64)
+            else:
+                probs_np = probs_gpu.detach().cpu().numpy().astype(np.float64)
+
             for g in range(n):
                 leaf = search_paths[g][-1]
                 leaf.hidden_state = next_hiddens[g]
-                leaf.reward = rewards[g].item()
-                self._expand(leaf, policy_batch[g], all_actions, top_k=leaf_top_k)
-                self._backpropagate(search_paths[g], value_batch[g].item(), min_max_stats[g])
+                leaf.reward = rewards_list[g]
+                if use_topk:
+                    self._expand_from_priors(leaf, topk_actions_np[g], topk_priors_np[g])
+                else:
+                    self._expand_from_priors(leaf, all_actions_np, probs_np[g])
+                self._backpropagate(search_paths[g], path_indices_all[g],
+                                    values_list[g], min_max_stats[g])
 
         return roots
 
@@ -293,26 +374,26 @@ def select_action(root: MCTSNode, temperature: float = 1.0) -> tuple[int, list[f
 
     Returns:
         action: selected action index
-        action_probs: probability distribution over all children
+        action_probs: probability distribution over all children (dense up to max action)
     """
-    actions = list(root.children.keys())
-    visits = np.array([root.children[a].visit_count for a in actions], dtype=np.float64)
+    actions = root.child_actions
+    visits = root.child_visits.astype(np.float64)
 
     if temperature == 0:
-        # Greedy
-        action = actions[np.argmax(visits)]
+        best = int(np.argmax(visits))
         probs = np.zeros(len(actions))
-        probs[np.argmax(visits)] = 1.0
+        probs[best] = 1.0
+        action = int(actions[best])
     else:
-        # Temperature-scaled distribution
         visits_temp = visits ** (1.0 / temperature)
-        probs = visits_temp / visits_temp.sum()
-        action = np.random.choice(actions, p=probs)
+        total = visits_temp.sum()
+        if total <= 0:
+            probs = np.ones(len(actions)) / len(actions)
+        else:
+            probs = visits_temp / total
+        action = int(np.random.choice(actions, p=probs))
 
-    # Build full action probability vector
-    max_action = max(actions) + 1
-    action_probs = np.zeros(max_action)
-    for a, p in zip(actions, probs):
-        action_probs[a] = p
-
+    max_action = int(actions.max()) + 1
+    action_probs = np.zeros(max_action, dtype=np.float64)
+    action_probs[actions] = probs
     return action, action_probs.tolist()

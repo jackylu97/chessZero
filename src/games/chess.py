@@ -191,7 +191,51 @@ class ChessGame(Game):
         return torch.from_numpy(planes)
 
     def render(self, state: GameState) -> str:
-        return str(state.board)
+        board = state.board
+        lines = ["  a b c d e f g h"]
+        for rank in range(7, -1, -1):
+            row = [f"{rank + 1}"]
+            for file in range(8):
+                piece = board.piece_at(rank * 8 + file)
+                row.append(piece.symbol() if piece else ".")
+            row.append(f"{rank + 1}")
+            lines.append(" ".join(row))
+        lines.append("  a b c d e f g h")
+        turn = "White" if board.turn == chess.WHITE else "Black"
+        suffix = f"\n{turn} to move"
+        if board.is_check():
+            suffix += "  (check)"
+        return "\n".join(lines) + suffix
+
+    def action_to_san(self, state: GameState, action: int) -> str:
+        """Convert an action index to Standard Algebraic Notation (e.g. 'Nf3')."""
+        move = _action_to_move(action, state.board)
+        if move is None:
+            return f"<invalid action {action}>"
+        return state.board.san(move)
+
+    def parse_human_move(self, state: GameState, text: str) -> int | None:
+        """Parse UCI ('e2e4') or SAN ('e4', 'Nf3', 'O-O') into a legal action index.
+
+        Returns None if the input is unparseable or the move isn't legal.
+        """
+        text = text.strip()
+        if not text:
+            return None
+        board = state.board
+        move = None
+        try:
+            move = board.parse_uci(text)
+        except ValueError:
+            pass
+        if move is None:
+            try:
+                move = board.parse_san(text)
+            except ValueError:
+                return None
+        if move not in board.legal_moves:
+            return None
+        return _move_to_action(move)
 
     def clone_state(self, state: GameState) -> GameState:
         return GameState(

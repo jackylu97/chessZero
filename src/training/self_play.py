@@ -85,6 +85,9 @@ def play_games_parallel(
     move_counts = [0] * num_games
     active = list(range(num_games))
 
+    iteration = 0
+    log_every = 20  # emit a progress line every 20 lockstep moves (silent for fast games)
+
     while active:
         obs_list = [game.to_tensor(states[g]) for g in active]
         legal_list = [game.legal_actions(states[g]) for g in active]
@@ -114,6 +117,18 @@ def play_games_parallel(
                 still_active.append(g)
 
         active = still_active
+        iteration += 1
+
+        if iteration % log_every == 0:
+            done = num_games - len(active)
+            done_lengths = [len(h.actions) for h in histories if h.game_outcome is not None]
+            avg_done = (sum(done_lengths) / len(done_lengths)) if done_lengths else 0.0
+            tqdm.write(
+                f"  self-play batch: move {iteration}, "
+                f"{len(active)}/{num_games} active, "
+                f"{done} done"
+                + (f" (avg length {avg_done:.0f})" if done_lengths else "")
+            )
 
     return histories
 

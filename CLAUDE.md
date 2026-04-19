@@ -47,6 +47,19 @@ better (directly encodes *where* the action was on the board). Keeping scalar br
 
 ## Architecture Summary
 
+### Normalization — LayerNorm (not BatchNorm)
+All norm layers in the network are `nn.LayerNorm([C, H, W])` — see `norm_layer()` in `src/model/utils.py`. `ResidualBlock` takes a required `spatial_shape` arg because LN's affine params are per-(C,H,W).
+
+**Why not BN:** MuZero dynamics is applied recurrently during training unroll (K=5 applications per sample). BN's `running_var` EMA assumes IID batch statistics; unrolled hidden states violate this. An observed failure mode: a single outlier batch pulled dynamics BN `running_var` by 30–80×, losses spiked across all three heads simultaneously, and the net never recovered before crashing on NaN ~400 steps later. LayerNorm has no running stats → failure mode disappears. Matches LightZero's default and DeepMind's updated architecture. Full diagnosis in `design.md`.
+
+**Residual block order:** post-activation (`Conv → Norm → ReLU → Conv → Norm → add → ReLU`), matching both muzero-general and LightZero.
+
+### Training stability monitoring (trainer.py)
+- `train/grad_norm`: pre-clip gradient norm (divergence early-warning).
+- `train/amp_scale`: `GradScaler` scale; staircase-down during a loss spike indicates AMP overflow.
+- Non-finite loss → skip optimizer step and priority update (prevents NaN propagation into weights).
+- `ReplayBuffer` sanitizes non-finite priorities on both write and read.
+
 ### Multi-game spatial alignment
 Games padded to 8×8 via `_pad_to_size()` (zero-padding). Bilinear interpolation
 was rejected — produces fractional values that distort discrete board semantics.

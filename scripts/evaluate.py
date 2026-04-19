@@ -70,14 +70,24 @@ def parse_tictactoe_move(move_str: str) -> int | None:
 def play_interactive(game, network, config, device):
     """Play interactively against the trained model."""
     from src.games.tictactoe import TicTacToe
+    from src.games.chess import ChessGame
     is_tictactoe = isinstance(game, TicTacToe)
+    is_chess = isinstance(game, ChessGame)
 
     mcts = MCTS(network, game, config, device)
     state = game.reset()
 
-    print("You are O (player -1). Model is X (player 1).")
-    if is_tictactoe:
+    if is_chess:
+        print("You are Black. Model is White.")
+        print("Enter moves as UCI (e2e4, g1f3, e7e8q) or SAN (e4, Nf3, O-O).")
+        print("Type 'quit' to exit.\n")
+    elif is_tictactoe:
+        print("You are O (player -1). Model is X (player 1).")
         print("Enter moves as 'row col' (e.g. '2 3' for row 2, column 3).\n")
+    else:
+        print("You are player -1. Model is player 1.\n")
+
+    if is_tictactoe:
         print(game.render_with_moves(state))
     else:
         print(game.render(state))
@@ -88,7 +98,9 @@ def play_interactive(game, network, config, device):
             obs = game.to_tensor(state)
             root = mcts.run(obs, legal, add_noise=False)
             action, _ = select_action(root, temperature=0)
-            if is_tictactoe:
+            if is_chess:
+                print(f"\nModel plays: {game.action_to_san(state, action)}")
+            elif is_tictactoe:
                 row, col = divmod(action, 3)
                 print(f"\nModel plays: row {row + 1}, col {col + 1}")
             else:
@@ -96,7 +108,16 @@ def play_interactive(game, network, config, device):
         else:
             while True:
                 try:
-                    if is_tictactoe:
+                    if is_chess:
+                        raw = input("\nYour move: ").strip()
+                        if raw.lower() in ("quit", "exit", "q"):
+                            print("Bye.")
+                            return
+                        action = game.parse_human_move(state, raw)
+                        if action is None:
+                            print("Couldn't parse or not legal. Try UCI (e2e4) or SAN (Nf3).")
+                            continue
+                    elif is_tictactoe:
                         raw = input("\nYour move (row col): ")
                         action = parse_tictactoe_move(raw)
                         if action is None:
@@ -106,7 +127,10 @@ def play_interactive(game, network, config, device):
                         action = int(input(f"\nLegal moves: {legal}\nYour move: "))
                     if action in legal:
                         break
-                    print("That square is taken — pick an empty one.")
+                    if is_chess:
+                        print("That move isn't legal from this position.")
+                    else:
+                        print("That square is taken — pick an empty one.")
                 except ValueError:
                     print("Enter a number.")
 
@@ -117,12 +141,20 @@ def play_interactive(game, network, config, device):
         else:
             print(game.render(state))
 
-    if state.winner == 1:
-        print("\nModel wins!")
-    elif state.winner == -1:
-        print("\nYou win!")
+    if is_chess:
+        if state.winner == 1:
+            print("\nModel (White) wins!")
+        elif state.winner == -1:
+            print("\nYou (Black) win!")
+        else:
+            print("\nDraw.")
     else:
-        print("\nDraw!")
+        if state.winner == 1:
+            print("\nModel wins!")
+        elif state.winner == -1:
+            print("\nYou win!")
+        else:
+            print("\nDraw!")
 
 
 def eval_vs_random(game, network, config, device, num_games=100):

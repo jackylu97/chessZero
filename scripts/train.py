@@ -3,6 +3,7 @@
 import argparse
 import sys
 import os
+from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -12,6 +13,7 @@ import torch
 from src.config import get_config
 from src.games.tictactoe import TicTacToe
 from src.model.muzero_net import MuZeroNetwork
+from src.training.run_id import generate_run_id
 from src.training.trainer import MuZeroTrainer
 
 
@@ -42,6 +44,10 @@ def main():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--log-dir", type=str, default="runs")
+    parser.add_argument("--checkpoints-dir", type=str, default="checkpoints")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Run ID (default: auto-generate YYYY_MM_DD_NNNN). "
+                             "Pass an existing ID to continue writing into that run's dirs.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
 
@@ -62,6 +68,14 @@ def main():
 
     game = get_game(args.game)
 
+    run_id = args.run_id or generate_run_id(
+        Path(args.checkpoints_dir) / args.game,
+        Path(args.log_dir) / args.game,
+    )
+    print(f"Run ID: {run_id}")
+    print(f"  Checkpoints: {Path(args.checkpoints_dir) / args.game / run_id}")
+    print(f"  TensorBoard: {Path(args.log_dir) / args.game / run_id}")
+
     network = MuZeroNetwork(
         observation_channels=game.num_planes,
         action_space_size=game.action_space_size,
@@ -76,7 +90,12 @@ def main():
         reward_support_size=config.reward_support_size,
     )
 
-    trainer = MuZeroTrainer(config, game, network, device, args.log_dir)
+    trainer = MuZeroTrainer(
+        config, game, network, run_id,
+        device=device,
+        log_dir=args.log_dir,
+        checkpoints_dir=args.checkpoints_dir,
+    )
 
     if args.resume:
         trainer.load_checkpoint(args.resume)

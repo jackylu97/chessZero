@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import ResidualBlock, mlp_head, support_to_scalar, inverse_scalar_transform
+from .utils import ResidualBlock, mlp_head, norm_layer, support_to_scalar, inverse_scalar_transform
 
 
 class RepresentationNetwork(nn.Module):
@@ -28,13 +28,15 @@ class RepresentationNetwork(nn.Module):
         self.latent_w = latent_w
         self.needs_resize = (input_h != latent_h) or (input_w != latent_w)
 
+        # Projection norm operates at the raw input resolution (may differ from
+        # latent if needs_resize); residual blocks operate at the latent size.
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_planes, 3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_planes),
+            norm_layer(hidden_planes, (input_h, input_w)),
             nn.ReLU(),
         )
         self.blocks = nn.Sequential(
-            *[ResidualBlock(hidden_planes) for _ in range(num_blocks)]
+            *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
@@ -71,10 +73,10 @@ class DynamicsNetwork(nn.Module):
 
         # Conv to reduce channels after concatenating action plane
         self.conv_in = nn.Conv2d(hidden_planes + 1, hidden_planes, 3, padding=1, bias=False)
-        self.bn_in = nn.BatchNorm2d(hidden_planes)
+        self.bn_in = norm_layer(hidden_planes, (latent_h, latent_w))
 
         self.blocks = nn.Sequential(
-            *[ResidualBlock(hidden_planes) for _ in range(num_blocks)]
+            *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
         )
 
         # Reward head outputs categorical distribution
@@ -130,7 +132,7 @@ class PredictionNetwork(nn.Module):
         # Policy head
         self.policy_head = nn.Sequential(
             nn.Conv2d(hidden_planes, 2, 1, bias=False),
-            nn.BatchNorm2d(2),
+            norm_layer(2, (latent_h, latent_w)),
             nn.ReLU(),
             nn.Flatten(),
             nn.Linear(2 * latent_h * latent_w, action_space_size),
@@ -141,7 +143,7 @@ class PredictionNetwork(nn.Module):
         value_out = 2 * value_support_size + 1
         self.value_head = nn.Sequential(
             nn.Conv2d(hidden_planes, 1, 1, bias=False),
-            nn.BatchNorm2d(1),
+            norm_layer(1, (latent_h, latent_w)),
             nn.ReLU(),
             nn.Flatten(),
             mlp_head(latent_h * latent_w, fc_hidden, value_out),
@@ -287,25 +289,26 @@ class MultiGameMuZeroNetwork(nn.Module):
         # signal. This may improve multi-game alignment if shared training underperforms.
         self.game_embeddings = nn.Embedding(len(self.game_names), game_id_dim)
 
-        # Per-game input projections
+        # Per-game input projections (each at the game's native input resolution,
+        # before padding to the shared latent size).
         self.input_projections = nn.ModuleDict()
         for name, cfg in game_configs.items():
             self.input_projections[name] = nn.Sequential(
                 nn.Conv2d(cfg["obs_channels"], hidden_planes, 3, padding=1, bias=False),
-                nn.BatchNorm2d(hidden_planes),
+                norm_layer(hidden_planes, (cfg["input_h"], cfg["input_w"])),
                 nn.ReLU(),
             )
 
-        # Shared backbone (representation)
+        # Shared backbone (representation) — runs at (latent_h, latent_w) after padding.
         self.shared_repr_blocks = nn.Sequential(
-            *[ResidualBlock(hidden_planes) for _ in range(num_blocks)]
+            *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
         )
 
         # Shared dynamics backbone
         self.dynamics_conv_in = nn.Conv2d(hidden_planes + 1, hidden_planes, 3, padding=1, bias=False)
-        self.dynamics_bn_in = nn.BatchNorm2d(hidden_planes)
+        self.dynamics_bn_in = norm_layer(hidden_planes, (latent_h, latent_w))
         self.shared_dynamics_blocks = nn.Sequential(
-            *[ResidualBlock(hidden_planes) for _ in range(num_blocks)]
+            *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
         )
 
         # Per-game heads
@@ -315,7 +318,7 @@ class MultiGameMuZeroNetwork(nn.Module):
         for name, cfg in game_configs.items():
             self.policy_heads[name] = nn.Sequential(
                 nn.Conv2d(hidden_planes, 2, 1, bias=False),
-                nn.BatchNorm2d(2),
+                norm_layer(2, (latent_h, latent_w)),
                 nn.ReLU(),
                 nn.Flatten(),
                 nn.Linear(2 * latent_h * latent_w, cfg["action_space"]),
@@ -324,7 +327,7 @@ class MultiGameMuZeroNetwork(nn.Module):
 
             self.value_heads[name] = nn.Sequential(
                 nn.Conv2d(hidden_planes, 1, 1, bias=False),
-                nn.BatchNorm2d(1),
+                norm_layer(1, (latent_h, latent_w)),
                 nn.ReLU(),
                 nn.Flatten(),
                 mlp_head(latent_h * latent_w, fc_hidden, value_out),

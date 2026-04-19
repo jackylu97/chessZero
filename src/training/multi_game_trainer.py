@@ -24,17 +24,22 @@ class MultiGameTrainer:
     def __init__(
         self,
         game_names: list[str],
+        run_id: str,
         hidden_planes: int = 128,
         num_blocks: int = 8,
         latent_size: int = 8,
         fc_hidden: int = 128,
         training_steps: int = 200000,
         device: str = "cpu",
-        log_dir: str = "runs/multi_game",
+        log_dir: str = "runs",
+        checkpoints_dir: str = "checkpoints",
     ):
         self.device = device
         self.training_steps = training_steps
         self.game_names = game_names
+        self.run_id = run_id
+        self.checkpoint_dir = Path(checkpoints_dir) / "multi_game" / run_id
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Create games and configs
         self.games = {}
@@ -72,7 +77,7 @@ class MultiGameTrainer:
         self.scaler = GradScaler("cuda", enabled=use_amp)
         self.use_amp = use_amp
 
-        self.writer = SummaryWriter(log_dir=log_dir)
+        self.writer = SummaryWriter(log_dir=os.path.join(log_dir, "multi_game", run_id))
         self.global_step = 0
 
         print(f"Multi-game MuZero: {game_names}")
@@ -227,14 +232,12 @@ class MultiGameTrainer:
         tqdm.write(f"Step {step} [{game_name}]: {win_rate:.1%} win rate vs random")
 
     def _save_checkpoint(self, step: int):
-        path = Path("checkpoints") / "multi_game"
-        path.mkdir(parents=True, exist_ok=True)
         torch.save({
             "step": step,
             "model_state_dict": self.network.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "game_names": self.game_names,
-        }, path / f"checkpoint_{step}.pt")
+        }, self.checkpoint_dir / f"checkpoint_{step}.pt")
 
 
 class _MultiGameNetWrapper:

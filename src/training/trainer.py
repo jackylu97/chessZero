@@ -27,13 +27,18 @@ class MuZeroTrainer:
         config: MuZeroConfig,
         game: Game,
         network: MuZeroNetwork,
+        run_id: str,
         device: str = "cpu",
         log_dir: str = "runs",
+        checkpoints_dir: str = "checkpoints",
     ):
         self.config = config
         self.game = game
         self.network = network.to(device)
         self.device = device
+        self.run_id = run_id
+        self.checkpoint_dir = Path(checkpoints_dir) / config.game / run_id
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.optimizer = torch.optim.Adam(
             network.parameters(),
@@ -48,7 +53,7 @@ class MuZeroTrainer:
         self.scaler = GradScaler("cuda", enabled=config.use_amp)
         self.replay_buffer = ReplayBuffer(config.replay_buffer_size)
 
-        self.writer = SummaryWriter(log_dir=os.path.join(log_dir, config.game))
+        self.writer = SummaryWriter(log_dir=os.path.join(log_dir, config.game, run_id))
         self.global_step = 0
 
     def train(self):
@@ -173,10 +178,26 @@ class MuZeroTrainer:
             )
             total_loss = (is_weights_t * per_sample_loss).mean()
 
+        # Skip optimizer and priority updates on non-finite loss so NaN/Inf
+        # doesn't propagate into weights or poison the priority buffer.
+        if not torch.isfinite(total_loss):
+            tqdm.write(f"Step {self.global_step}: non-finite loss ({total_loss.item()}), skipping step")
+            self.optimizer.zero_grad()
+            return {
+                "total_loss": float("nan"),
+                "policy_loss": float("nan"),
+                "value_loss": float("nan"),
+                "reward_loss": float("nan"),
+                "grad_norm": float("nan"),
+                "amp_scale": float(self.scaler.get_scale()),
+            }
+
         self.optimizer.zero_grad()
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
+        # clip_grad_norm_ returns the pre-clip total norm — useful as a divergence
+        # signal (sudden spike → bad gradient → likely source of loss spikes).
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
@@ -192,6 +213,8 @@ class MuZeroTrainer:
             "policy_loss": (scale * policy_loss.mean()).item(),
             "value_loss": (scale * self.config.value_loss_weight * value_loss.mean()).item(),
             "reward_loss": (scale * reward_loss.mean()).item(),
+            "grad_norm": float(grad_norm),
+            "amp_scale": float(self.scaler.get_scale()),
         }
 
     @torch.no_grad()
@@ -240,12 +263,15 @@ class MuZeroTrainer:
 
             for (_, _, game, pos), root in zip(batch, roots):
                 # Build full-length visit-count policy vector
-                total = sum(c.visit_count for c in root.children.values())
+                visits = root.child_visits
+                total = float(visits.sum())
                 if total > 0:
                     new_policy = [0.0] * self.game.action_space_size
-                    for a, child in root.children.items():
+                    actions = root.child_actions
+                    probs = visits / total
+                    for a, p in zip(actions.tolist(), probs.tolist()):
                         if a < self.game.action_space_size:
-                            new_policy[a] = child.visit_count / total
+                            new_policy[a] = p
                     game.policies[pos] = new_policy
                 game.root_values[pos] = root.value
                 positions_updated += 1
@@ -272,23 +298,26 @@ class MuZeroTrainer:
         return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1)
 
     def _log(self, loss_info: dict, step: int):
+        # Route loss/grad/scale scalars to their own namespaces so TensorBoard
+        # groups them sensibly.
         for key, value in loss_info.items():
-            self.writer.add_scalar(f"loss/{key}", value, step)
+            if key in ("grad_norm", "amp_scale"):
+                self.writer.add_scalar(f"train/{key}", value, step)
+            else:
+                self.writer.add_scalar(f"loss/{key}", value, step)
         self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], step)
         self.writer.add_scalar("train/per_beta", self.config.per_beta_init + (1.0 - self.config.per_beta_init) * (
             step / max(1, self.config.training_steps)
         ), step)
 
     def _save_checkpoint(self, step: int):
-        path = Path("checkpoints") / self.config.game
-        path.mkdir(parents=True, exist_ok=True)
         torch.save({
             "step": step,
             "model_state_dict": self.network.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
-        }, path / f"checkpoint_{step}.pt")
-        self.replay_buffer.save(path / f"checkpoint_{step}.buf")
+        }, self.checkpoint_dir / f"checkpoint_{step}.pt")
+        self.replay_buffer.save(self.checkpoint_dir / f"checkpoint_{step}.buf")
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load model, optimizer, scheduler, and replay buffer from a checkpoint."""

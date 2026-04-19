@@ -131,21 +131,23 @@ def get_config(game: str) -> MuZeroConfig:
             num_residual_blocks=16,
             latent_h=8, latent_w=8,
             fc_hidden=256,
-            num_simulations=50,      # baseline: validate training before scaling up
+            num_simulations=100,     # bumped from 50 for tactical vision (phase 1)
             batch_size=256,
             training_steps=500000,
             replay_buffer_size=100000,
             min_buffer_size=500,
             num_self_play_games=100,
-            self_play_interval=500,
+            self_play_interval=1500,   # higher train:selfplay ratio (3:1) — phase 1
             lr=5e-4,
             dirichlet_alpha=0.03,
-            td_steps=5,              # bootstrap over 5 steps; full return too noisy for 60-move games
-            temperature_drop_step=30,  # paper: drop after move 30
-            reanalyze_interval=500,    # matches self_play_interval: 1:1 refresh per self-play round
-            reanalyze_batch_size=20,   # 20 games ≈ 1.2k positions per reanalyze call
-            num_parallel_games=64,
-            leaf_top_k=50,             # expand only top-50 priors at leaves (vs 4672) — ~90x CPU speedup
+            td_steps=10,             # bumped from 5 — better value propagation through sparse-reward chess
+            temperature_drop_step=30,
+            reanalyze_interval=1500,   # keep 1:1 with self_play_interval
+            reanalyze_batch_size=100,
+            num_parallel_games=128,    # bumped from 64 — batched-sync run_batch fits 24GB
+            leaf_top_k=50,             # top-K heuristic — replaced by Sampled MuZero in phase 2
+            eval_interval=2500,
+            lr_decay_milestones=[0.8, 0.95],  # later decay — previous [0.5, 0.75] cut LR too early
         ),
         "checkers": MuZeroConfig(
             game="checkers",
