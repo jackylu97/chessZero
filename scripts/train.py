@@ -104,6 +104,11 @@ def main():
         fc_hidden=config.fc_hidden,
         value_support_size=config.value_support_size,
         reward_support_size=config.reward_support_size,
+        use_consistency_loss=config.use_consistency_loss,
+        proj_hid=config.proj_hid,
+        proj_out=config.proj_out,
+        pred_hid=config.pred_hid,
+        pred_out=config.pred_out,
     )
 
     trainer = MuZeroTrainer(

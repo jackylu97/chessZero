@@ -28,7 +28,10 @@ class GameHistory:
         """Create training target for a given position.
 
         Returns:
-            target_observations: observation at state_index
+            target_observations: list of K+1 obs at state_index..state_index+K
+                (past game end: last valid obs is reused; the mask zeros the loss)
+            target_obs_mask: list of K+1 floats — 1.0 where the index is within
+                the game, 0.0 past game end. Used by EfficientZero consistency loss.
             target_actions: K future actions (padded with 0 if game ended)
             target_values: K+1 values (bootstrapped or game outcome)
             target_rewards: K+1 rewards
@@ -38,6 +41,9 @@ class GameHistory:
         rewards = []
         policies = []
         actions = []
+        obs_list = []
+        obs_mask = []
+        last_obs = self.observations[min(state_index, len(self) - 1)]
 
         for i in range(num_unroll_steps + 1):
             idx = state_index + i
@@ -73,10 +79,15 @@ class GameHistory:
                     elif len(policy) > action_space_size:
                         policy = policy[:action_space_size]
                 policies.append(policy)
+                last_obs = self.observations[idx]
+                obs_list.append(last_obs)
+                obs_mask.append(1.0)
             else:
                 values.append(0.0)
                 rewards.append(0.0)
                 policies.append(np.full(action_space_size, 1.0 / action_space_size, dtype=np.float32))
+                obs_list.append(last_obs)
+                obs_mask.append(0.0)
 
             if i < num_unroll_steps:
                 act_idx = state_index + i
@@ -86,7 +97,8 @@ class GameHistory:
                     actions.append(0)
 
         return (
-            self.observations[state_index],
+            obs_list,
+            obs_mask,
             actions,
             values,
             rewards,
@@ -150,7 +162,8 @@ class ReplayBuffer:
         weights = (n * probs[game_indices]) ** (-beta)
         weights = (weights / weights.max()).astype(np.float32)
 
-        observations = []
+        target_observations = []
+        target_obs_masks = []
         actions_batch = []
         values_batch = []
         rewards_batch = []
@@ -159,17 +172,24 @@ class ReplayBuffer:
         for g_idx in game_indices:
             game = self.buffer[g_idx]
             pos = np.random.randint(0, len(game))
-            obs, actions, values, rewards, policies = game.make_target(
+            obs_list, obs_mask, actions, values, rewards, policies = game.make_target(
                 pos, num_unroll_steps, td_steps, discount, action_space_size
             )
-            observations.append(obs)
+            target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
+            target_obs_masks.append(obs_mask)
             actions_batch.append(actions)
             values_batch.append(values)
             rewards_batch.append(rewards)
             policies_batch.append(policies)
 
+        target_observations_t = torch.stack(target_observations)  # (B, K+1, C, H, W)
+
         batch = {
-            "observations": torch.stack(observations),
+            # Root obs (k=0) kept at "observations" for back-compat with callers that
+            # only need the initial inference input.
+            "observations": target_observations_t[:, 0],
+            "target_observations": target_observations_t,
+            "target_obs_mask": torch.tensor(target_obs_masks, dtype=torch.float32),
             "actions": torch.tensor(actions_batch, dtype=torch.long),
             "target_values": torch.tensor(values_batch, dtype=torch.float32),
             "target_rewards": torch.tensor(rewards_batch, dtype=torch.float32),

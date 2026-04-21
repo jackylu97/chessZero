@@ -159,6 +159,50 @@ class PredictionNetwork(nn.Module):
         return self.policy_head(hidden_state), self.value_head(hidden_state)
 
 
+class ProjectionNetwork(nn.Module):
+    """SimSiam projector: flattened latent → proj_out.
+
+    Three-layer MLP (Linear+BN+ReLU twice, then Linear+BN). Matches LightZero's
+    EfficientZero projection: lzero/model/efficientzero_model.py.
+    """
+
+    def __init__(self, in_dim: int, hidden: int, out_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim),
+            nn.BatchNorm1d(out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class PredictionHead(nn.Module):
+    """SimSiam predictor: proj_out → pred_out.
+
+    Two-layer MLP (Linear+BN+ReLU, Linear). Asymmetry with the projector is
+    the key ingredient that prevents representation collapse (Chen & He 2020).
+    """
+
+    def __init__(self, in_dim: int, hidden: int, out_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class MuZeroNetwork(nn.Module):
     """Full MuZero network combining representation, dynamics, prediction.
 
@@ -180,11 +224,17 @@ class MuZeroNetwork(nn.Module):
         fc_hidden: int = 128,
         value_support_size: int = 10,
         reward_support_size: int = 1,
+        use_consistency_loss: bool = False,
+        proj_hid: int = 1024,
+        proj_out: int = 1024,
+        pred_hid: int = 512,
+        pred_out: int = 1024,
     ):
         super().__init__()
         self.action_space_size = action_space_size
         self.value_support_size = value_support_size
         self.reward_support_size = reward_support_size
+        self.use_consistency_loss = use_consistency_loss
 
         self.representation = RepresentationNetwork(
             observation_channels, hidden_planes, num_blocks,
@@ -198,6 +248,29 @@ class MuZeroNetwork(nn.Module):
             hidden_planes, action_space_size,
             latent_h, latent_w, fc_hidden, value_support_size,
         )
+
+        if use_consistency_loss:
+            flat_dim = hidden_planes * latent_h * latent_w
+            self.projection = ProjectionNetwork(flat_dim, proj_hid, proj_out)
+            self.prediction_head = PredictionHead(proj_out, pred_hid, pred_out)
+        else:
+            self.projection = None
+            self.prediction_head = None
+
+    def project(self, hidden: torch.Tensor, with_grad: bool = True) -> torch.Tensor:
+        """SimSiam projection for EfficientZero consistency loss.
+
+        with_grad=True:  predictor(projection(hidden))  — online branch (gradient flows)
+        with_grad=False: projection(hidden).detach()    — target branch (stop-grad)
+
+        Matches LightZero's MuZeroModel.project() signature.
+        """
+        assert self.projection is not None, "project() called with use_consistency_loss=False"
+        x = hidden.reshape(hidden.shape[0], -1)
+        proj = self.projection(x)
+        if with_grad:
+            return self.prediction_head(proj)
+        return proj.detach()
 
     def initial_inference(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run representation + prediction on observation.

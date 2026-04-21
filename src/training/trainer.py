@@ -21,6 +21,17 @@ from .replay_buffer import ReplayBuffer
 from .self_play import run_self_play
 
 
+def _negative_cosine_similarity(p: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """SimSiam loss: -cos(p, z) per sample. Target z already detached by caller.
+
+    F.normalize eps handles zero-norm vectors safely (they map to zero output,
+    giving 0 similarity — which paired with a zero mask contributes no loss).
+    """
+    p = F.normalize(p, dim=-1)
+    z = F.normalize(z, dim=-1)
+    return -(p * z).sum(dim=-1)
+
+
 class MuZeroTrainer:
     """Main training loop for MuZero."""
 
@@ -178,6 +189,10 @@ class MuZeroTrainer:
         target_rewards = batch["target_rewards"].to(self.device)
         target_policies = batch["target_policies"].to(self.device)
         is_weights_t = torch.tensor(is_weights, device=self.device)
+        use_consistency = bool(getattr(self.config, "use_consistency_loss", False))
+        if use_consistency:
+            target_observations = batch["target_observations"].to(self.device)  # (B, K+1, C, H, W)
+            target_obs_mask = batch["target_obs_mask"].to(self.device)          # (B, K+1)
 
         # Under Plain Gumbel MuZero the target is π' (softmax over π_net + σ(completedQ));
         # KL matches the paper's L_policy and reports 0 when π_net ≡ π'. Otherwise use
@@ -196,6 +211,7 @@ class MuZeroTrainer:
             value_loss = self._value_loss(value_logits, target_values[:, 0],
                                           self.network.value_support_size)
             reward_loss = torch.zeros(obs.shape[0], device=self.device)
+            consistency_loss = torch.zeros(obs.shape[0], device=self.device)
 
             for k in range(self.config.num_unroll_steps):
                 hidden, reward_logits, policy_logits, value_logits = \
@@ -209,11 +225,25 @@ class MuZeroTrainer:
                 reward_loss = reward_loss + self._reward_loss(reward_logits, target_rewards[:, k + 1],
                                                               self.network.reward_support_size)
 
+                if use_consistency:
+                    # SimSiam: online branch via dynamics (grad); target branch via representation
+                    # of the actual future observation (stop-grad). Matches LightZero
+                    # lzero/policy/efficientzero.py consistency loop.
+                    dyn_proj = self.network.project(hidden, with_grad=True)
+                    with torch.no_grad():
+                        target_hidden = self.network.representation(target_observations[:, k + 1])
+                        tgt_proj = self.network.project(target_hidden, with_grad=False)
+                    consistency_loss = consistency_loss + (
+                        _negative_cosine_similarity(dyn_proj, tgt_proj)
+                        * target_obs_mask[:, k + 1]
+                    )
+
             scale = 1.0 / (self.config.num_unroll_steps + 1)
             per_sample_loss = scale * (
                 policy_loss
                 + self.config.value_loss_weight * value_loss
                 + reward_loss
+                + self.config.consistency_loss_weight * consistency_loss
             )
             total_loss = (is_weights_t * per_sample_loss).mean()
 
@@ -227,6 +257,7 @@ class MuZeroTrainer:
                 "policy_loss": float("nan"),
                 "value_loss": float("nan"),
                 "reward_loss": float("nan"),
+                "consistency_loss": float("nan"),
                 "grad_norm": float("nan"),
                 "amp_scale": float(self.scaler.get_scale()),
             }
@@ -252,6 +283,7 @@ class MuZeroTrainer:
             "policy_loss": (scale * policy_loss.mean()).item(),
             "value_loss": (scale * self.config.value_loss_weight * value_loss.mean()).item(),
             "reward_loss": (scale * reward_loss.mean()).item(),
+            "consistency_loss": (scale * self.config.consistency_loss_weight * consistency_loss.mean()).item(),
             "grad_norm": float(grad_norm),
             "amp_scale": float(self.scaler.get_scale()),
         }

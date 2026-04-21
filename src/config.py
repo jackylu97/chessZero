@@ -92,6 +92,18 @@ class MuZeroConfig:
     gumbel_c_scale: float = 1.0
     use_gumbel_noise: bool = True        # True for training self-play; False for eval
 
+    # EfficientZero consistency loss (Ye 2021). SimSiam-style self-supervision on the
+    # dynamics net: rolled-out latent must match representation(future_obs). Supervises
+    # the world model directly, decoupled from noisy value/reward signal — helps most
+    # during cold start when value targets are starved. See src/model/muzero_net.py
+    # (ProjectionNetwork / PredictionHead) and lzero/policy/efficientzero.py.
+    use_consistency_loss: bool = False
+    consistency_loss_weight: float = 2.0  # LightZero ssl_loss_weight default
+    proj_hid: int = 1024
+    proj_out: int = 1024
+    pred_hid: int = 512
+    pred_out: int = 1024
+
     # Multi-game (Phase 2)
     multi_game: bool = False
     games: list[str] = field(default_factory=lambda: ["tictactoe"])
@@ -160,6 +172,7 @@ def get_config(game: str) -> MuZeroConfig:
             num_parallel_games=128,    # bumped from 64 — batched-sync run_batch fits 24GB
             sample_k=50,               # Sampled MuZero: sample K distinct actions per node (Hubert 2021 Proposed Modification)
             eval_interval=5000,
+            use_consistency_loss=True, # EfficientZero SimSiam consistency loss on dynamics rollouts
         ),
         "checkers": MuZeroConfig(
             game="checkers",
