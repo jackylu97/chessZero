@@ -97,6 +97,15 @@ muzero-general's `PredictionNetwork` runs additional residual blocks on the hidd
 
 This is intentionally skipped for single-game training — the backbone's 8 blocks are deep enough that the heads don't need extra capacity. However, **revisit for multi-game training**: when the shared backbone must serve all games simultaneously, per-game prediction blocks would let each game's heads do additional game-specific computation rather than reading directly off the shared representation. This could meaningfully improve per-game prediction quality without affecting the shared backbone.
 
+### Known issue: EfficientZero consistency loss not wired into `MultiGameMuZeroNetwork`
+`MuZeroNetwork` has a `project()` method (projection + predictor) used by the EfficientZero consistency loss. `MultiGameMuZeroNetwork` does not — it was missed when the SimSiam heads were added. Trainer gates the consistency branch on `config.use_consistency_loss`, so setting it with a multi-game network will blow up on `self.network.project(...)`.
+
+**Options when we revisit multi-game:**
+- Shared projection/predictor operating on the shared-backbone latent (cheapest; matches current shared-dynamics philosophy).
+- Per-game projection/predictor (better if per-game prediction blocks land too — lets each game learn its own world-model similarity metric).
+
+**Status:** Deferred. Chess (the cold-start motivation for EZ) is single-game, and there's no path through `MuZeroTrainer` that can combine them today.
+
 ---
 
 ## MCTS
