@@ -51,6 +51,12 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--sample-k", type=int, default=None,
                         help="Sampled MuZero K. None = deterministic top-K (legacy).")
+    parser.add_argument("--use-gumbel", action="store_true",
+                        help="Enable Plain Gumbel MuZero (Danihelka 2022) at root.")
+    parser.add_argument("--gumbel-m", type=int, default=None,
+                        help="gumbel_num_considered (m for Sequential Halving).")
+    parser.add_argument("--eval-interval", type=int, default=None,
+                        help="Override config.eval_interval (steps between evals).")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -65,6 +71,12 @@ def main():
         config.training_steps = args.steps
     if args.sample_k is not None:
         config.sample_k = args.sample_k
+    if args.use_gumbel:
+        config.use_gumbel = True
+    if args.gumbel_m is not None:
+        config.gumbel_num_considered = args.gumbel_m
+    if args.eval_interval is not None:
+        config.eval_interval = args.eval_interval
 
     # Use CPU AMP settings appropriately
     if device == "cpu":

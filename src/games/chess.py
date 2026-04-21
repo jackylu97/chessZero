@@ -116,7 +116,7 @@ class ChessGame(Game):
     board_size = (8, 8)
     action_space_size = ACTION_SPACE  # 4672
     num_planes = 19  # 6 piece types × 2 colors + castling (4) + en passant (1) + turn (1) + move count (1)
-    max_plies = 400  # force draw after 400 plies (200 fullmoves) — prevents runaway self-play loops
+    max_plies = 400  # force draw after 400 plies (200 fullmoves); 200 was too tight — untrained models can't resolve in that horizon, starves value head of real terminal labels
 
     def reset(self) -> GameState:
         return GameState(
@@ -131,7 +131,7 @@ class ChessGame(Game):
         board.push(move)
 
         hit_cap = board.ply() >= self.max_plies
-        if board.is_game_over() or hit_cap:
+        if board.is_game_over(claim_draw=True) or hit_cap:
             if hit_cap and not board.is_game_over():
                 winner = 0
                 reward = 0.0

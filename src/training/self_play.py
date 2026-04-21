@@ -4,7 +4,7 @@ import torch
 from tqdm import tqdm
 
 from ..games.base import Game
-from ..mcts.mcts import MCTS, BatchedMCTS, select_action
+from ..mcts.mcts import MCTS, BatchedMCTS, select_action, select_action_gumbel
 from .replay_buffer import GameHistory
 
 
@@ -29,23 +29,34 @@ def play_game(
     device: str = "cpu",
     training_step: int = 0,
 ) -> GameHistory:
-    """Play a single self-play game using MCTS."""
+    """Play a single self-play game using MCTS.
+
+    Under ``config.use_gumbel`` the serial path routes through BatchedMCTS with
+    n=1 so Plain Gumbel MuZero's Sequential-Halving root path is reused; action
+    selection uses ``select_action_gumbel`` (argmax over sampled + π' target).
+    """
     network.eval()
-    mcts = MCTS(network, game, config, device)
+    use_gumbel = bool(getattr(config, "use_gumbel", False))
+    mcts_serial = MCTS(network, game, config, device) if not use_gumbel else None
+    mcts_batched = BatchedMCTS(network, game, config, device) if use_gumbel else None
     temp_init = get_temperature(training_step, config)
 
     state = game.reset()
     history = GameHistory(game_name=config.game)
 
     move_count = 0
+    action_space_size = game.action_space_size
     while not state.done:
         obs = game.to_tensor(state)
         legal = game.legal_actions(state)
 
-        root = mcts.run(obs, legal, add_noise=True)
-
-        temp = temp_init if move_count < config.temperature_drop_step else config.temperature_final
-        action, action_probs = select_action(root, temperature=temp)
+        if use_gumbel:
+            root = mcts_batched.run_batch([obs], [legal], add_noise=True)[0]
+            action, action_probs = select_action_gumbel(root, config, action_space_size)
+        else:
+            root = mcts_serial.run(obs, legal, add_noise=True)
+            temp = temp_init if move_count < config.temperature_drop_step else config.temperature_final
+            action, action_probs = select_action(root, temperature=temp)
 
         history.observations.append(obs)
         history.actions.append(action)
@@ -79,6 +90,8 @@ def play_games_parallel(
     network.eval()
     batched_mcts = BatchedMCTS(network, game, config, device)
     temp_init = get_temperature(training_step, config)
+    use_gumbel = bool(getattr(config, "use_gumbel", False))
+    action_space_size = game.action_space_size
 
     states = [game.reset() for _ in range(num_games)]
     histories = [GameHistory(game_name=config.game) for _ in range(num_games)]
@@ -96,8 +109,11 @@ def play_games_parallel(
 
         still_active = []
         for i, g in enumerate(active):
-            temp = temp_init if move_counts[g] < config.temperature_drop_step else config.temperature_final
-            action, action_probs = select_action(roots[i], temperature=temp)
+            if use_gumbel:
+                action, action_probs = select_action_gumbel(roots[i], config, action_space_size)
+            else:
+                temp = temp_init if move_counts[g] < config.temperature_drop_step else config.temperature_final
+                action, action_probs = select_action(roots[i], temperature=temp)
 
             histories[g].observations.append(obs_list[i])
             histories[g].actions.append(action)

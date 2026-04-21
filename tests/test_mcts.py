@@ -194,9 +194,9 @@ def test_expand_populates_parallel_arrays():
     assert node.child_visits.tolist() == [0.0, 0.0, 0.0]
     assert node.child_rewards.tolist() == [0.0, 0.0, 0.0]
     assert node.child_value_sums.tolist() == [0.0, 0.0, 0.0]
+    # Children are lazily allocated: slots start as None and get materialized on first visit.
     assert len(node.children) == 3
-    for i, child in enumerate(node.children):
-        assert child.prior == pytest.approx(float(node.child_priors[i]))
+    assert all(c is None for c in node.children)
 
 
 def test_expand_from_priors_populates_arrays():
@@ -211,14 +211,14 @@ def test_expand_from_priors_populates_arrays():
     assert np.array_equal(node.child_actions, actions)
     assert np.array_equal(node.child_priors, priors)
     assert node.child_visits.tolist() == [0.0, 0.0, 0.0]
+    # Lazy allocation: slots are None until first traversal.
     assert len(node.children) == 3
-    for i, c in enumerate(node.children):
-        assert c.prior == pytest.approx(float(priors[i]))
+    assert all(c is None for c in node.children)
 
 
 # --- _add_dirichlet_noise ---------------------------------------------------
 
-def test_dirichlet_noise_updates_both_array_and_child_prior():
+def test_dirichlet_noise_updates_child_priors_array():
     mcts = _make_mcts()
     node = MCTSNode(visit_count=0)
     k = 5
@@ -228,18 +228,25 @@ def test_dirichlet_noise_updates_both_array_and_child_prior():
     node.child_visits = np.zeros(k)
     node.child_rewards = np.zeros(k)
     node.child_value_sums = np.zeros(k)
-    node.children = [MCTSNode(prior=float(base_priors[i])) for i in range(k)]
+    # Mix of pre-materialized and lazy children — both paths must stay consistent.
+    node.children = [MCTSNode(prior=float(base_priors[i])) if i < 2 else None
+                     for i in range(k)]
 
     np.random.seed(0)
     mcts._add_dirichlet_noise(node)
 
-    # Array and per-child attr must agree.
-    for i, child in enumerate(node.children):
-        assert child.prior == pytest.approx(float(node.child_priors[i]))
-    # Priors still sum to ~1.
+    # Priors still sum to ~1 and noise actually applied.
     assert node.child_priors.sum() == pytest.approx(1.0)
-    # Noise actually applied — priors no longer all equal.
     assert not np.allclose(node.child_priors, 0.2)
+    # Pre-materialized children had their .prior synced; lazy slots stay None
+    # and will pick up the noised prior when materialized via _get_or_create_child.
+    for i, child in enumerate(node.children):
+        if child is not None:
+            assert child.prior == pytest.approx(float(node.child_priors[i]))
+
+    # A subsequent materialization reads the noised prior from the array.
+    materialized = mcts._get_or_create_child(node, 3)
+    assert materialized.prior == pytest.approx(float(node.child_priors[3]))
 
 
 # --- _backpropagate ---------------------------------------------------------

@@ -1,9 +1,11 @@
 """MuZero training loop."""
 
+import ctypes
 import os
 from pathlib import Path
 
 import numpy as np
+import psutil
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
@@ -62,10 +64,13 @@ class MuZeroTrainer:
         print(f"Device: {self.device}")
         print(f"Network parameters: {sum(p.numel() for p in self.network.parameters()):,}")
 
-        print("Generating initial self-play games...")
-        self._run_self_play()
+        if len(self.replay_buffer) == 0:
+            print("Generating initial self-play games...")
+            self._run_self_play()
 
-        pbar = tqdm(range(self.config.training_steps), desc="Training")
+        start_step = self.global_step
+        pbar = tqdm(range(start_step, self.config.training_steps), desc="Training",
+                    initial=start_step, total=self.config.training_steps)
         for step in pbar:
             self.global_step = step
 
@@ -102,6 +107,12 @@ class MuZeroTrainer:
 
     def _run_self_play(self):
         """Generate self-play games and add to replay buffer."""
+        proc = psutil.Process()
+        rss_before = proc.memory_info().rss / 1e9
+        if self.device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+            gpu_before = torch.cuda.memory_allocated() / 1e9
+
         games = run_self_play(
             self.network, self.game, self.config,
             self.config.num_self_play_games, self.device,
@@ -109,6 +120,13 @@ class MuZeroTrainer:
         )
         for g in games:
             self.replay_buffer.save_game(g)
+
+        rss_after = proc.memory_info().rss / 1e9
+        rss_delta = rss_after - rss_before
+        gpu_after = gpu_peak = 0.0
+        if self.device == "cuda":
+            gpu_after = torch.cuda.memory_allocated() / 1e9
+            gpu_peak = torch.cuda.max_memory_allocated() / 1e9
 
         avg_length = sum(len(g) - 1 for g in games) / len(games)
         outcomes = [g.game_outcome for g in games]
@@ -121,6 +139,19 @@ class MuZeroTrainer:
         self.writer.add_scalar("self_play/p2_win_rate", p2_wins / len(games), self.global_step)
         self.writer.add_scalar("self_play/draw_rate", draws / len(games), self.global_step)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
+        self.writer.add_scalar("memory/rss_gb_before_selfplay", rss_before, self.global_step)
+        self.writer.add_scalar("memory/rss_gb_after_selfplay", rss_after, self.global_step)
+        self.writer.add_scalar("memory/rss_delta_gb_selfplay", rss_delta, self.global_step)
+        if self.device == "cuda":
+            self.writer.add_scalar("memory/gpu_alloc_gb_after_selfplay", gpu_after, self.global_step)
+            self.writer.add_scalar("memory/gpu_peak_gb_selfplay", gpu_peak, self.global_step)
+
+        gpu_msg = f" | GPU alloc {gpu_after:.2f} GB (peak {gpu_peak:.2f})" if self.device == "cuda" else ""
+        ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
+        tqdm.write(
+            f"Step {self.global_step}: self-play done | "
+            f"RSS {rss_before:.2f} → {rss_after:.2f} GB (Δ {rss_delta:+.2f}){gpu_msg}"
+        )
 
     def _train_step(self) -> dict:
         """Single training step on a batch from the replay buffer."""
@@ -148,12 +179,20 @@ class MuZeroTrainer:
         target_policies = batch["target_policies"].to(self.device)
         is_weights_t = torch.tensor(is_weights, device=self.device)
 
+        # Under Plain Gumbel MuZero the target is π' (softmax over π_net + σ(completedQ));
+        # KL matches the paper's L_policy and reports 0 when π_net ≡ π'. Otherwise use
+        # cross-entropy on raw visit counts (gradient is identical to KL up to entropy-of-target).
+        policy_loss_fn = (
+            self._policy_loss_kl if bool(getattr(self.config, "use_gumbel", False))
+            else self._policy_loss
+        )
+
         with autocast(device_type=self.device.split(":")[0], enabled=self.config.use_amp):
             hidden, policy_logits, value_logits = self.network.initial_inference_logits(obs)
             value_logits_k0 = value_logits  # save for priority update
 
             # Per-sample losses at root (k=0)
-            policy_loss = self._policy_loss(policy_logits, target_policies[:, 0])
+            policy_loss = policy_loss_fn(policy_logits, target_policies[:, 0])
             value_loss = self._value_loss(value_logits, target_values[:, 0],
                                           self.network.value_support_size)
             reward_loss = torch.zeros(obs.shape[0], device=self.device)
@@ -164,7 +203,7 @@ class MuZeroTrainer:
 
                 hidden.register_hook(lambda grad: grad * 0.5)
 
-                policy_loss = policy_loss + self._policy_loss(policy_logits, target_policies[:, k + 1])
+                policy_loss = policy_loss + policy_loss_fn(policy_logits, target_policies[:, k + 1])
                 value_loss = value_loss + self._value_loss(value_logits, target_values[:, k + 1],
                                                            self.network.value_support_size)
                 reward_loss = reward_loss + self._reward_loss(reward_logits, target_rewards[:, k + 1],
@@ -230,7 +269,9 @@ class MuZeroTrainer:
         No Dirichlet noise: we want clean policy estimates, not exploratory ones
         (consistent with lightzero's reanalyze_noise=False default).
         """
-        from ..mcts.mcts import BatchedMCTS, select_action
+        from ..mcts.mcts import BatchedMCTS, select_action, select_action_gumbel
+
+        use_gumbel = bool(getattr(self.config, "use_gumbel", False))
 
         _, games = self.replay_buffer.sample_games_for_reanalyze(
             self.config.reanalyze_batch_size
@@ -264,17 +305,22 @@ class MuZeroTrainer:
 
             for (_, _, game, pos), root in zip(batch, roots):
                 if float(root.child_visits.sum()) > 0:
-                    # temperature=1.0 → raw visit-count normalization. Under
-                    # Sampled MuZero the search prior was renormalized over σ,
-                    # so raw visits already approximate Î_β π (Hubert 2021
-                    # Proposed Modification).
-                    _, action_probs = select_action(root, temperature=1.0)
-                    # Pad to full action space size.
-                    new_policy = [0.0] * action_space_size
-                    for a, p in enumerate(action_probs):
-                        if a < action_space_size:
-                            new_policy[a] = p
-                    game.policies[pos] = new_policy
+                    if use_gumbel:
+                        # Plain Gumbel MuZero: π' = softmax(logits + σ(completedQ)) over legals.
+                        _, action_probs = select_action_gumbel(
+                            root, self.config, action_space_size
+                        )
+                        game.policies[pos] = action_probs
+                    else:
+                        # temperature=1.0 → raw visit-count normalization. Under
+                        # Sampled MuZero the search prior was renormalized over σ,
+                        # so raw visits already approximate Î_β π (Hubert 2021
+                        # Proposed Modification).
+                        _, action_probs = select_action(root, temperature=1.0)
+                        # Pad to full action space size.
+                        new_policy = np.zeros(action_space_size, dtype=np.float32)
+                        new_policy[: len(action_probs)] = action_probs
+                        game.policies[pos] = new_policy
                 game.root_values[pos] = root.value
                 positions_updated += 1
 
@@ -284,6 +330,16 @@ class MuZeroTrainer:
     def _policy_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Per-sample cross-entropy between predicted policy and MCTS visit distribution."""
         return -(targets * F.log_softmax(logits, dim=1)).sum(dim=1)
+
+    def _policy_loss_kl(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Per-sample KL(π'_target || π_net) — paper Eq. 12.
+
+        Gradient matches cross-entropy up to H(target) (constant in network params),
+        but the reported loss value is more interpretable (→ 0 as π_net → π').
+        F.kl_div handles ``target == 0`` safely via the 0·log(0) = 0 convention.
+        """
+        log_p = F.log_softmax(logits, dim=1)
+        return F.kl_div(log_p, targets, reduction="none").sum(dim=1)
 
     def _value_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,
                     support_size: int) -> torch.Tensor:
@@ -346,15 +402,7 @@ class MuZeroTrainer:
         self.network.eval()
         n = self.config.eval_games
 
-        wins, losses, draws = 0, 0, 0
-        for _ in range(n):
-            result = self._play_vs_random()
-            if result == 1:
-                wins += 1
-            elif result == -1:
-                losses += 1
-            else:
-                draws += 1
+        wins, losses, draws = self._play_vs_random_batched(n)
 
         self.writer.add_scalar("eval/win_rate_vs_random", wins / n, step)
         self.writer.add_scalar("eval/draw_rate_vs_random", draws / n, step)
@@ -378,25 +426,62 @@ class MuZeroTrainer:
             self.writer.add_scalar("eval/loss_rate_vs_minimax", losses / n, step)
             tqdm.write(f"Step {step}: vs minimax - W:{wins} L:{losses} D:{draws} ({draws/n:.1%} draw rate)")
 
+    def _agent_action(self, state):
+        """Model's greedy action. Under use_gumbel routes through BatchedMCTS
+        (Plain Gumbel MuZero path), otherwise serial MCTS + temperature=0."""
+        from ..mcts.mcts import MCTS, BatchedMCTS, select_action, select_action_gumbel
+
+        legal = self.game.legal_actions(state)
+        obs = self.game.to_tensor(state)
+        use_gumbel = bool(getattr(self.config, "use_gumbel", False))
+        if use_gumbel:
+            batched = BatchedMCTS(self.network, self.game, self.config, self.device)
+            root = batched.run_batch([obs], [legal], add_noise=False)[0]
+            action, _ = select_action_gumbel(root, self.config, self.game.action_space_size)
+        else:
+            mcts = MCTS(self.network, self.game, self.config, self.device)
+            root = mcts.run(obs, legal, add_noise=False)
+            action, _ = select_action(root, temperature=0)
+        return action
+
     @torch.no_grad()
-    def _play_vs_random(self) -> int:
-        from ..mcts.mcts import MCTS, select_action
+    def _play_vs_random_batched(self, n_games: int) -> tuple[int, int, int]:
+        """Play n_games vs random in parallel; agent on player 1, random on player -1.
+
+        All agent-turn games are collected into one BatchedMCTS.run_batch call per
+        ply — scales to ~1 batched forward pass per simulation instead of one per
+        game, per move.
+        """
         import random
+        from ..mcts.mcts import BatchedMCTS, select_action, select_action_gumbel
 
-        state = self.game.reset()
-        mcts = MCTS(self.network, self.game, self.config, self.device)
+        use_gumbel = bool(getattr(self.config, "use_gumbel", False))
+        batched = BatchedMCTS(self.network, self.game, self.config, self.device)
+        states = [self.game.reset() for _ in range(n_games)]
 
-        while not state.done:
-            legal = self.game.legal_actions(state)
-            if state.current_player == 1:
-                obs = self.game.to_tensor(state)
-                root = mcts.run(obs, legal, add_noise=False)
-                action, _ = select_action(root, temperature=0)
-            else:
-                action = random.choice(legal)
-            state, _, _ = self.game.step(state, action)
+        while any(not s.done for s in states):
+            for i, s in enumerate(states):
+                if not s.done and s.current_player == -1:
+                    a = random.choice(self.game.legal_actions(s))
+                    states[i], _, _ = self.game.step(s, a)
 
-        return state.winner
+            agent_idx = [i for i, s in enumerate(states) if not s.done and s.current_player == 1]
+            if not agent_idx:
+                continue
+            obs_list = [self.game.to_tensor(states[i]) for i in agent_idx]
+            legal_list = [self.game.legal_actions(states[i]) for i in agent_idx]
+            roots = batched.run_batch(obs_list, legal_list, add_noise=False)
+            for k, i in enumerate(agent_idx):
+                if use_gumbel:
+                    a, _ = select_action_gumbel(roots[k], self.config, self.game.action_space_size)
+                else:
+                    a, _ = select_action(roots[k], temperature=0)
+                states[i], _, _ = self.game.step(states[i], a)
+
+        wins = sum(1 for s in states if s.winner == 1)
+        losses = sum(1 for s in states if s.winner == -1)
+        draws = sum(1 for s in states if s.winner == 0)
+        return wins, losses, draws
 
     @torch.no_grad()
     def _play_vs_minimax(self, minimax) -> int:
@@ -405,17 +490,10 @@ class MuZeroTrainer:
         Minimax plays perfectly — optimal result is a draw. Any loss means
         the agent made a suboptimal move. Wins are impossible against perfect play.
         """
-        from ..mcts.mcts import MCTS, select_action
-
         state = self.game.reset()
-        mcts = MCTS(self.network, self.game, self.config, self.device)
-
         while not state.done:
-            legal = self.game.legal_actions(state)
             if state.current_player == 1:
-                obs = self.game.to_tensor(state)
-                root = mcts.run(obs, legal, add_noise=False)
-                action, _ = select_action(root, temperature=0)
+                action = self._agent_action(state)
             else:
                 action = minimax.best_action(state.board, player=-1)
             state, _, _ = self.game.step(state, action)

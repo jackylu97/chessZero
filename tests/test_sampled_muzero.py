@@ -227,8 +227,14 @@ def test_dirichlet_noise_preserves_prior_mass():
     assert node.child_priors.sum() == pytest.approx(1.0), "post-noise priors must still sum to 1"
 
 
-def test_dirichlet_noise_syncs_child_prior_to_search_prior():
-    """After noise, each child.prior should reflect child_priors (used by PUCT)."""
+def test_dirichlet_noise_seeds_lazy_children_with_noised_prior():
+    """Lazy children materialize with the noised prior from child_priors.
+
+    Under lazy allocation, PUCT reads priors directly from the parent's
+    child_priors array, so the per-child .prior attribute is only meaningful
+    at materialization time. This test confirms materialization picks up the
+    post-noise prior — the effective invariant for Sampled MuZero PUCT.
+    """
     cfg = type("C", (), {
         "discount": 1.0, "dirichlet_alpha": 0.3, "dirichlet_epsilon": 0.25,
     })()
@@ -240,7 +246,8 @@ def test_dirichlet_noise_syncs_child_prior_to_search_prior():
     mcts._expand_from_priors(node, actions, priors)
     np.random.seed(0)
     mcts._add_dirichlet_noise(node)
-    for i, child in enumerate(node.children):
+    for i in range(len(actions)):
+        child = mcts._get_or_create_child(node, i)
         assert child.prior == pytest.approx(float(node.child_priors[i]))
 
 

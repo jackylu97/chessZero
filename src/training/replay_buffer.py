@@ -14,7 +14,7 @@ class GameHistory:
     observations: list[torch.Tensor] = field(default_factory=list)  # (C, H, W) tensors
     actions: list[int] = field(default_factory=list)
     rewards: list[float] = field(default_factory=list)
-    policies: list[list[float]] = field(default_factory=list)  # MCTS visit count distributions
+    policies: list[np.ndarray] = field(default_factory=list)  # MCTS visit count distributions (fp32)
     root_values: list[float] = field(default_factory=list)  # MCTS root values
     legal_actions_list: list[list[int]] = field(default_factory=list)  # legal actions at each step
     game_outcome: float = 0.0  # final game outcome from player 1's perspective
@@ -61,14 +61,22 @@ class GameHistory:
                 values.append(value)
                 rewards.append(self.rewards[idx] if idx < len(self.rewards) else 0.0)
 
-                policy = self.policies[idx] if idx < len(self.policies) else []
-                if len(policy) < action_space_size:
-                    policy = policy + [0.0] * (action_space_size - len(policy))
-                policies.append(policy[:action_space_size])
+                policy = self.policies[idx] if idx < len(self.policies) else None
+                if policy is None or len(policy) == 0:
+                    policy = np.zeros(action_space_size, dtype=np.float32)
+                else:
+                    policy = np.asarray(policy, dtype=np.float32)
+                    if len(policy) < action_space_size:
+                        padded = np.zeros(action_space_size, dtype=np.float32)
+                        padded[: len(policy)] = policy
+                        policy = padded
+                    elif len(policy) > action_space_size:
+                        policy = policy[:action_space_size]
+                policies.append(policy)
             else:
                 values.append(0.0)
                 rewards.append(0.0)
-                policies.append([1.0 / action_space_size] * action_space_size)
+                policies.append(np.full(action_space_size, 1.0 / action_space_size, dtype=np.float32))
 
             if i < num_unroll_steps:
                 act_idx = state_index + i
@@ -165,7 +173,7 @@ class ReplayBuffer:
             "actions": torch.tensor(actions_batch, dtype=torch.long),
             "target_values": torch.tensor(values_batch, dtype=torch.float32),
             "target_rewards": torch.tensor(rewards_batch, dtype=torch.float32),
-            "target_policies": torch.tensor(policies_batch, dtype=torch.float32),
+            "target_policies": torch.from_numpy(np.stack(policies_batch)),
         }
         return batch, game_indices, weights
 

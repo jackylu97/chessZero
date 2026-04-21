@@ -82,6 +82,16 @@ class MuZeroConfig:
     # None = expand all legal actions at root / all actions at leaves (tiny action spaces only).
     sample_k: int | None = None
 
+    # Gumbel MuZero (Danihelka 2022, Plain variant): Sequential Halving + Gumbel-Top-K
+    # at root; PUCT untouched at non-root. Training target is π' = softmax(logits +
+    # σ(completedQ)), loss is KL(π', π_net). No Dirichlet noise (Gumbel provides
+    # exploration). See plan_gumbel_muzero.md and src/mcts/gumbel.py.
+    use_gumbel: bool = False
+    gumbel_num_considered: int = 16      # m: actions sampled without replacement at root
+    gumbel_c_visit: float = 50.0         # σ transform (paper Eq. 8)
+    gumbel_c_scale: float = 1.0
+    use_gumbel_noise: bool = True        # True for training self-play; False for eval
+
     # Multi-game (Phase 2)
     multi_game: bool = False
     games: list[str] = field(default_factory=lambda: ["tictactoe"])
@@ -132,22 +142,24 @@ def get_config(game: str) -> MuZeroConfig:
             num_residual_blocks=16,
             latent_h=8, latent_w=8,
             fc_hidden=256,
-            num_simulations=100,     # bumped from 50 for tactical vision (phase 1)
+            num_simulations=200,     # 200 for ~12 visits/candidate on m=16 Gumbel (was 100 ≈ 6/candidate)
             batch_size=256,
-            training_steps=500000,
-            replay_buffer_size=100000,
+            training_steps=100000,
+            checkpoint_interval=1000,
+            lr_decay_milestones=[0.5, 0.75],  # decay 10× at 50k and 75k
+            replay_buffer_size=1000,
             min_buffer_size=500,
             num_self_play_games=100,
-            self_play_interval=1500,   # higher train:selfplay ratio (3:1) — phase 1
+            self_play_interval=1000,   # 2:1 train:selfplay ratio
             lr=5e-4,
             dirichlet_alpha=0.03,
-            td_steps=10,             # bumped from 5 — better value propagation through sparse-reward chess
+            td_steps=-1,             # full MC return; bootstrapping poisons targets while value head is broken
             temperature_drop_step=30,
-            reanalyze_interval=1500,   # keep 1:1 with self_play_interval
+            reanalyze_interval=1000,   # keep 1:1 with self_play_interval
             reanalyze_batch_size=100,
             num_parallel_games=128,    # bumped from 64 — batched-sync run_batch fits 24GB
             sample_k=50,               # Sampled MuZero: sample K distinct actions per node (Hubert 2021 Proposed Modification)
-            eval_interval=2500,
+            eval_interval=5000,
         ),
         "checkers": MuZeroConfig(
             game="checkers",
