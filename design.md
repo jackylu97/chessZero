@@ -166,6 +166,14 @@ Loss functions return per-sample tensors (not reduced means). IS weights are app
 
 **alpha=0, beta=1** degrades gracefully to uniform sampling — useful for ablations.
 
+### Deferred: decisive-game prioritization for MuZero cold start
+
+When most self-play games end in zero-reward draws (e.g. chess early in training, or any environment with sparse terminal reward), the value/reward heads are starved of non-zero labels. Current PER priorities are per-game from TD error, but within a game positions are sampled uniformly — so a long draw still contributes many zero-label samples for every decisive sample.
+
+**Candidate fix:** in `ReplayBuffer.save_game`, weight the initial priority by `|game_outcome|` (and possibly `1/game_length`) so decisive games — especially short mates — are over-sampled during the bootstrap phase. Phase the weighting out as training matures to avoid biasing toward tactical-only positions.
+
+Related lineage: Hindsight Experience Replay (Andrychowicz 2017) and "success prioritization" techniques in sparse-reward RL. Not standard in the AlphaZero/MuZero line, but a natural extension to PER when the value head is cold-starting. Kept in reserve as a Plan C fix for the chess draw basin — deferred because root-cause fixes (ply cap, MC returns) address the starvation more directly and should be tried first.
+
 ---
 
 ## LR Scheduling and Temperature Scheduling
