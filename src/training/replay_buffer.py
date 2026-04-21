@@ -214,33 +214,55 @@ class ReplayBuffer:
                     err = 1.0
                 self._priorities[idx] = err + epsilon
 
-    def save(self, path: str | Path, filter_fn=None):
-        """Pickle buffer, priorities, and total_games to path.
+    def save(self, path: str | Path, filter_fn=None, max_games: int | None = None):
+        """Stream-pickle buffer to path, one record per game.
 
-        filter_fn: optional callable (GameHistory) -> bool. Only games for which
-        filter_fn returns True are pickled; their priorities are kept aligned.
-        total_games is preserved unchanged so the training-progress counter
-        survives filtered saves.
+        Writes a header dict first, then one ``(game, priority)`` pickle per
+        record. Peak memory is ~one game instead of the whole buffer, which
+        matters when the buffer is multi-GB: the old single-dump path
+        allocated the entire serialized payload in RAM before writing and
+        OOM'd the host.
+
+        filter_fn: optional ``(GameHistory) -> bool``. Only matching games
+        are written; priorities stay aligned.
+        max_games: if set, keep only the most recent ``max_games`` (post-filter)
+        records. total_games is preserved regardless so the training-progress
+        counter survives capped saves.
         """
         if filter_fn is None:
-            games, priorities = self.buffer, self._priorities
+            pairs = list(zip(self.buffer, self._priorities))
         else:
-            items = [(g, p) for g, p in zip(self.buffer, self._priorities) if filter_fn(g)]
-            games = [g for g, _ in items]
-            priorities = [p for _, p in items]
+            pairs = [(g, p) for g, p in zip(self.buffer, self._priorities) if filter_fn(g)]
+        if max_games is not None and len(pairs) > max_games:
+            pairs = pairs[-max_games:]
+        header = {
+            "version": 2,
+            "total_games": self.total_games,
+            "n_records": len(pairs),
+        }
         with open(path, "wb") as f:
-            pickle.dump({
-                "buffer": games,
-                "priorities": priorities,
-                "total_games": self.total_games,
-            }, f)
+            pickle.dump(header, f)
+            for game, priority in pairs:
+                pickle.dump((game, priority), f)
 
     def load(self, path: str | Path):
+        """Load buffer from path. Handles both streaming (v2) and legacy formats."""
         with open(path, "rb") as f:
-            data = pickle.load(f)
-        self.buffer = data["buffer"]
-        self._priorities = data["priorities"]
-        self.total_games = data["total_games"]
+            first = pickle.load(f)
+            if isinstance(first, dict) and first.get("version") == 2:
+                self.buffer = []
+                self._priorities = []
+                self.total_games = first["total_games"]
+                for _ in range(first["n_records"]):
+                    game, priority = pickle.load(f)
+                    self.buffer.append(game)
+                    self._priorities.append(priority)
+            else:
+                # Legacy format: single pickled dict {"buffer", "priorities", "total_games"}
+                data = first
+                self.buffer = data["buffer"]
+                self._priorities = data["priorities"]
+                self.total_games = data["total_games"]
 
     def load_warmstart_games(self, paths: list[Path | str]) -> int:
         """Load pickled shards of GameHistory objects into the buffer.

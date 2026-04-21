@@ -43,6 +43,10 @@ class MuZeroConfig:
     # Replay buffer
     replay_buffer_size: int = 5000  # number of games
     min_buffer_size: int = 50  # min games before training starts
+    # Cap the number of most-recent self-play games persisted to .buf per
+    # checkpoint. None = no cap (save everything the in-memory buffer holds).
+    # The in-memory buffer is unaffected; only the on-disk snapshot is trimmed.
+    max_buf_save_games: int | None = None
 
     # Self-play
     num_self_play_games: int = 100  # games per self-play batch

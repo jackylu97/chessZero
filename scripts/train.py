@@ -67,6 +67,10 @@ def main():
                         help="Weight the root prediction at 1.0 and each unroll step "
                              "at 1/K (MuZero paper / muzero-general convention). "
                              "Default is uniform 1/(K+1) per step (LightZero-like).")
+    parser.add_argument("--max-buf-save-games", type=int, default=None,
+                        help="Cap the number of most-recent self-play games persisted "
+                             "to .buf per checkpoint. In-memory buffer is unaffected. "
+                             "Default: no cap.")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -89,6 +93,8 @@ def main():
         config.eval_interval = args.eval_interval
     if args.root_heavy_loss:
         config.use_root_heavy_loss = True
+    if args.max_buf_save_games is not None:
+        config.max_buf_save_games = args.max_buf_save_games
 
     # Use CPU AMP settings appropriately
     if device == "cpu":

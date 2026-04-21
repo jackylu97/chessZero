@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -466,13 +467,17 @@ class MuZeroTrainer:
                 f"(no self-play games yet — resume via --warmstart-path)"
             )
         else:
+            cap = self.config.max_buf_save_games
             self.replay_buffer.save(
                 self.checkpoint_dir / f"checkpoint_{step}.buf",
                 filter_fn=lambda g: not g.external_values,
+                max_games=cap,
             )
+            saved = min(n_self_play, cap) if cap is not None else n_self_play
+            cap_note = f" (capped; {n_self_play - saved} older dropped)" if cap is not None and n_self_play > cap else ""
             tqdm.write(
                 f"Step {step}: saved buffer "
-                f"({n_self_play} self-play games; warmstart excluded — "
+                f"({saved} self-play games{cap_note}; warmstart excluded — "
                 f"re-pass --warmstart-path on resume)"
             )
 
@@ -489,8 +494,16 @@ class MuZeroTrainer:
 
         buf_path = Path(checkpoint_path).with_suffix(".buf")
         if buf_path.exists():
-            self.replay_buffer.load(buf_path)
-            print(f"Loaded replay buffer ({len(self.replay_buffer)} games)")
+            try:
+                self.replay_buffer.load(buf_path)
+                print(f"Loaded replay buffer ({len(self.replay_buffer)} games)")
+            except (EOFError, pickle.UnpicklingError) as e:
+                # A .buf truncated by a crashed/OOM'd save shouldn't prevent resume.
+                # Fall back to an empty buffer; --warmstart-path can re-seed it.
+                print(f"WARNING: {buf_path.name} is corrupt ({type(e).__name__}: {e}); "
+                      f"starting with empty buffer")
+                self.replay_buffer.buffer = []
+                self.replay_buffer._priorities = []
         else:
             print("No saved buffer found — starting with empty buffer")
 
