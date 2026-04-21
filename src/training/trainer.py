@@ -308,6 +308,9 @@ class MuZeroTrainer:
         _, games = self.replay_buffer.sample_games_for_reanalyze(
             self.config.reanalyze_batch_size
         )
+        if not games:
+            # Happens early in warmstart runs when buffer is all external_values games.
+            return
 
         # Flatten all non-terminal positions across sampled games into one list.
         # Each entry: (obs tensor, legal_actions list, game ref, position index).

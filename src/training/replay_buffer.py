@@ -253,9 +253,16 @@ class ReplayBuffer:
         Uniform sampling avoids double-biasing: PER already up-weights high-error
         positions during training; using it here too would over-concentrate reanalyze
         on the same games. See muzero-general replay_buffer.py (force_uniform=True).
+
+        Warmstart games (``external_values`` populated) are excluded: their policy
+        targets are supervised one-hots from Stockfish, and their value targets come
+        from external_values directly — reanalyze would strictly degrade both.
         """
-        n = min(n, len(self.buffer))
-        indices = np.random.choice(len(self.buffer), size=n, replace=False)
+        eligible = [i for i, g in enumerate(self.buffer) if not g.external_values]
+        if not eligible:
+            return np.array([], dtype=np.int64), []
+        n = min(n, len(eligible))
+        indices = np.random.choice(eligible, size=n, replace=False)
         return indices, [self.buffer[i] for i in indices]
 
     def __len__(self) -> int:
