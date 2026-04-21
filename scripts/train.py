@@ -57,6 +57,12 @@ def main():
                         help="gumbel_num_considered (m for Sequential Halving).")
     parser.add_argument("--eval-interval", type=int, default=None,
                         help="Override config.eval_interval (steps between evals).")
+    parser.add_argument("--warmstart-path", type=str, default=None,
+                        help="Directory or glob of .pkl shards (list[GameHistory]) "
+                             "to pre-load into the replay buffer before training. "
+                             "Games with populated external_values use those as value "
+                             "targets (bypassing td_steps/game_outcome). Typically "
+                             "produced by scripts/generate_stockfish_games.py.")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -120,6 +126,20 @@ def main():
 
     if args.resume:
         trainer.load_checkpoint(args.resume)
+
+    if args.warmstart_path:
+        import glob
+        p = args.warmstart_path
+        if os.path.isdir(p):
+            shard_paths = sorted(glob.glob(os.path.join(p, "*.pkl")))
+        else:
+            shard_paths = sorted(glob.glob(p))
+        if not shard_paths:
+            raise FileNotFoundError(f"No .pkl shards found under --warmstart-path: {p}")
+        print(f"Warmstart: loading {len(shard_paths)} shard(s) from {p}")
+        n_loaded = trainer.replay_buffer.load_warmstart_games(shard_paths)
+        print(f"Warmstart: pre-seeded {n_loaded} games "
+              f"(buffer now {len(trainer.replay_buffer)}/{config.replay_buffer_size})")
 
     trainer.train()
 

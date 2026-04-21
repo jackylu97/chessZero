@@ -159,7 +159,8 @@ def get_config(game: str) -> MuZeroConfig:
             training_steps=100000,
             checkpoint_interval=1000,
             lr_decay_milestones=[0.5, 0.75],  # decay 10× at 50k and 75k
-            replay_buffer_size=1000,
+            replay_buffer_size=10000,   # bumped from 1000 so Stockfish warmstart games
+                                        # aren't evicted before they've trained the net
             min_buffer_size=500,
             num_self_play_games=100,
             self_play_interval=1000,   # 2:1 train:selfplay ratio

@@ -19,6 +19,10 @@ class GameHistory:
     legal_actions_list: list[list[int]] = field(default_factory=list)  # legal actions at each step
     game_outcome: float = 0.0  # final game outcome from player 1's perspective
     game_name: str = ""  # for multi-game training
+    # Per-step value targets from an external source (e.g., Stockfish eval), already
+    # converted to side-to-move POV in [-1, +1]. Empty for self-play games (default).
+    # When populated, make_target prefers these over the td_steps/game_outcome paths.
+    external_values: list[float] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.observations)
@@ -49,7 +53,10 @@ class GameHistory:
             idx = state_index + i
 
             if idx < len(self):
-                if td_steps == -1:
+                if self.external_values and idx < len(self.external_values):
+                    # Warmstart path: external targets are already side-to-move-relative.
+                    value = self.external_values[idx]
+                elif td_steps == -1:
                     sign = 1.0 if (idx % 2 == 0) else -1.0
                     value = sign * self.game_outcome
                 else:
@@ -221,6 +228,24 @@ class ReplayBuffer:
         self.buffer = data["buffer"]
         self._priorities = data["priorities"]
         self.total_games = data["total_games"]
+
+    def load_warmstart_games(self, paths: list[Path | str]) -> int:
+        """Load pickled shards of GameHistory objects into the buffer.
+
+        Each shard is expected to be a pickle of list[GameHistory]. Games are
+        inserted via save_game so priorities are seeded to the current max.
+        Returns the number of games loaded.
+        """
+        loaded = 0
+        for p in paths:
+            with open(p, "rb") as f:
+                shard = pickle.load(f)
+            if not isinstance(shard, list):
+                raise TypeError(f"{p}: expected list[GameHistory], got {type(shard)}")
+            for g in shard:
+                self.save_game(g)
+                loaded += 1
+        return loaded
 
     def sample_games_for_reanalyze(self, n: int) -> tuple[np.ndarray, list]:
         """Sample n games uniformly (ignoring PER priorities) for reanalyze.
