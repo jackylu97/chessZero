@@ -131,11 +131,14 @@ class ChessGame(Game):
         board.push(move)
 
         hit_cap = board.ply() >= self.max_plies
-        if board.is_game_over(claim_draw=True) or hit_cap:
-            if hit_cap and not board.is_game_over():
-                winner = 0
-                reward = 0.0
-            else:
+        # claim_draw=False → only automatic terminations (mate, stalemate, insufficient,
+        # fivefold, 75-move). We add strict threefold ourselves: is_repetition(3) means
+        # the current position has *actually* occurred 3 times, not that a claim is one
+        # ply away (which is what claim_draw=True would imply and caused premature draws).
+        natural_end = board.is_game_over(claim_draw=False)
+        strict_threefold = board.is_repetition(3)
+        if natural_end or strict_threefold or hit_cap:
+            if natural_end:
                 result = board.result()
                 if result == "1-0":
                     winner = 1
@@ -146,6 +149,9 @@ class ChessGame(Game):
                 else:
                     winner = 0
                     reward = 0.0
+            else:
+                winner = 0
+                reward = 0.0
             return GameState(board=board, current_player=-state.current_player,
                              done=True, winner=winner), reward, True
 
