@@ -221,6 +221,14 @@ def model_move():
 
 
 def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, device: str):
+    torch.serialization.add_safe_globals([MuZeroConfig])
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    state_dict = ckpt["model_state_dict"]
+
+    # Detect whether the checkpoint was trained with the EZ consistency head
+    # (projection + prediction_head). Back-compat with pre-EZ chess checkpoints.
+    has_consistency = any(k.startswith("projection.") for k in state_dict)
+
     network = MuZeroNetwork(
         observation_channels=game.num_planes,
         action_space_size=game.action_space_size,
@@ -233,10 +241,15 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
         fc_hidden=config.fc_hidden,
         value_support_size=config.value_support_size,
         reward_support_size=config.reward_support_size,
+        use_consistency_loss=has_consistency,
+        proj_hid=config.proj_hid,
+        proj_out=config.proj_out,
+        pred_hid=config.pred_hid,
+        pred_out=config.pred_out,
+        use_scalar_transform=config.use_scalar_transform,
+        value_target_scale=config.value_target_scale,
     )
-    torch.serialization.add_safe_globals([MuZeroConfig])
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    network.load_state_dict(ckpt["model_state_dict"])
+    network.load_state_dict(state_dict)
     network.to(device)
     network.eval()
     return network

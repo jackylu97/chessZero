@@ -12,6 +12,7 @@ wheels/
 # Training artifacts
 runs/
 checkpoints/
+data/
 *.pt
 
 # IDE

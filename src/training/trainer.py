@@ -16,7 +16,7 @@ from tqdm import tqdm
 from ..config import MuZeroConfig
 from ..games.base import Game
 from ..model.muzero_net import MuZeroNetwork
-from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar
+from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar, inverse_scalar_transform
 from .replay_buffer import ReplayBuffer
 from .self_play import run_self_play
 
@@ -79,19 +79,30 @@ class MuZeroTrainer:
             print("Generating initial self-play games...")
             self._run_self_play()
 
+        pretrain = self.config.warmstart_pretrain_steps
+        if pretrain > 0:
+            print(f"Warmstart pretrain: skipping self-play and reanalyze until step {pretrain}")
+
         start_step = self.global_step
         pbar = tqdm(range(start_step, self.config.training_steps), desc="Training",
                     initial=start_step, total=self.config.training_steps)
         for step in pbar:
             self.global_step = step
 
-            if step > 0 and step % self.config.self_play_interval == 0:
+            # Gate self-play and reanalyze during warmstart pretrain. An untrained
+            # net produces garbage self-play that dilutes the clean Stockfish
+            # signal, and reanalyze with an untrained net overwrites self-play
+            # root_values with noise.
+            in_pretrain = step < pretrain
+
+            if step > 0 and step % self.config.self_play_interval == 0 and not in_pretrain:
                 self._run_self_play()
 
             if (
                 self.config.reanalyze_interval > 0
                 and step % self.config.reanalyze_interval == 0
                 and len(self.replay_buffer) >= self.config.min_buffer_size
+                and not in_pretrain
             ):
                 self._reanalyze()
 
@@ -202,11 +213,20 @@ class MuZeroTrainer:
             else self._policy_loss
         )
 
+        # Loss-weighting mode. See config.use_root_heavy_loss docstring.
+        K = self.config.num_unroll_steps
+        use_root_heavy = bool(getattr(self.config, "use_root_heavy_loss", False))
+        # Per-unroll-step multiplier applied inside the loop. Root (k=0) always at 1.
+        # - root-heavy: unroll weight 1/K, no outer scale (matches paper pseudocode)
+        # - uniform:    unroll weight 1,   outer scale 1/(K+1) (current default)
+        unroll_scale = (1.0 / K if K > 0 else 0.0) if use_root_heavy else 1.0
+        outer_scale = 1.0 if use_root_heavy else 1.0 / (K + 1)
+
         with autocast(device_type=self.device.split(":")[0], enabled=self.config.use_amp):
             hidden, policy_logits, value_logits = self.network.initial_inference_logits(obs)
             value_logits_k0 = value_logits  # save for priority update
 
-            # Per-sample losses at root (k=0)
+            # Per-sample losses at root (k=0) — always full weight
             policy_loss = policy_loss_fn(policy_logits, target_policies[:, 0])
             value_loss = self._value_loss(value_logits, target_values[:, 0],
                                           self.network.value_support_size)
@@ -219,11 +239,11 @@ class MuZeroTrainer:
 
                 hidden.register_hook(lambda grad: grad * 0.5)
 
-                policy_loss = policy_loss + policy_loss_fn(policy_logits, target_policies[:, k + 1])
-                value_loss = value_loss + self._value_loss(value_logits, target_values[:, k + 1],
-                                                           self.network.value_support_size)
-                reward_loss = reward_loss + self._reward_loss(reward_logits, target_rewards[:, k + 1],
-                                                              self.network.reward_support_size)
+                policy_loss = policy_loss + unroll_scale * policy_loss_fn(policy_logits, target_policies[:, k + 1])
+                value_loss = value_loss + unroll_scale * self._value_loss(value_logits, target_values[:, k + 1],
+                                                                          self.network.value_support_size)
+                reward_loss = reward_loss + unroll_scale * self._reward_loss(reward_logits, target_rewards[:, k + 1],
+                                                                             self.network.reward_support_size)
 
                 if use_consistency:
                     # SimSiam: online branch via dynamics (grad); target branch via representation
@@ -233,13 +253,12 @@ class MuZeroTrainer:
                     with torch.no_grad():
                         target_hidden = self.network.representation(target_observations[:, k + 1])
                         tgt_proj = self.network.project(target_hidden, with_grad=False)
-                    consistency_loss = consistency_loss + (
+                    consistency_loss = consistency_loss + unroll_scale * (
                         _negative_cosine_similarity(dyn_proj, tgt_proj)
                         * target_obs_mask[:, k + 1]
                     )
 
-            scale = 1.0 / (self.config.num_unroll_steps + 1)
-            per_sample_loss = scale * (
+            per_sample_loss = outer_scale * (
                 policy_loss
                 + self.config.value_loss_weight * value_loss
                 + reward_loss
@@ -260,6 +279,8 @@ class MuZeroTrainer:
                 "consistency_loss": float("nan"),
                 "grad_norm": float("nan"),
                 "amp_scale": float(self.scaler.get_scale()),
+                "value_mae": float("nan"),
+                "value_target_std": float("nan"),
             }
 
         self.optimizer.zero_grad()
@@ -271,21 +292,37 @@ class MuZeroTrainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
-        # Update PER priorities from root value TD errors
+        # Update PER priorities from root value TD errors. TD error is computed in
+        # transformed space (matches target_dist construction). MAE / target_std are
+        # reported in raw scalar space so they compare against a meaningful floor:
+        # if value_mae ≳ value_target_std, the model is just predicting the batch
+        # mean. CE loss hits a floor once targets are concentrated, so MAE-vs-std
+        # is the more honest "is the value head learning?" signal.
         with torch.no_grad():
-            pred_v = support_to_scalar(value_logits_k0.detach().float(), self.network.value_support_size)
-            true_v = scalar_transform(target_values[:, 0])
-            td_errors = (pred_v.squeeze(-1) - true_v).abs().cpu().numpy()
+            pred_v_trans = support_to_scalar(value_logits_k0.detach().float(), self.network.value_support_size).squeeze(-1)
+            true_v_scalar = target_values[:, 0]
+            if self.config.use_scalar_transform:
+                true_v_trans = scalar_transform(true_v_scalar)
+                pred_v_scalar = inverse_scalar_transform(pred_v_trans)
+            else:
+                scale = self.config.value_target_scale
+                true_v_trans = true_v_scalar * scale
+                pred_v_scalar = pred_v_trans / scale if scale != 1.0 else pred_v_trans
+            td_errors = (pred_v_trans - true_v_trans).abs().cpu().numpy()
+            value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
+            value_target_std = true_v_scalar.float().std(unbiased=False).item()
         self.replay_buffer.update_priorities(game_indices, td_errors, self.config.per_epsilon)
 
         return {
             "total_loss": total_loss.item(),
-            "policy_loss": (scale * policy_loss.mean()).item(),
-            "value_loss": (scale * self.config.value_loss_weight * value_loss.mean()).item(),
-            "reward_loss": (scale * reward_loss.mean()).item(),
-            "consistency_loss": (scale * self.config.consistency_loss_weight * consistency_loss.mean()).item(),
+            "policy_loss": (outer_scale * policy_loss.mean()).item(),
+            "value_loss": (outer_scale * self.config.value_loss_weight * value_loss.mean()).item(),
+            "reward_loss": (outer_scale * reward_loss.mean()).item(),
+            "consistency_loss": (outer_scale * self.config.consistency_loss_weight * consistency_loss.mean()).item(),
             "grad_norm": float(grad_norm),
             "amp_scale": float(self.scaler.get_scale()),
+            "value_mae": value_mae,
+            "value_target_std": value_target_std,
         }
 
     @torch.no_grad()
@@ -379,23 +416,29 @@ class MuZeroTrainer:
     def _value_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,
                     support_size: int) -> torch.Tensor:
         """Per-sample cross-entropy for categorical value prediction."""
-        transformed = scalar_transform(target_scalar)
+        if self.config.use_scalar_transform:
+            transformed = scalar_transform(target_scalar)
+        else:
+            transformed = target_scalar * self.config.value_target_scale
         target_dist = scalar_to_support(transformed, support_size).to(logits.device)
         return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1)
 
     def _reward_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,
                      support_size: int) -> torch.Tensor:
         """Per-sample cross-entropy for categorical reward prediction."""
-        transformed = scalar_transform(target_scalar)
+        transformed = scalar_transform(target_scalar) if self.config.use_scalar_transform else target_scalar
         target_dist = scalar_to_support(transformed, support_size).to(logits.device)
         return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1)
 
     def _log(self, loss_info: dict, step: int):
         # Route loss/grad/scale scalars to their own namespaces so TensorBoard
         # groups them sensibly.
+        value_keys = {"value_mae", "value_target_std"}
         for key, value in loss_info.items():
             if key in ("grad_norm", "amp_scale"):
                 self.writer.add_scalar(f"train/{key}", value, step)
+            elif key in value_keys:
+                self.writer.add_scalar(f"value/{key[len('value_'):]}", value, step)
             else:
                 self.writer.add_scalar(f"loss/{key}", value, step)
         self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], step)
@@ -410,7 +453,28 @@ class MuZeroTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
         }, self.checkpoint_dir / f"checkpoint_{step}.pt")
-        self.replay_buffer.save(self.checkpoint_dir / f"checkpoint_{step}.buf")
+
+        # Only pickle self-play games. Warmstart games are on disk as Stockfish
+        # shards and can be reloaded via --warmstart-path on resume; including
+        # them in the .buf would rewrite a multi-GB static dataset every
+        # checkpoint, OOM-ing the host. total_games is preserved unchanged.
+        buf = self.replay_buffer.buffer
+        n_self_play = sum(1 for g in buf if not g.external_values)
+        if n_self_play == 0:
+            tqdm.write(
+                f"Step {step}: skipped buffer pickle "
+                f"(no self-play games yet — resume via --warmstart-path)"
+            )
+        else:
+            self.replay_buffer.save(
+                self.checkpoint_dir / f"checkpoint_{step}.buf",
+                filter_fn=lambda g: not g.external_values,
+            )
+            tqdm.write(
+                f"Step {step}: saved buffer "
+                f"({n_self_play} self-play games; warmstart excluded — "
+                f"re-pass --warmstart-path on resume)"
+            )
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load model, optimizer, scheduler, and replay buffer from a checkpoint."""

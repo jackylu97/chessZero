@@ -76,6 +76,38 @@ class MuZeroConfig:
     reanalyze_interval: int = 0   # training steps between reanalyze calls; 0 = disabled
     reanalyze_batch_size: int = 20  # number of games to reanalyze per call
 
+    # Warmstart pretrain — pure supervised steps on warmstart data before self-play
+    # and reanalyze kick in. Prevents an untrained net from polluting the buffer
+    # (via garbage self-play) and overwriting clean Stockfish targets (via reanalyze).
+    # 0 = disabled (normal schedule from step 0).
+    warmstart_pretrain_steps: int = 0
+
+    # Categorical value/reward target encoding uses h(x) = sign(x)(sqrt(|x|+1)-1)
+    # + 0.001x to compress heavy-tailed Atari-style returns. For bounded chess
+    # targets in [-1,+1], h(x) compresses them into ~3 of 21 bins (roughly 0.415,
+    # 0, -0.415), throwing away the resolution the bins were meant to provide.
+    # Set False to skip the transform (identity) — targets then span the full
+    # support at ~0.1 resolution. Both muzero-general and LightZero apply h(x)
+    # unconditionally; flip this for board games where targets are already bounded.
+    use_scalar_transform: bool = True
+
+    # Linear scale applied to raw value targets before bin encoding (and inverse
+    # applied after decoding). Only active when use_scalar_transform=False — h(x)
+    # and linear scaling are mutually exclusive encodings. For bounded targets in
+    # [-R, +R] paired with value_support_size=S, setting value_target_scale=S/R
+    # spreads raw values across the full support so every bin carries gradient.
+    # Chess example: raw targets in [-1,+1], support_size=2 → scale=2 → 5 bins
+    # at {-1, -0.5, 0, +0.5, +1} in raw-value terms.
+    value_target_scale: float = 1.0
+
+    # Root-heavy loss weighting (MuZero paper / muzero-general pseudocode):
+    # root prediction gets weight 1.0, each of the K unroll steps gets weight 1/K.
+    # Default False uses the current uniform 1/(K+1) weighting (≈ LightZero's
+    # convention). Flip to True for an A/B against the paper-prescribed shape;
+    # effectively increases root-level gradient ~6× vs tail (K=5) and ~doubles total
+    # loss magnitude, so watch train/grad_norm and train/amp_scale on rollout.
+    use_root_heavy_loss: bool = False
+
     # Sampled MuZero (Hubert 2021, Proposed Modification): sample K distinct
     # actions per node via Gumbel-Top-K; PUCT prior is π_net renormalized over σ,
     # training target is raw N(a)/ΣN(a). Required for large action spaces (chess).
@@ -164,7 +196,7 @@ def get_config(game: str) -> MuZeroConfig:
             min_buffer_size=500,
             num_self_play_games=100,
             self_play_interval=1000,   # 2:1 train:selfplay ratio
-            lr=5e-4,
+            lr=1e-3,
             dirichlet_alpha=0.03,
             td_steps=-1,             # full MC return; bootstrapping poisons targets while value head is broken
             temperature_drop_step=30,
@@ -174,6 +206,10 @@ def get_config(game: str) -> MuZeroConfig:
             sample_k=50,               # Sampled MuZero: sample K distinct actions per node (Hubert 2021 Proposed Modification)
             eval_interval=5000,
             use_consistency_loss=True, # EfficientZero SimSiam consistency loss on dynamics rollouts
+            warmstart_pretrain_steps=5000,  # Pure supervised steps on Stockfish warmstart before self-play/reanalyze
+            use_scalar_transform=False,  # chess values live in [-1,+1]; h(x) would collapse them onto bin 0
+            value_support_size=2,        # 5 bins at {-2,-1,0,+1,+2}; paired with value_target_scale=2.0 gives {-1,-0.5,0,+0.5,+1} in raw space
+            value_target_scale=2.0,      # spread raw [-1,+1] targets across the full 5-bin support
         ),
         "checkers": MuZeroConfig(
             game="checkers",

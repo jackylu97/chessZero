@@ -104,8 +104,11 @@ def scalar_to_support(x: torch.Tensor, support_size: int) -> torch.Tensor:
     high_idx = (low_idx + 1).clamp(0, num_bins - 1)
 
     probs = torch.zeros(x.shape[0], num_bins, device=x.device, dtype=x.dtype)
-    probs.scatter_(1, low_idx.unsqueeze(1), (1 - frac).unsqueeze(1))
-    probs.scatter_(1, high_idx.unsqueeze(1), frac.unsqueeze(1))
+    # scatter_add_ instead of scatter_ so that when x sits exactly on the upper
+    # support boundary (low_idx == high_idx after clamp), the two writes
+    # accumulate to 1.0 instead of the second overwriting the first to 0.
+    probs.scatter_add_(1, low_idx.unsqueeze(1), (1 - frac).unsqueeze(1))
+    probs.scatter_add_(1, high_idx.unsqueeze(1), frac.unsqueeze(1))
 
     return probs
 

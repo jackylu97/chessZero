@@ -214,11 +214,24 @@ class ReplayBuffer:
                     err = 1.0
                 self._priorities[idx] = err + epsilon
 
-    def save(self, path: str | Path):
+    def save(self, path: str | Path, filter_fn=None):
+        """Pickle buffer, priorities, and total_games to path.
+
+        filter_fn: optional callable (GameHistory) -> bool. Only games for which
+        filter_fn returns True are pickled; their priorities are kept aligned.
+        total_games is preserved unchanged so the training-progress counter
+        survives filtered saves.
+        """
+        if filter_fn is None:
+            games, priorities = self.buffer, self._priorities
+        else:
+            items = [(g, p) for g, p in zip(self.buffer, self._priorities) if filter_fn(g)]
+            games = [g for g, _ in items]
+            priorities = [p for _, p in items]
         with open(path, "wb") as f:
             pickle.dump({
-                "buffer": self.buffer,
-                "priorities": self._priorities,
+                "buffer": games,
+                "priorities": priorities,
                 "total_games": self.total_games,
             }, f)
 

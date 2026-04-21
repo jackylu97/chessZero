@@ -155,12 +155,13 @@ class MultiGameTrainer:
 
         value_support = self.network.value_support_size
         reward_support = self.network.reward_support_size
+        value_scale = getattr(self.network, "value_target_scale", 1.0)
 
         with autocast(device_type=self.device.split(":")[0], enabled=self.use_amp):
             hidden, policy_logits, value_logits = self.network.initial_inference_logits(obs, game_name)
 
             policy_loss = -(target_policies[:, 0] * F.log_softmax(policy_logits, dim=1)).sum(1).mean()
-            value_loss = self._categorical_loss(value_logits, target_values[:, 0], value_support)
+            value_loss = self._categorical_loss(value_logits, target_values[:, 0], value_support, value_scale)
             reward_loss = torch.tensor(0.0, device=self.device)
 
             for k in range(config.num_unroll_steps):
@@ -169,7 +170,7 @@ class MultiGameTrainer:
                 hidden.register_hook(lambda grad: grad * 0.5)
 
                 policy_loss += -(target_policies[:, k+1] * F.log_softmax(policy_logits, dim=1)).sum(1).mean()
-                value_loss += self._categorical_loss(value_logits, target_values[:, k+1], value_support)
+                value_loss += self._categorical_loss(value_logits, target_values[:, k+1], value_support, value_scale)
                 reward_loss += self._categorical_loss(reward_logits, target_rewards[:, k+1], reward_support)
 
             scale = 1.0 / (config.num_unroll_steps + 1)
@@ -194,9 +195,12 @@ class MultiGameTrainer:
         }
 
     def _categorical_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,
-                          support_size: int) -> torch.Tensor:
+                          support_size: int, target_scale: float = 1.0) -> torch.Tensor:
         """Cross-entropy loss for categorical value/reward prediction."""
-        transformed = scalar_transform(target_scalar)
+        if getattr(self.network, "use_scalar_transform", True):
+            transformed = scalar_transform(target_scalar)
+        else:
+            transformed = target_scalar * target_scale
         target_dist = scalar_to_support(transformed, support_size).to(logits.device)
         return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
 

@@ -42,6 +42,8 @@ def load_model(checkpoint_path: str, game, config, device: str):
         fc_hidden=config.fc_hidden,
         value_support_size=config.value_support_size,
         reward_support_size=config.reward_support_size,
+        use_scalar_transform=config.use_scalar_transform,
+        value_target_scale=config.value_target_scale,
     )
     from src.config import MuZeroConfig
     torch.serialization.add_safe_globals([MuZeroConfig])

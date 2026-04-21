@@ -63,6 +63,10 @@ def main():
                              "Games with populated external_values use those as value "
                              "targets (bypassing td_steps/game_outcome). Typically "
                              "produced by scripts/generate_stockfish_games.py.")
+    parser.add_argument("--root-heavy-loss", action="store_true",
+                        help="Weight the root prediction at 1.0 and each unroll step "
+                             "at 1/K (MuZero paper / muzero-general convention). "
+                             "Default is uniform 1/(K+1) per step (LightZero-like).")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -83,6 +87,8 @@ def main():
         config.gumbel_num_considered = args.gumbel_m
     if args.eval_interval is not None:
         config.eval_interval = args.eval_interval
+    if args.root_heavy_loss:
+        config.use_root_heavy_loss = True
 
     # Use CPU AMP settings appropriately
     if device == "cpu":
@@ -115,6 +121,8 @@ def main():
         proj_out=config.proj_out,
         pred_hid=config.pred_hid,
         pred_out=config.pred_out,
+        use_scalar_transform=config.use_scalar_transform,
+        value_target_scale=config.value_target_scale,
     )
 
     trainer = MuZeroTrainer(

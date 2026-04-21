@@ -229,12 +229,16 @@ class MuZeroNetwork(nn.Module):
         proj_out: int = 1024,
         pred_hid: int = 512,
         pred_out: int = 1024,
+        use_scalar_transform: bool = True,
+        value_target_scale: float = 1.0,
     ):
         super().__init__()
         self.action_space_size = action_space_size
         self.value_support_size = value_support_size
         self.reward_support_size = reward_support_size
         self.use_consistency_loss = use_consistency_loss
+        self.use_scalar_transform = use_scalar_transform
+        self.value_target_scale = value_target_scale
 
         self.representation = RepresentationNetwork(
             observation_channels, hidden_planes, num_blocks,
@@ -319,11 +323,17 @@ class MuZeroNetwork(nn.Module):
 
     def _value_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
         scalar = support_to_scalar(logits, self.value_support_size)
-        return inverse_scalar_transform(scalar).unsqueeze(-1)
+        if self.use_scalar_transform:
+            scalar = inverse_scalar_transform(scalar)
+        elif self.value_target_scale != 1.0:
+            scalar = scalar / self.value_target_scale
+        return scalar.unsqueeze(-1)
 
     def _reward_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
         scalar = support_to_scalar(logits, self.reward_support_size)
-        return inverse_scalar_transform(scalar).unsqueeze(-1)
+        if self.use_scalar_transform:
+            scalar = inverse_scalar_transform(scalar)
+        return scalar.unsqueeze(-1)
 
 
 class MultiGameMuZeroNetwork(nn.Module):
@@ -337,7 +347,9 @@ class MultiGameMuZeroNetwork(nn.Module):
     def __init__(self, game_configs: dict, hidden_planes: int = 128,
                  num_blocks: int = 8, latent_h: int = 8, latent_w: int = 8,
                  fc_hidden: int = 128, game_id_dim: int = 16,
-                 value_support_size: int = 10, reward_support_size: int = 1):
+                 value_support_size: int = 10, reward_support_size: int = 1,
+                 use_scalar_transform: bool = True,
+                 value_target_scale: float = 1.0):
         """
         Args:
             game_configs: dict mapping game_name -> {
@@ -352,6 +364,8 @@ class MultiGameMuZeroNetwork(nn.Module):
         self.hidden_planes = hidden_planes
         self.value_support_size = value_support_size
         self.reward_support_size = reward_support_size
+        self.use_scalar_transform = use_scalar_transform
+        self.value_target_scale = value_target_scale
 
         value_out = 2 * value_support_size + 1
         reward_out = 2 * reward_support_size + 1
@@ -482,11 +496,17 @@ class MultiGameMuZeroNetwork(nn.Module):
 
     def _value_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
         scalar = support_to_scalar(logits, self.value_support_size)
-        return inverse_scalar_transform(scalar).unsqueeze(-1)
+        if self.use_scalar_transform:
+            scalar = inverse_scalar_transform(scalar)
+        elif self.value_target_scale != 1.0:
+            scalar = scalar / self.value_target_scale
+        return scalar.unsqueeze(-1)
 
     def _reward_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
         scalar = support_to_scalar(logits, self.reward_support_size)
-        return inverse_scalar_transform(scalar).unsqueeze(-1)
+        if self.use_scalar_transform:
+            scalar = inverse_scalar_transform(scalar)
+        return scalar.unsqueeze(-1)
 
 
 def _min_max_normalize(x: torch.Tensor) -> torch.Tensor:
