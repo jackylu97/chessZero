@@ -75,6 +75,13 @@ def main():
                         help="Games per injection round. Overrides config.")
     parser.add_argument("--stockfish-injection-interval", type=int, default=None,
                         help="Training steps between injection rounds. Overrides config.")
+    parser.add_argument("--stockfish-injection-shuffle-seed", type=int, default=0,
+                        help="Seed for the deterministic shuffle of injection shard paths. "
+                             "0 = shuffle with seed 0 (interleaves buckets/workers so the "
+                             "replay buffer sees a balanced mix of sub-pools throughout "
+                             "warmstart, instead of bucket-sequential curriculum order). "
+                             "Pass a negative value to disable shuffling (consume in sorted "
+                             "alphabetical order — legacy behavior, reproducible across resumes).")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -151,10 +158,11 @@ def main():
 
     if args.stockfish_injection_path:
         import glob
+        import random
         p = args.stockfish_injection_path
         if os.path.isdir(p):
-            # Recursive glob — parallel generation lays shards under worker_N/
-            # subdirs. Sorted order gives deterministic consumption across resume.
+            # Recursive glob — parallel generation lays shards under
+            # bucket_*/worker_*/subdirs.
             injection_paths = sorted(glob.glob(os.path.join(p, "**", "*.pkl"),
                                                 recursive=True))
         else:
@@ -163,9 +171,22 @@ def main():
             raise FileNotFoundError(
                 f"No .pkl shards found under --stockfish-injection-path: {p}"
             )
+
+        # Deterministic shuffle so multi-bucket pools (e.g. asymmetric-teacher
+        # 8v5/8v6/8v7/8v8 layout) mix evenly through the buffer instead of
+        # feeding one bucket at a time in curriculum order (which biases the
+        # position distribution the model sees across warmstart). Seed=0 gives
+        # reproducible ordering across resumes; negative seed preserves the
+        # legacy sorted-alphabetical order.
+        seed = args.stockfish_injection_shuffle_seed
+        if seed >= 0:
+            random.Random(seed).shuffle(injection_paths)
+
         trainer.set_injection_shards(injection_paths)
+        shuffle_note = (f"shuffled with seed={seed}" if seed >= 0
+                        else "sorted-alphabetical (shuffle disabled)")
         print(f"Stockfish injection: {len(injection_paths)} shard(s) attached from {p} "
-              f"(cursor resumed at {trainer._injection_loaded} games consumed)")
+              f"[{shuffle_note}] (cursor resumed at {trainer._injection_loaded} games consumed)")
 
     trainer.train()
 
