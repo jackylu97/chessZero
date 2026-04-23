@@ -370,3 +370,55 @@ def test_bootstrap_skipped_when_buffer_not_empty(tmp_path):
     # Buffer still has only the pre-existing game; bootstrap did not fire.
     assert len(trainer.replay_buffer) == 1
     assert trainer._injection_loaded == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase-dependent value_loss_weight (warmstart vs selfplay)
+# ---------------------------------------------------------------------------
+
+
+def _trainer_with_phase_weights(tmp_path: Path, *, warm: float, selfp: float):
+    t = _make_trainer(tmp_path)
+    t.config.value_loss_weight_warmstart = warm
+    t.config.value_loss_weight_selfplay = selfp
+    return t
+
+
+def test_value_loss_weight_uses_warmstart_while_pool_alive(tmp_path):
+    """With phase fields set and the injection pool still alive, value weight
+    reads the warmstart value."""
+    t = _trainer_with_phase_weights(tmp_path, warm=1.0, selfp=0.25)
+    t.set_injection_shards([str(tmp_path / "stub.pkl")])  # not read; just truthy
+    assert t._current_value_loss_weight() == pytest.approx(1.0)
+
+
+def test_value_loss_weight_switches_at_pool_exhaustion(tmp_path):
+    """Once _injection_shards goes empty (the existing pool_alive signal), the
+    weight flips to the self-play value."""
+    t = _trainer_with_phase_weights(tmp_path, warm=1.0, selfp=0.25)
+    t.set_injection_shards([str(tmp_path / "stub.pkl")])
+    assert t._current_value_loss_weight() == pytest.approx(1.0)
+
+    t._injection_shards = []  # simulate exhaustion (mirrors _inject_stockfish_games)
+    assert t._current_value_loss_weight() == pytest.approx(0.25)
+
+
+def test_value_loss_weight_falls_back_when_phase_fields_unset(tmp_path):
+    """Back-compat: if a preset leaves both phase fields at None, the trainer
+    uses the scalar value_loss_weight."""
+    t = _make_trainer(tmp_path)
+    t.config.value_loss_weight_warmstart = None
+    t.config.value_loss_weight_selfplay = None
+    t.config.value_loss_weight = 0.42  # sentinel
+    t.set_injection_shards([str(tmp_path / "stub.pkl")])
+    assert t._current_value_loss_weight() == pytest.approx(0.42)
+    t._injection_shards = []
+    assert t._current_value_loss_weight() == pytest.approx(0.42)
+
+
+def test_chess_preset_has_phase_value_weights():
+    """Sanity: next-run chess preset ships with 1.0 / 0.25 split."""
+    from src.config import get_config
+    cfg = get_config("chess")
+    assert cfg.value_loss_weight_warmstart == pytest.approx(1.0)
+    assert cfg.value_loss_weight_selfplay == pytest.approx(0.25)

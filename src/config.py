@@ -32,7 +32,17 @@ class MuZeroConfig:
     batch_size: int = 64
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    value_loss_weight: float = 0.25  # downweight value loss (Reanalyze paper)
+    value_loss_weight: float = 0.25  # downweight value loss (Reanalyze paper).
+                                     # Fallback / back-compat: used when the phase-dependent
+                                     # fields below are both left at their default (None).
+    # Phase-dependent value loss weighting. Stockfish warmstart targets are clean supervised
+    # signal (deterministic, teacher >> net, no feedback loop) → high weight. Self-play
+    # targets are noisy MCTS bootstraps → paper-standard 0.25 to avoid value-chasing-itself
+    # feedback loops. Switch is gated on pool_alive in trainer._train_step. When either
+    # value is None, the trainer falls back to the scalar value_loss_weight above so older
+    # presets keep working unchanged. See design.md § Deferred: Phase-Dependent value_loss_weight.
+    value_loss_weight_warmstart: float | None = None
+    value_loss_weight_selfplay: float | None = None
     num_unroll_steps: int = 5  # K: number of future steps to unroll
     td_steps: int = -1  # -1 means use full game return
     discount: float = 1.0  # 1.0 for board games (no discounting)
@@ -66,6 +76,10 @@ class MuZeroConfig:
     # LR scheduling — piecewise constant decay. Empty list = no decay.
     lr_decay_milestones: list = field(default_factory=list)  # fractions of training_steps
     lr_decay_factor: float = 0.1
+    # Linear warmup from ~0 → lr over lr_warmup_steps, then hand off to MultiStepLR.
+    # 0 = disabled (scheduler is just MultiStepLR). Useful when bumping lr: protects
+    # against early-training gradient explosion before amp_scale settles.
+    lr_warmup_steps: int = 0
 
     # Prioritized Experience Replay (PER)
     per_alpha: float = 0.6    # priority exponent: 0 = uniform, 1 = fully prioritized
@@ -202,6 +216,8 @@ def get_config(game: str) -> MuZeroConfig:
             training_steps=150000,
             checkpoint_interval=1000,
             lr_decay_milestones=[0.5, 0.75],  # decay 10× at 50k and 75k
+            lr_warmup_steps=500,               # ramp up to lr over first 500 steps;
+                                               # AMP scale is still stabilizing there.
             replay_buffer_size=2500,    # memory-capped, not game-capped: self-play games
                                         # avg 277 plies × ~25 KB/ply ≈ 6.7 MB/game, so
                                         # 2500 slots peaks at ~17 GB RAM — safe on a
@@ -213,7 +229,12 @@ def get_config(game: str) -> MuZeroConfig:
             min_buffer_size=500,
             num_self_play_games=256,   # one num_parallel_games sweep per round
             self_play_interval=512,   # 2:1 train:selfplay ratio
-            lr=1e-3,
+            lr=2e-3,                   # 2× paper floor; grad_norm + amp_scale confirm
+                                        # optimizer has headroom at 1e-3. With 500-step
+                                        # warmup (below). See design.md § Deferred: Double
+                                        # Base Learning Rate for Chess.
+            value_loss_weight_warmstart=1.0,  # clean Stockfish targets: strong supervision
+            value_loss_weight_selfplay=0.25,  # noisy MCTS bootstraps: paper-standard damp
             dirichlet_alpha=0.03,
             td_steps=10,
             temperature_drop_step=30,
@@ -230,6 +251,11 @@ def get_config(game: str) -> MuZeroConfig:
             use_scalar_transform=False,  # chess values live in [-1,+1]; h(x) would collapse them onto bin 0
             value_support_size=2,        # 5 bins at {-2,-1,0,+1,+2}; paired with value_target_scale=2.0 gives {-1,-0.5,0,+0.5,+1} in raw space
             value_target_scale=2.0,      # spread raw [-1,+1] targets across the full 5-bin support
+            use_gumbel=False,            # Classic PUCT + Dirichlet for chess. m=16 sampled-root truncation in
+                                         # Gumbel MuZero structurally hides tactical moves ranking 17+ in an
+                                         # undertrained policy (avg 30-40 legal chess moves in middlegame), and
+                                         # Gumbel's advantages were validated on Go where priors are sharper.
+                                         # Code path stays flag-gated. See design.md § Deferred: Drop Gumbel.
         ),
         "checkers": MuZeroConfig(
             game="checkers",

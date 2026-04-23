@@ -10,7 +10,7 @@ import psutil
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import LinearLR, MultiStepLR, SequentialLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -60,9 +60,29 @@ class MuZeroTrainer:
             weight_decay=config.weight_decay,
         )
 
-        # LR scheduling: piecewise constant decay at milestone fractions of training_steps
+        # LR scheduling: optional linear warmup → piecewise constant decay.
+        # Milestones are fractions of training_steps. Warmup, if enabled,
+        # ramps lr from lr*start_factor → lr over lr_warmup_steps; the
+        # decay scheduler then takes over (milestones are measured in
+        # absolute steps, so they fire correctly after warmup).
         milestones = [int(m * config.training_steps) for m in config.lr_decay_milestones]
-        self.scheduler = MultiStepLR(self.optimizer, milestones=milestones, gamma=config.lr_decay_factor)
+        decay_scheduler = MultiStepLR(
+            self.optimizer, milestones=milestones, gamma=config.lr_decay_factor
+        )
+        if config.lr_warmup_steps > 0:
+            warmup_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=1e-4,          # ramp from tiny → full lr
+                end_factor=1.0,
+                total_iters=config.lr_warmup_steps,
+            )
+            self.scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, decay_scheduler],
+                milestones=[config.lr_warmup_steps],
+            )
+        else:
+            self.scheduler = decay_scheduler
 
         self.scaler = GradScaler("cuda", enabled=config.use_amp)
         self.replay_buffer = ReplayBuffer(config.replay_buffer_size)
@@ -300,6 +320,21 @@ class MuZeroTrainer:
             f"(pool {self._injection_loaded} consumed, buffer {len(self.replay_buffer)})"
         )
 
+    def _current_value_loss_weight(self) -> float:
+        """Return the value-loss weight for this training step.
+
+        When both ``value_loss_weight_warmstart`` and ``value_loss_weight_selfplay``
+        are set, gate on ``self._injection_shards`` (the pool_alive signal): clean
+        Stockfish targets get the warmstart weight, self-play-phase bootstrap
+        targets get the selfplay weight. If either is ``None`` (older presets),
+        fall back to the scalar ``value_loss_weight`` for back-compat.
+        """
+        w_warm = getattr(self.config, "value_loss_weight_warmstart", None)
+        w_self = getattr(self.config, "value_loss_weight_selfplay", None)
+        if w_warm is None or w_self is None:
+            return self.config.value_loss_weight
+        return w_warm if self._injection_shards else w_self
+
     def _train_step(self) -> dict:
         """Single training step on a batch from the replay buffer."""
         self.network.train()
@@ -337,6 +372,13 @@ class MuZeroTrainer:
             self._policy_loss_kl if bool(getattr(self.config, "use_gumbel", False))
             else self._policy_loss
         )
+
+        # Phase-dependent value_loss_weight: clean Stockfish targets deserve stronger
+        # supervision than noisy MCTS bootstraps. Gate on the existing pool_alive signal
+        # so the switch happens automatically at pool exhaustion (mirrors self-play and
+        # reanalyze gating). If a preset leaves both phase fields at None (default), fall
+        # back to the scalar value_loss_weight so older presets are unaffected.
+        value_weight = self._current_value_loss_weight()
 
         # Loss-weighting mode. See config.use_root_heavy_loss docstring.
         K = self.config.num_unroll_steps
@@ -385,7 +427,7 @@ class MuZeroTrainer:
 
             per_sample_loss = outer_scale * (
                 policy_loss
-                + self.config.value_loss_weight * value_loss
+                + value_weight * value_loss
                 + reward_loss
                 + self.config.consistency_loss_weight * consistency_loss
             )
@@ -441,13 +483,14 @@ class MuZeroTrainer:
         return {
             "total_loss": total_loss.item(),
             "policy_loss": (outer_scale * policy_loss.mean()).item(),
-            "value_loss": (outer_scale * self.config.value_loss_weight * value_loss.mean()).item(),
+            "value_loss": (outer_scale * value_weight * value_loss.mean()).item(),
             "reward_loss": (outer_scale * reward_loss.mean()).item(),
             "consistency_loss": (outer_scale * self.config.consistency_loss_weight * consistency_loss.mean()).item(),
             "grad_norm": float(grad_norm),
             "amp_scale": float(self.scaler.get_scale()),
             "value_mae": value_mae,
             "value_target_std": value_target_std,
+            "value_loss_weight": float(value_weight),
         }
 
     @torch.no_grad()
@@ -558,7 +601,7 @@ class MuZeroTrainer:
     def _log(self, loss_info: dict, step: int):
         # Route loss/grad/scale scalars to their own namespaces so TensorBoard
         # groups them sensibly.
-        value_keys = {"value_mae", "value_target_std"}
+        value_keys = {"value_mae", "value_target_std", "value_loss_weight"}
         for key, value in loss_info.items():
             if key in ("grad_norm", "amp_scale"):
                 self.writer.add_scalar(f"train/{key}", value, step)
