@@ -160,6 +160,109 @@ def generate_one_game(
     return history
 
 
+def generate_one_asymmetric_game(
+    engine: chess.engine.SimpleEngine,
+    game: ChessGame,
+    play_depth_white: int,
+    play_depth_black: int,
+    label_depth: int,
+    max_plies: int,
+    multipv: int,
+    move_temperature: float,
+    rng: random.Random,
+    gap_sink: list | None = None,
+) -> GameHistory | None:
+    """Asymmetric-teacher game: play at mixed depths, label everything at label_depth.
+
+    At each ply, two analyse calls (collapsed to one when play_depth == label_depth):
+      1. label_info @ depth=label_depth, MPV=1 — drives `policies` (one-hot on top move)
+         and `external_values` / `root_values` (STM eval).
+      2. play_info  @ depth=play_depth_{w,b}, MPV=multipv — drives `actions` (the move
+         actually pushed to the board) via softmax-over-top-K sampling.
+
+    ``policies[i]`` and ``actions[i]`` diverge on positions where the weaker play
+    engine would pick a different move than depth-8's preference. That divergence
+    IS the tactical-signal this is designed to create — depth-8 labels every
+    position accurately, and the weak-side trajectory puts bad positions in the
+    training set so dynamics learns the cause-and-effect.
+    """
+    board = chess.Board()
+    state = game.reset()
+    history = GameHistory(game_name="chess")
+
+    while not state.done:
+        if board.ply() >= max_plies:
+            return None
+
+        play_depth = play_depth_white if board.turn == chess.WHITE else play_depth_black
+
+        if play_depth == label_depth:
+            # Single analyse: play engine at label depth with MPV=K covers both uses.
+            play_info = engine.analyse(
+                board, chess.engine.Limit(depth=label_depth), multipv=multipv
+            )
+            if isinstance(play_info, dict):
+                play_info = [play_info]
+            label_info = [play_info[0]]
+        else:
+            label_info = engine.analyse(
+                board, chess.engine.Limit(depth=label_depth), multipv=1
+            )
+            if isinstance(label_info, dict):
+                label_info = [label_info]
+            play_info = engine.analyse(
+                board, chess.engine.Limit(depth=play_depth), multipv=multipv
+            )
+            if isinstance(play_info, dict):
+                play_info = [play_info]
+
+        # Label from depth-8 top line.
+        if not label_info or not label_info[0].get("pv"):
+            return None
+        label_move = label_info[0]["pv"][0]
+        label_value_stm = score_to_value(label_info[0]["score"], board.turn)
+
+        # Play via softmax sample over depth-play_depth top-K.
+        played_move, chosen_eval, best_eval = softmax_sample_from_multipv(
+            play_info, board.turn, move_temperature, rng
+        )
+        if played_move is None:
+            return None
+        if gap_sink is not None:
+            gap_sink.append(best_eval - chosen_eval)
+
+        label_action = _move_to_action(label_move)
+        played_action = _move_to_action(played_move)
+        one_hot = np.zeros(game.action_space_size, dtype=np.float32)
+        one_hot[label_action] = 1.0
+
+        history.observations.append(game.to_tensor(state))
+        history.actions.append(played_action)          # behavior (played) — may diverge
+        history.policies.append(one_hot)                # target (labeled at depth-8)
+        history.root_values.append(label_value_stm)
+        history.external_values.append(label_value_stm)
+        history.legal_actions_list.append(game.legal_actions(state))
+
+        board.push(played_move)
+        state, reward, _ = game.step(state, played_action)
+        history.rewards.append(reward)
+
+    history.observations.append(game.to_tensor(state))
+    history.game_outcome = float(state.winner)
+    terminal_sign = 1.0 if (len(history.actions) % 2 == 0) else -1.0
+    history.external_values.append(terminal_sign * history.game_outcome)
+    return history
+
+
+# Bucket-name → (strong_depth, weak_depth). Strong always 8; weak varies.
+BUCKETS = {
+    "8v5": (8, 5),
+    "8v6": (8, 6),
+    "8v7": (8, 7),
+    "8v8": (8, 8),
+}
+
+
 def save_shard(path: Path, games: list[GameHistory], format_version: int = 2) -> None:
     """Write a shard to disk.
 
@@ -207,7 +310,44 @@ def main():
                     help="Shard format. 1 = legacy list[GameHistory] (~2.8 MB/game); "
                          "2 = compact streaming (~10-50 KB/game, default). Training "
                          "loads both transparently.")
+    ap.add_argument("--bucket", choices=list(BUCKETS.keys()), default=None,
+                    help="Asymmetric-teacher bucket. 8v5/8v6/8v7 = depth-8 vs weak engine; "
+                         "8v8 = depth-8 both sides (labels + K-way play sampling). Within "
+                         "a bucket, colors alternate 50/50 per game so depth-8 plays white "
+                         "half the time. Overrides --depth; labels at --label-depth (default 8).")
+    ap.add_argument("--play-depth-white", type=int, default=None,
+                    help="Explicit per-color play depth (advanced). Requires --play-depth-black. "
+                         "Incompatible with --bucket.")
+    ap.add_argument("--play-depth-black", type=int, default=None)
+    ap.add_argument("--label-depth", type=int, default=8,
+                    help="Evaluator depth used for policy/value labels in asymmetric mode "
+                         "(default 8, matches --depth for backward compat of symmetric runs).")
     args = ap.parse_args()
+
+    # Mode selection: bucket > explicit play-depth pair > symmetric --depth fallback.
+    asymmetric = args.bucket is not None or args.play_depth_white is not None
+    if args.bucket and args.play_depth_white is not None:
+        ap.error("--bucket and --play-depth-white are mutually exclusive")
+    if args.play_depth_white is not None and args.play_depth_black is None:
+        ap.error("--play-depth-white requires --play-depth-black")
+
+    if args.bucket:
+        strong_depth, weak_depth = BUCKETS[args.bucket]
+
+        def depths_for_game(i: int) -> Tuple[int, int]:
+            # Even games: depth-8 white; odd games: depth-8 black. Alternation gives a
+            # 50/50 color split per bucket so the model sees both sides of the asymmetry.
+            if i % 2 == 0:
+                return strong_depth, weak_depth
+            return weak_depth, strong_depth
+    elif asymmetric:
+        w, b = args.play_depth_white, args.play_depth_black
+
+        def depths_for_game(i: int) -> Tuple[int, int]:
+            return w, b
+    else:
+        def depths_for_game(i: int) -> Tuple[int, int]:
+            return args.depth, args.depth
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -227,14 +367,35 @@ def main():
     dropped_cap = 0
     t0 = time.time()
 
-    print(f"Generating {args.num_games} games at depth {args.depth} "
-          f"(multipv={args.multipv}, τ={args.move_temperature}) → {args.out_dir}")
+    if asymmetric:
+        mode_str = (f"asymmetric bucket={args.bucket}"
+                    if args.bucket else
+                    f"asymmetric play_w={args.play_depth_white},b={args.play_depth_black}")
+        print(f"Generating {args.num_games} games [{mode_str}] "
+              f"label_depth={args.label_depth} multipv={args.multipv} "
+              f"τ={args.move_temperature} → {args.out_dir}")
+    else:
+        print(f"Generating {args.num_games} games at depth {args.depth} "
+              f"(multipv={args.multipv}, τ={args.move_temperature}) → {args.out_dir}")
     try:
         while completed < args.num_games:
-            g = generate_one_game(
-                engine, game, args.depth, args.max_plies,
-                args.multipv, args.move_temperature, rng,
-            )
+            if asymmetric:
+                pd_w, pd_b = depths_for_game(completed)
+                g = generate_one_asymmetric_game(
+                    engine, game,
+                    play_depth_white=pd_w,
+                    play_depth_black=pd_b,
+                    label_depth=args.label_depth,
+                    max_plies=args.max_plies,
+                    multipv=args.multipv,
+                    move_temperature=args.move_temperature,
+                    rng=rng,
+                )
+            else:
+                g = generate_one_game(
+                    engine, game, args.depth, args.max_plies,
+                    args.multipv, args.move_temperature, rng,
+                )
             if g is None:
                 dropped_cap += 1
                 continue
