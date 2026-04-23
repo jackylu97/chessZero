@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 from src.config import get_config
-from src.mcts.mcts import MCTS, select_action
+from src.mcts.mcts import MCTS, BatchedMCTS, select_action, select_action_gumbel
 
 
 def get_game(name: str):
@@ -30,6 +30,12 @@ def get_game(name: str):
 
 def load_model(checkpoint_path: str, game, config, device: str):
     from src.model.muzero_net import MuZeroNetwork
+    from src.config import MuZeroConfig
+    torch.serialization.add_safe_globals([MuZeroConfig])
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    state_dict = checkpoint["model_state_dict"]
+    # Detect EZ consistency head from state_dict keys (back-compat with pre-EZ checkpoints).
+    has_consistency = any(k.startswith("projection.") for k in state_dict)
     network = MuZeroNetwork(
         observation_channels=game.num_planes,
         action_space_size=game.action_space_size,
@@ -42,16 +48,39 @@ def load_model(checkpoint_path: str, game, config, device: str):
         fc_hidden=config.fc_hidden,
         value_support_size=config.value_support_size,
         reward_support_size=config.reward_support_size,
+        use_consistency_loss=has_consistency,
+        proj_hid=config.proj_hid,
+        proj_out=config.proj_out,
+        pred_hid=config.pred_hid,
+        pred_out=config.pred_out,
         use_scalar_transform=config.use_scalar_transform,
         value_target_scale=config.value_target_scale,
     )
-    from src.config import MuZeroConfig
-    torch.serialization.add_safe_globals([MuZeroConfig])
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    network.load_state_dict(checkpoint["model_state_dict"])
+    network.load_state_dict(state_dict)
     network.to(device)
     network.eval()
     return network
+
+
+def make_mcts(network, game, config, device):
+    """Instantiate the right MCTS class for the config. Mirrors trainer._agent_action:
+    BatchedMCTS for Gumbel MuZero (Sequential Halving at root), serial MCTS otherwise.
+    """
+    use_gumbel = bool(getattr(config, "use_gumbel", False))
+    if use_gumbel:
+        return BatchedMCTS(network, game, config, device), True
+    return MCTS(network, game, config, device), False
+
+
+def mcts_move(mcts, is_gumbel, obs, legal, config, action_space_size):
+    """Run MCTS and pick a deterministic action, matching the train/eval path."""
+    if is_gumbel:
+        root = mcts.run_batch([obs], [legal], add_noise=False)[0]
+        action, _ = select_action_gumbel(root, config, action_space_size)
+    else:
+        root = mcts.run(obs, legal, add_noise=False)
+        action, _ = select_action(root, temperature=0)
+    return action
 
 
 def parse_tictactoe_move(move_str: str) -> int | None:
@@ -76,7 +105,7 @@ def play_interactive(game, network, config, device):
     is_tictactoe = isinstance(game, TicTacToe)
     is_chess = isinstance(game, ChessGame)
 
-    mcts = MCTS(network, game, config, device)
+    mcts, is_gumbel = make_mcts(network, game, config, device)
     state = game.reset()
 
     if is_chess:
@@ -98,8 +127,7 @@ def play_interactive(game, network, config, device):
         legal = game.legal_actions(state)
         if state.current_player == 1:
             obs = game.to_tensor(state)
-            root = mcts.run(obs, legal, add_noise=False)
-            action, _ = select_action(root, temperature=0)
+            action = mcts_move(mcts, is_gumbel, obs, legal, config, game.action_space_size)
             if is_chess:
                 print(f"\nModel plays: {game.action_to_san(state, action)}")
             elif is_tictactoe:
@@ -162,7 +190,8 @@ def play_interactive(game, network, config, device):
 def eval_vs_random(game, network, config, device, num_games=100):
     """Evaluate model vs random player."""
     import random as rng
-    mcts = MCTS(network, game, config, device)
+    mcts, is_gumbel = make_mcts(network, game, config, device)
+    action_space_size = game.action_space_size
 
     results = {1: 0, -1: 0, 0: 0}
     for i in range(num_games):
@@ -171,14 +200,14 @@ def eval_vs_random(game, network, config, device, num_games=100):
             legal = game.legal_actions(state)
             if state.current_player == 1:
                 obs = game.to_tensor(state)
-                root = mcts.run(obs, legal, add_noise=False)
-                action, _ = select_action(root, temperature=0)
+                action = mcts_move(mcts, is_gumbel, obs, legal, config, action_space_size)
             else:
                 action = rng.choice(legal)
             state, _, _ = game.step(state, action)
         results[state.winner] += 1
 
-    print(f"Results vs Random ({num_games} games):")
+    print(f"Results vs Random ({num_games} games, use_gumbel={is_gumbel}, "
+          f"num_simulations={config.num_simulations}):")
     print(f"  Wins:   {results[1]}")
     print(f"  Losses: {results[-1]}")
     print(f"  Draws:  {results[0]}")
@@ -192,6 +221,14 @@ def main():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--mode", choices=["play", "eval"], default="eval")
     parser.add_argument("--num-games", type=int, default=100)
+    parser.add_argument("--use-gumbel", dest="use_gumbel", action="store_true", default=None,
+                        help="Force Gumbel MuZero root selection (BatchedMCTS path). "
+                             "Overrides config.use_gumbel.")
+    parser.add_argument("--no-gumbel", dest="use_gumbel", action="store_false",
+                        help="Force PUCT root selection (serial MCTS path). "
+                             "Overrides config.use_gumbel.")
+    parser.add_argument("--num-simulations", type=int, default=None,
+                        help="Override config.num_simulations.")
     args = parser.parse_args()
 
     if args.device is None:
@@ -200,6 +237,10 @@ def main():
         device = args.device
 
     config = get_config(args.game)
+    if args.use_gumbel is not None:
+        config.use_gumbel = args.use_gumbel
+    if args.num_simulations is not None:
+        config.num_simulations = args.num_simulations
     game = get_game(args.game)
     network = load_model(args.checkpoint, game, config, device)
 

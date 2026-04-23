@@ -57,12 +57,6 @@ def main():
                         help="gumbel_num_considered (m for Sequential Halving).")
     parser.add_argument("--eval-interval", type=int, default=None,
                         help="Override config.eval_interval (steps between evals).")
-    parser.add_argument("--warmstart-path", type=str, default=None,
-                        help="Directory or glob of .pkl shards (list[GameHistory]) "
-                             "to pre-load into the replay buffer before training. "
-                             "Games with populated external_values use those as value "
-                             "targets (bypassing td_steps/game_outcome). Typically "
-                             "produced by scripts/generate_stockfish_games.py.")
     parser.add_argument("--root-heavy-loss", action="store_true",
                         help="Weight the root prediction at 1.0 and each unroll step "
                              "at 1/K (MuZero paper / muzero-general convention). "
@@ -71,6 +65,16 @@ def main():
                         help="Cap the number of most-recent self-play games persisted "
                              "to .buf per checkpoint. In-memory buffer is unaffected. "
                              "Default: no cap.")
+    parser.add_argument("--stockfish-injection-path", type=str, default=None,
+                        help="Directory or glob of .pkl shards (list[GameHistory]) "
+                             "to inject into the buffer as self-play surrogates. "
+                             "Shards are consumed in sorted-path order; cursor persists "
+                             "across resume. Self-play + reanalyze auto-gate off until "
+                             "the pool exhausts, then flip on automatically.")
+    parser.add_argument("--stockfish-injection-games", type=int, default=None,
+                        help="Games per injection round. Overrides config.")
+    parser.add_argument("--stockfish-injection-interval", type=int, default=None,
+                        help="Training steps between injection rounds. Overrides config.")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -95,6 +99,10 @@ def main():
         config.use_root_heavy_loss = True
     if args.max_buf_save_games is not None:
         config.max_buf_save_games = args.max_buf_save_games
+    if args.stockfish_injection_games is not None:
+        config.stockfish_injection_games = args.stockfish_injection_games
+    if args.stockfish_injection_interval is not None:
+        config.stockfish_injection_interval = args.stockfish_injection_interval
 
     # Use CPU AMP settings appropriately
     if device == "cpu":
@@ -141,19 +149,23 @@ def main():
     if args.resume:
         trainer.load_checkpoint(args.resume)
 
-    if args.warmstart_path:
+    if args.stockfish_injection_path:
         import glob
-        p = args.warmstart_path
+        p = args.stockfish_injection_path
         if os.path.isdir(p):
-            shard_paths = sorted(glob.glob(os.path.join(p, "*.pkl")))
+            # Recursive glob — parallel generation lays shards under worker_N/
+            # subdirs. Sorted order gives deterministic consumption across resume.
+            injection_paths = sorted(glob.glob(os.path.join(p, "**", "*.pkl"),
+                                                recursive=True))
         else:
-            shard_paths = sorted(glob.glob(p))
-        if not shard_paths:
-            raise FileNotFoundError(f"No .pkl shards found under --warmstart-path: {p}")
-        print(f"Warmstart: loading {len(shard_paths)} shard(s) from {p}")
-        n_loaded = trainer.replay_buffer.load_warmstart_games(shard_paths)
-        print(f"Warmstart: pre-seeded {n_loaded} games "
-              f"(buffer now {len(trainer.replay_buffer)}/{config.replay_buffer_size})")
+            injection_paths = sorted(glob.glob(p))
+        if not injection_paths:
+            raise FileNotFoundError(
+                f"No .pkl shards found under --stockfish-injection-path: {p}"
+            )
+        trainer.set_injection_shards(injection_paths)
+        print(f"Stockfish injection: {len(injection_paths)} shard(s) attached from {p} "
+              f"(cursor resumed at {trainer._injection_loaded} games consumed)")
 
     trainer.train()
 

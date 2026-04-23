@@ -26,6 +26,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from typing import Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -54,16 +55,56 @@ def score_to_value(score: chess.engine.PovScore, pov: chess.Color) -> float:
     return 2.0 * (1.0 / (1.0 + math.exp(-cp / CP_SCALE))) - 1.0
 
 
+def softmax_sample_from_multipv(
+    info_list: list,
+    pov: chess.Color,
+    temperature: float,
+    rng: random.Random,
+) -> Tuple[chess.Move | None, float, float]:
+    """Sample a move from MultiPV analysis, weighted by softmax over line evals.
+
+    Returns ``(move, chosen_eval, best_eval)`` where:
+      - ``chosen_eval`` is ``info_list[k]['score']`` in ``pov`` POV for the sampled k —
+        the correct value target (eval of the line we're actually playing).
+      - ``best_eval`` is the top-line eval, returned so the caller can log
+        quality (how far below best we sampled).
+
+    At ``temperature <= 0`` or len(moves) == 1, deterministically returns top-1.
+    Numerical stability: subtracts eval max before exp.
+    """
+    moves = [info["pv"][0] for info in info_list if info.get("pv")]
+    if not moves:
+        return None, 0.0, 0.0
+    evals = np.array(
+        [score_to_value(info["score"], pov) for info in info_list[: len(moves)]],
+        dtype=np.float64,
+    )
+    best_eval = float(evals[0])
+
+    if temperature <= 0.0 or len(moves) == 1:
+        return moves[0], float(evals[0]), best_eval
+
+    w = np.exp((evals - evals.max()) / temperature)
+    w /= w.sum()
+    idx = rng.choices(range(len(moves)), weights=w.tolist())[0]
+    return moves[idx], float(evals[idx]), best_eval
+
+
 def generate_one_game(
     engine: chess.engine.SimpleEngine,
     game: ChessGame,
     depth: int,
     max_plies: int,
+    multipv: int,
+    move_temperature: float,
+    rng: random.Random,
+    gap_sink: list | None = None,
 ) -> GameHistory | None:
-    """Play a single Stockfish-vs-Stockfish game at fixed depth, recording per-move eval.
+    """Play a single Stockfish game at fixed depth with softmax-over-top-K move sampling.
 
-    Returns the GameHistory, or None if the game hit max_plies without a natural result
-    (rare at depth 8 but possible — we drop these to keep label quality high).
+    Returns the GameHistory, or None if the game hit max_plies without a natural result.
+    If ``gap_sink`` is provided, per-ply ``(best_eval - chosen_eval)`` gaps are appended
+    for diversity diagnostics.
     """
     board = chess.Board()
     state = game.reset()
@@ -73,14 +114,19 @@ def generate_one_game(
         if board.ply() >= max_plies:
             return None
 
-        # Eval BEFORE the move (from the current side-to-move's POV).
-        info = engine.analyse(board, chess.engine.Limit(depth=depth))
-        value_stm = score_to_value(info["score"], board.turn)
+        info_list = engine.analyse(
+            board, chess.engine.Limit(depth=depth), multipv=multipv
+        )
+        if isinstance(info_list, dict):
+            info_list = [info_list]
 
-        result = engine.play(board, chess.engine.Limit(depth=depth))
-        move = result.move
+        move, value_stm, best_eval = softmax_sample_from_multipv(
+            info_list, board.turn, move_temperature, rng
+        )
         if move is None:
             return None
+        if gap_sink is not None:
+            gap_sink.append(best_eval - value_stm)
 
         # Record position + chosen action.
         obs = game.to_tensor(state)
@@ -95,8 +141,8 @@ def generate_one_game(
         history.external_values.append(value_stm)
         history.legal_actions_list.append(game.legal_actions(state))
 
-        # Advance both the python-chess board (for engine.play) and ChessGame state
-        # (for proper terminal reward). They must agree.
+        # Advance both the python-chess board (for engine state) and ChessGame
+        # state (for proper terminal reward). They must agree.
         board.push(move)
         state, reward, _ = game.step(state, action)
         history.rewards.append(reward)
@@ -114,10 +160,26 @@ def generate_one_game(
     return history
 
 
-def save_shard(path: Path, games: list[GameHistory]) -> None:
+def save_shard(path: Path, games: list[GameHistory], format_version: int = 2) -> None:
+    """Write a shard to disk.
+
+    format_version:
+        1 — legacy: a single pickled ``list[GameHistory]`` (~2.8 MB/game).
+        2 — compact streaming: header dict then one compact-dict per game
+            (~10-50 KB/game for Stockfish one-hots). Default.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    if format_version == 1:
+        with open(path, "wb") as f:
+            pickle.dump(games, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return
+    if format_version != 2:
+        raise ValueError(f"Unsupported shard format_version: {format_version}")
+    header = {"version": 2, "n_records": len(games)}
     with open(path, "wb") as f:
-        pickle.dump(games, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(header, f, protocol=pickle.HIGHEST_PROTOCOL)
+        for g in games:
+            pickle.dump(g.to_compact_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def main():
@@ -131,6 +193,20 @@ def main():
     ap.add_argument("--stockfish-threads", type=int, default=1, help="UCI Threads option")
     ap.add_argument("--stockfish-hash", type=int, default=128, help="UCI Hash MB")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--shard-index-start", type=int, default=0,
+                    help="Starting shard index (for running parallel workers writing "
+                         "to the same --out-dir with disjoint index ranges).")
+    ap.add_argument("--multipv", type=int, default=3,
+                    help="Top-K moves Stockfish returns per position. 1 = deterministic "
+                         "best move (no diversity).")
+    ap.add_argument("--move-temperature", type=float, default=0.15,
+                    help="Softmax temperature τ over the top-K line evals in [-1,+1] "
+                         "space. τ→0 = always best move; τ→∞ = uniform across top-K. "
+                         "0.15 ≈ random in flat positions, deterministic on mate threats.")
+    ap.add_argument("--format-version", type=int, default=2, choices=[1, 2],
+                    help="Shard format. 1 = legacy list[GameHistory] (~2.8 MB/game); "
+                         "2 = compact streaming (~10-50 KB/game, default). Training "
+                         "loads both transparently.")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -143,17 +219,22 @@ def main():
         print(f"Warning: could not configure engine ({e}); continuing with defaults")
 
     game = ChessGame()
+    rng = random.Random(args.seed)
 
     shard: list[GameHistory] = []
-    shard_idx = 0
+    shard_idx = args.shard_index_start
     completed = 0
     dropped_cap = 0
     t0 = time.time()
 
-    print(f"Generating {args.num_games} games at depth {args.depth} → {args.out_dir}")
+    print(f"Generating {args.num_games} games at depth {args.depth} "
+          f"(multipv={args.multipv}, τ={args.move_temperature}) → {args.out_dir}")
     try:
         while completed < args.num_games:
-            g = generate_one_game(engine, game, args.depth, args.max_plies)
+            g = generate_one_game(
+                engine, game, args.depth, args.max_plies,
+                args.multipv, args.move_temperature, rng,
+            )
             if g is None:
                 dropped_cap += 1
                 continue
@@ -162,7 +243,7 @@ def main():
 
             if len(shard) >= args.shard_size:
                 path = args.out_dir / f"shard_{shard_idx:04d}.pkl"
-                save_shard(path, shard)
+                save_shard(path, shard, format_version=args.format_version)
                 elapsed = time.time() - t0
                 rate = completed / max(elapsed, 1e-6)
                 decisive = sum(1 for gg in shard if gg.game_outcome != 0.0)
@@ -176,7 +257,7 @@ def main():
 
         if shard:
             path = args.out_dir / f"shard_{shard_idx:04d}.pkl"
-            save_shard(path, shard)
+            save_shard(path, shard, format_version=args.format_version)
             print(f"  final shard {shard_idx}: {len(shard)} games → {path}")
     finally:
         engine.quit()

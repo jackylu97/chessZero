@@ -80,11 +80,18 @@ class MuZeroConfig:
     reanalyze_interval: int = 0   # training steps between reanalyze calls; 0 = disabled
     reanalyze_batch_size: int = 20  # number of games to reanalyze per call
 
-    # Warmstart pretrain — pure supervised steps on warmstart data before self-play
-    # and reanalyze kick in. Prevents an untrained net from polluting the buffer
-    # (via garbage self-play) and overwriting clean Stockfish targets (via reanalyze).
-    # 0 = disabled (normal schedule from step 0).
-    warmstart_pretrain_steps: int = 0
+    # Stockfish injection — inject pre-generated Stockfish games into the buffer
+    # as if they were self-play rounds. Pool (shards of list[GameHistory] with
+    # external_values populated) is passed via --stockfish-injection-path.
+    # While the pool has games left, self-play and reanalyze are both gated off:
+    # the supervised Stockfish stream takes self-play's role; reanalyze on a
+    # buffer of external_values-only games is a no-op anyway. When the pool
+    # exhausts, self-play and reanalyze flip on automatically for the rest of
+    # training. Buffer FIFO + PER handle staleness naturally — identical code
+    # path to self-play.
+    # Both 0 = disabled.
+    stockfish_injection_games: int = 0       # games per injection round
+    stockfish_injection_interval: int = 0    # training steps between rounds
 
     # Categorical value/reward target encoding uses h(x) = sign(x)(sqrt(|x|+1)-1)
     # + 0.001x to compress heavy-tailed Atari-style returns. For bounded chess
@@ -192,25 +199,34 @@ def get_config(game: str) -> MuZeroConfig:
             fc_hidden=256,
             num_simulations=200,     # 200 for ~12 visits/candidate on m=16 Gumbel (was 100 ≈ 6/candidate)
             batch_size=256,
-            training_steps=100000,
+            training_steps=150000,
             checkpoint_interval=1000,
             lr_decay_milestones=[0.5, 0.75],  # decay 10× at 50k and 75k
-            replay_buffer_size=10000,   # bumped from 1000 so Stockfish warmstart games
-                                        # aren't evicted before they've trained the net
+            replay_buffer_size=2500,    # memory-capped, not game-capped: self-play games
+                                        # avg 277 plies × ~25 KB/ply ≈ 6.7 MB/game, so
+                                        # 2500 slots peaks at ~17 GB RAM — safe on a
+                                        # 32 GB host (was 5000 → ~34 GB peak, OOM'd
+                                        # around step 36k of 2026_04_22_0002 as self-play
+                                        # games displaced shorter stockfish ones).
+                                        # Revert to 5000 once compact GameHistory
+                                        # encoding lands (see plan_compact_gamehistory_encoding.md).
             min_buffer_size=500,
-            num_self_play_games=100,
-            self_play_interval=1000,   # 2:1 train:selfplay ratio
+            num_self_play_games=256,   # one num_parallel_games sweep per round
+            self_play_interval=512,   # 2:1 train:selfplay ratio
             lr=1e-3,
             dirichlet_alpha=0.03,
-            td_steps=-1,             # full MC return; bootstrapping poisons targets while value head is broken
+            td_steps=10,
             temperature_drop_step=30,
-            reanalyze_interval=1000,   # keep 1:1 with self_play_interval
-            reanalyze_batch_size=100,
-            num_parallel_games=128,    # bumped from 64 — batched-sync run_batch fits 24GB
+            reanalyze_interval=1024,   # keep 1:1 with self_play_interval
+            reanalyze_batch_size=256,
+            num_parallel_games=256,    # matches training batch_size; batched-sync run_batch
             sample_k=50,               # Sampled MuZero: sample K distinct actions per node (Hubert 2021 Proposed Modification)
             eval_interval=5000,
             use_consistency_loss=True, # EfficientZero SimSiam consistency loss on dynamics rollouts
-            warmstart_pretrain_steps=5000,  # Pure supervised steps on Stockfish warmstart before self-play/reanalyze
+            stockfish_injection_games=256,     # 256 games every 240 steps ≈ 1.07 g/step
+            stockfish_injection_interval=240,  # ~3 center-touches per position (×6 unroll = ~18 loss terms);
+                                               # with a 32k-game pool this runs ~30k steps before exhaustion,
+                                               # at which point self-play + reanalyze flip on automatically
             use_scalar_transform=False,  # chess values live in [-1,+1]; h(x) would collapse them onto bin 0
             value_support_size=2,        # 5 bins at {-2,-1,0,+1,+2}; paired with value_target_scale=2.0 gives {-1,-0.5,0,+0.5,+1} in raw space
             value_target_scale=2.0,      # spread raw [-1,+1] targets across the full 5-bin support

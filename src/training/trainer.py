@@ -18,7 +18,7 @@ from ..config import MuZeroConfig
 from ..games.base import Game
 from ..model.muzero_net import MuZeroNetwork
 from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar, inverse_scalar_transform
-from .replay_buffer import ReplayBuffer
+from .replay_buffer import ReplayBuffer, _iter_shard_games
 from .self_play import run_self_play
 
 
@@ -70,19 +70,34 @@ class MuZeroTrainer:
         self.writer = SummaryWriter(log_dir=os.path.join(log_dir, config.game, run_id))
         self.global_step = 0
 
+        # Stockfish injection state. Populated by scripts/train.py via
+        # set_injection_shards(paths) when --stockfish-injection-path is passed.
+        # _injection_loaded counts games consumed so far from the pool — used as
+        # the cursor so resume can pick up where the previous run left off.
+        self._injection_shards: list[Path] = []
+        self._injection_loaded: int = 0
+        # In-memory cache of the currently-open shard's games; drained one game
+        # at a time by _inject_stockfish_games to avoid re-reading each shard.
+        self._injection_shard_idx: int = 0
+        self._injection_shard_games: list = []
+
     def train(self):
         """Run the full training loop."""
         print(f"Starting MuZero training for {self.config.game}")
         print(f"Device: {self.device}")
         print(f"Network parameters: {sum(p.numel() for p in self.network.parameters()):,}")
 
+        # Cold-start bootstrap. If a Stockfish pool is attached, bulk-inject
+        # enough games to start training on non-trivial buffer diversity.
+        # Otherwise fall back to a random self-play round.
         if len(self.replay_buffer) == 0:
-            print("Generating initial self-play games...")
-            self._run_self_play()
-
-        pretrain = self.config.warmstart_pretrain_steps
-        if pretrain > 0:
-            print(f"Warmstart pretrain: skipping self-play and reanalyze until step {pretrain}")
+            if self._injection_shards:
+                n = max(self.config.stockfish_injection_games, self.config.min_buffer_size)
+                print(f"Bootstrapping buffer with {n} Stockfish games from injection pool")
+                self._inject_stockfish_games(n)
+            else:
+                print("Generating initial self-play games...")
+                self._run_self_play()
 
         start_step = self.global_step
         pbar = tqdm(range(start_step, self.config.training_steps), desc="Training",
@@ -90,20 +105,33 @@ class MuZeroTrainer:
         for step in pbar:
             self.global_step = step
 
-            # Gate self-play and reanalyze during warmstart pretrain. An untrained
-            # net produces garbage self-play that dilutes the clean Stockfish
-            # signal, and reanalyze with an untrained net overwrites self-play
-            # root_values with noise.
-            in_pretrain = step < pretrain
+            # Stockfish injection. Runs on every ``interval`` until the pool is
+            # exhausted (at which point ``_inject_stockfish_games`` clears
+            # ``_injection_shards`` and this branch goes dormant).
+            if (
+                self._injection_shards
+                and self.config.stockfish_injection_interval > 0
+                and step > 0
+                and step % self.config.stockfish_injection_interval == 0
+            ):
+                self._inject_stockfish_games(self.config.stockfish_injection_games)
 
-            if step > 0 and step % self.config.self_play_interval == 0 and not in_pretrain:
+            # Self-play and reanalyze are gated off while the pool is alive.
+            # When it exhausts, both flip on automatically for the rest of training.
+            pool_alive = bool(self._injection_shards)
+
+            if (
+                step > 0
+                and step % self.config.self_play_interval == 0
+                and not pool_alive
+            ):
                 self._run_self_play()
 
             if (
                 self.config.reanalyze_interval > 0
                 and step % self.config.reanalyze_interval == 0
                 and len(self.replay_buffer) >= self.config.min_buffer_size
-                and not in_pretrain
+                and not pool_alive
             ):
                 self._reanalyze()
 
@@ -174,6 +202,102 @@ class MuZeroTrainer:
         tqdm.write(
             f"Step {self.global_step}: self-play done | "
             f"RSS {rss_before:.2f} → {rss_after:.2f} GB (Δ {rss_delta:+.2f}){gpu_msg}"
+        )
+
+    def set_injection_shards(self, shard_paths: list) -> None:
+        """Attach a pool of Stockfish shards for in-loop injection.
+
+        Paths are consumed in list order; _inject_stockfish_games walks them via
+        self._injection_loaded (cumulative games consumed across shards), so a
+        crash mid-window and resume continues from the next un-consumed game.
+        For stable resume behaviour, pass paths in a deterministic order
+        (e.g. sorted) and don't reshuffle between runs.
+        """
+        self._injection_shards = [Path(p) for p in shard_paths]
+
+    def _advance_injection_shard(self) -> bool:
+        """Load the next shard into ``_injection_shard_games``. Return False if pool exhausted.
+
+        Handles both legacy ``list[GameHistory]`` shards and compact v2 shards
+        via ``_iter_shard_games``.
+        """
+        if self._injection_shard_idx >= len(self._injection_shards):
+            return False
+        path = self._injection_shards[self._injection_shard_idx]
+        self._injection_shard_games = list(_iter_shard_games(path, self.game))
+        self._injection_shard_idx += 1
+        return True
+
+    def _fastforward_injection(self) -> None:
+        """Skip through shards until we reach ``_injection_loaded`` cumulative games.
+
+        Called lazily on first injection after resume: the checkpoint persisted
+        the cursor count but not the in-memory shard state, so on cold start we
+        need to discard already-consumed games. Loads and throws away whole
+        shards; the final partial shard is retained in ``_injection_shard_games``.
+        """
+        skipped = 0
+        target = self._injection_loaded
+        while skipped < target:
+            if not self._advance_injection_shard():
+                # Cursor exceeds pool — shard list shrank between runs. Give up.
+                self._injection_shards = []
+                return
+            shard_size = len(self._injection_shard_games)
+            if skipped + shard_size <= target:
+                skipped += shard_size
+                self._injection_shard_games = []
+            else:
+                drop = target - skipped
+                self._injection_shard_games = self._injection_shard_games[drop:]
+                return
+
+    def _inject_stockfish_games(self, n: int) -> None:
+        """Inject up to ``n`` next-un-consumed Stockfish games into the buffer.
+
+        Streams shards lazily: loads one shard at a time into
+        ``_injection_shard_games``, drains it, advances to the next. When the
+        pool is exhausted, logs once and stops injecting for the remainder of
+        training (no wrap — the point is a bounded teacher signal).
+        """
+        if not self._injection_shards:
+            return
+
+        # Lazy fast-forward on first call after resume.
+        if (
+            self._injection_loaded > 0
+            and self._injection_shard_idx == 0
+            and not self._injection_shard_games
+        ):
+            self._fastforward_injection()
+            if not self._injection_shards:
+                return
+
+        inserted = 0
+        while inserted < n:
+            if not self._injection_shard_games:
+                if not self._advance_injection_shard():
+                    tqdm.write(
+                        f"Step {self.global_step}: Stockfish injection pool exhausted "
+                        f"after {self._injection_loaded} games; injection disabled for "
+                        f"remainder of window."
+                    )
+                    self._injection_shards = []
+                    break
+            g = self._injection_shard_games.pop(0)
+            self.replay_buffer.save_game(g)
+            inserted += 1
+            self._injection_loaded += 1
+
+        self.writer.add_scalar(
+            "injection/games_injected_total", self._injection_loaded, self.global_step
+        )
+        self.writer.add_scalar(
+            "injection/buffer_size", len(self.replay_buffer), self.global_step
+        )
+        tqdm.write(
+            f"Step {self.global_step}: injected {inserted} Stockfish games "
+            f"(pool {self._injection_loaded} consumed, buffer {len(self.replay_buffer)})"
         )
 
     def _train_step(self) -> dict:
@@ -453,6 +577,7 @@ class MuZeroTrainer:
             "model_state_dict": self.network.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
+            "injection_loaded": self._injection_loaded,
         }, self.checkpoint_dir / f"checkpoint_{step}.pt")
 
         # Only pickle self-play games. Warmstart games are on disk as Stockfish
@@ -491,11 +616,13 @@ class MuZeroTrainer:
         if "scheduler_state_dict" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         self.global_step = ckpt["step"]
+        # Restore injection cursor; absent in pre-injection checkpoints → 0.
+        self._injection_loaded = int(ckpt.get("injection_loaded", 0))
 
         buf_path = Path(checkpoint_path).with_suffix(".buf")
         if buf_path.exists():
             try:
-                self.replay_buffer.load(buf_path)
+                self.replay_buffer.load(buf_path, game=self.game)
                 print(f"Loaded replay buffer ({len(self.replay_buffer)} games)")
             except (EOFError, pickle.UnpicklingError) as e:
                 # A .buf truncated by a crashed/OOM'd save shouldn't prevent resume.

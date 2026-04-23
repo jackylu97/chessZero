@@ -18,8 +18,9 @@ from flask import Flask, jsonify, request
 
 from src.config import MuZeroConfig, get_config
 from src.games.chess import ChessGame
-from src.mcts.mcts import MCTS, select_action
+from src.mcts.mcts import MCTS, BatchedMCTS, select_action, select_action_gumbel
 from src.model.muzero_net import MuZeroNetwork
+from src.model.utils import support_to_scalar, inverse_scalar_transform
 
 
 HTML = """<!DOCTYPE html>
@@ -35,6 +36,13 @@ HTML = """<!DOCTYPE html>
   #status { min-height: 1.5em; margin: 10px 0; font-size: 15px; }
   #result { font-weight: bold; }
   #moves { font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; background: #f5f5f5; padding: 10px; border-radius: 4px; max-height: 220px; overflow-y: auto; margin-top: 8px; }
+  #evals { display: flex; gap: 16px; font-family: ui-monospace, monospace; font-size: 13px; margin: 6px 0 4px; padding: 8px 10px; background: #f5f5f5; border-radius: 4px; }
+  #evals .label { color: #666; margin-right: 4px; }
+  #evals .val { font-weight: 600; }
+  .pos { color: #1a7a1a; }
+  .neg { color: #a02020; }
+  .eq { color: #666; }
+  .evalhint { color: #888; font-size: 12px; margin-top: 4px; }
   button { padding: 8px 16px; margin-right: 8px; font-size: 14px; cursor: pointer; border: 1px solid #bbb; background: white; border-radius: 4px; }
   button:hover { background: #f0f0f0; }
 </style>
@@ -43,6 +51,11 @@ HTML = """<!DOCTYPE html>
 <h1>ChessZero</h1>
 <p class="hint">You play Black. Drag a piece to move. Pawn promotion defaults to queen.</p>
 <div id="board"></div>
+<div id="evals">
+  <div><span class="label">Raw eval:</span><span class="val" id="raw_eval">—</span></div>
+  <div><span class="label">Search eval:</span><span class="val" id="mcts_eval">—</span></div>
+</div>
+<div class="evalhint">Values from White's perspective. Positive = White advantage, negative = Black advantage. Range [-1, +1].</div>
 <div id="status">Loading...</div>
 <div>
   <button onclick="newGame()">New game</button>
@@ -60,6 +73,18 @@ let busy = false;
 function setStatus(text) { document.getElementById('status').textContent = text; }
 function setResult(text) { document.getElementById('result').textContent = text ? '— ' + text : ''; }
 
+function setEval(id, v) {
+    const el = document.getElementById(id);
+    if (v === null || v === undefined) {
+        el.textContent = '—';
+        el.className = 'val';
+        return;
+    }
+    const sign = v >= 0 ? '+' : '';
+    el.textContent = sign + v.toFixed(3);
+    el.className = 'val ' + (v > 0.05 ? 'pos' : v < -0.05 ? 'neg' : 'eq');
+}
+
 function setMoves(sanMoves) {
     const lines = [];
     for (let i = 0; i < sanMoves.length; i += 2) {
@@ -76,6 +101,8 @@ function applyState(data) {
     setStatus(data.status);
     setMoves(data.sanMoves || []);
     setResult(data.game_over ? data.result : '');
+    setEval('raw_eval', data.value_raw);
+    setEval('mcts_eval', data.value_mcts);
 }
 
 async function modelMove() {
@@ -138,14 +165,46 @@ class GameSession:
         self.network = network
         self.config = config
         self.device = device
-        self.mcts = MCTS(network, game, config, device)
+        # Use Gumbel path (via BatchedMCTS) if configured, matching trainer._agent_action.
+        # Serial MCTS.run() is PUCT-only and ignores config.use_gumbel entirely.
+        self.use_gumbel = bool(getattr(config, "use_gumbel", False))
+        if self.use_gumbel:
+            self.mcts = BatchedMCTS(network, game, config, device)
+        else:
+            self.mcts = MCTS(network, game, config, device)
         self.state = None
         self.san_history: list[str] = []
+        # Last MCTS root value from White's POV; updated only when the model moves
+        # (user moves don't trigger search). None until the first model move of a game.
+        self.last_mcts_value: float | None = None
         self.reset()
 
     def reset(self):
         self.state = self.game.reset()
         self.san_history = []
+        self.last_mcts_value = None
+
+    @torch.no_grad()
+    def _raw_value_white_pov(self) -> float | None:
+        """Raw value head prediction for the current position, from White's POV, in [-1, +1].
+
+        Returns None when the game is over (value has no meaning at terminal).
+        Inverts sign when it's Black to move, since the network emits STM-relative values.
+        """
+        if self.state.done:
+            return None
+        obs = self.game.to_tensor(self.state).unsqueeze(0).to(self.device)
+        _, _, value_logits = self.network.initial_inference_logits(obs)
+        v_trans = support_to_scalar(
+            value_logits.float(), self.network.value_support_size
+        ).squeeze(-1)
+        if self.config.use_scalar_transform:
+            v_scalar = inverse_scalar_transform(v_trans)
+        else:
+            scale = self.config.value_target_scale
+            v_scalar = v_trans / scale if scale != 1.0 else v_trans
+        v_stm = float(v_scalar.item())
+        return v_stm if self.state.current_player == 1 else -v_stm
 
     def to_json(self):
         return {
@@ -155,6 +214,8 @@ class GameSession:
             "game_over": self.state.done,
             "result": self._result() if self.state.done else None,
             "model_to_move": self.state.current_player == 1 and not self.state.done,
+            "value_raw": self._raw_value_white_pov(),
+            "value_mcts": self.last_mcts_value,
         }
 
     def _status(self) -> str:
@@ -184,8 +245,14 @@ class GameSession:
             return
         obs = self.game.to_tensor(self.state)
         legal = self.game.legal_actions(self.state)
-        root = self.mcts.run(obs, legal, add_noise=False)
-        action, _ = select_action(root, temperature=0)
+        if self.use_gumbel:
+            root = self.mcts.run_batch([obs], [legal], add_noise=False)[0]
+            action, _ = select_action_gumbel(root, self.config, self.game.action_space_size)
+        else:
+            root = self.mcts.run(obs, legal, add_noise=False)
+            action, _ = select_action(root, temperature=0)
+        # root.value is STM POV — STM at root is White (the model). No sign flip needed.
+        self.last_mcts_value = float(root.value)
         self.san_history.append(self.game.action_to_san(self.state, action))
         self.state, _, _ = self.game.step(self.state, action)
 
@@ -262,6 +329,15 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--use-gumbel", dest="use_gumbel", action="store_true", default=None,
+                        help="Force Gumbel MuZero root selection at inference (BatchedMCTS path). "
+                             "Overrides config.use_gumbel.")
+    parser.add_argument("--no-gumbel", dest="use_gumbel", action="store_false",
+                        help="Force PUCT root selection at inference (serial MCTS path), "
+                             "regardless of training config. Useful for A/B testing inference-time "
+                             "Gumbel vs PUCT on the same checkpoint.")
+    parser.add_argument("--num-simulations", type=int, default=None,
+                        help="Override config.num_simulations for faster/slower play.")
     args = parser.parse_args()
 
     if args.device is None:
@@ -270,11 +346,16 @@ def main():
         device = args.device
 
     config = get_config("chess")
+    if args.use_gumbel is not None:
+        config.use_gumbel = args.use_gumbel
+    if args.num_simulations is not None:
+        config.num_simulations = args.num_simulations
     game = ChessGame()
     network = load_network(args.checkpoint, game, config, device)
     session = GameSession(game, network, config, device)
 
-    print(f"Open http://{args.host}:{args.port} to play")
+    print(f"Open http://{args.host}:{args.port} to play "
+          f"[use_gumbel={config.use_gumbel}, num_simulations={config.num_simulations}]")
     # threaded=False to serialize MCTS calls (single user, avoid races on session state)
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False, threaded=False)
 

@@ -22,7 +22,9 @@ import chess
 import torch  # required to unpickle GameHistory (observations are torch.Tensor)  # noqa: F401
 from flask import Flask, jsonify
 
+from src.games import GAME_REGISTRY
 from src.games.chess import _action_to_move
+from src.training.replay_buffer import ReplayBuffer
 
 
 @dataclass
@@ -266,13 +268,16 @@ def load_or_build_records(buffer_path: str, force_rebuild: bool = False) -> list
 
     print(f"Loading {buffer_path} ({os.path.getsize(buffer_path)/1e9:.1f} GB) ...")
     t0 = time.time()
-    with open(buffer_path, "rb") as f:
-        data = pickle.load(f)
-    buf = data["buffer"]
+    # Route through ReplayBuffer.load so all three on-disk formats work:
+    # v1 legacy single-dict, v2 streaming full GameHistory, v3 streaming
+    # compact (requires a game for action replay).
+    rb = ReplayBuffer(max_size=10_000_000)
+    rb.load(buffer_path, game=GAME_REGISTRY["chess"]())
+    buf = rb.buffer
     print(f"  unpickled in {time.time()-t0:.1f}s, {len(buf)} games. Decoding moves...")
     t1 = time.time()
     recs = [decode_game(g, i) for i, g in enumerate(buf)]
-    del buf, data
+    del buf, rb
     gc.collect()
     print(f"  decoded in {time.time()-t1:.1f}s")
 
