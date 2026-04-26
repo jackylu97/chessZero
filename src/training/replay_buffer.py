@@ -165,7 +165,9 @@ class GameHistory:
     def make_target(self, state_index: int, num_unroll_steps: int,
                     td_steps: int, discount: float, action_space_size: int,
                     value_head_type: str = "support",
-                    history_frames: int = 1):
+                    history_frames: int = 1,
+                    eval_to_wdl_alpha: float = 4.0,
+                    eval_to_wdl_beta: float = 2.0):
         """Create training target for a given position.
 
         Args:
@@ -200,11 +202,29 @@ class GameHistory:
         wdl_l = np.array([0.0, 0.0, 1.0], dtype=np.float32)
 
         def _wdl_target_at(ply_idx: int) -> np.ndarray:
-            """One-hot WDL from the side-to-move's POV at ply_idx.
+            """WDL target at ply_idx from side-to-move's POV.
 
-            Convention: ply 0 is white-to-move, even ply indices are white-stm,
-            odd are black-stm. game_outcome > 0 means white wins.
+            Two paths:
+            (1) Warmstart games (with external_values populated): derive a soft
+                WDL from Stockfish's per-position eval via eval_to_wdl(). Rich
+                graded signal — preserves what Stockfish told us about THIS
+                position, not just the game's eventual outcome.
+            (2) Self-play games (no external_values): one-hot of the actual
+                game outcome from STM POV. The only signal available — Lc0
+                pure-z target.
             """
+            # Per-position eval available → use it (warmstart games).
+            if self.external_values and ply_idx < len(self.external_values):
+                stm_eval = float(self.external_values[ply_idx])
+                # external_values is already side-to-move-relative (per the
+                # generate_stockfish_games convention) so no parity flip needed.
+                # Lazy import to avoid model→buffer import cycle.
+                from src.model.utils import eval_to_wdl as _eval_to_wdl
+                p_w, p_d, p_l = _eval_to_wdl(
+                    stm_eval, alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta
+                )
+                return np.array([p_w, p_d, p_l], dtype=np.float32)
+            # No per-position eval → fall back to game-outcome one-hot.
             if self.game_outcome == 0.0:
                 return wdl_draw
             stm_is_white = (ply_idx % 2 == 0)
@@ -216,9 +236,11 @@ class GameHistory:
 
             if idx < len(self):
                 if value_head_type == "wdl":
-                    # Pure z (Lc0 q_ratio=0 path). external_values ignored —
-                    # we deliberately use game outcome for both warmstart
-                    # and self-play to keep target distribution shape unified.
+                    # Two paths inside _wdl_target_at:
+                    #  - Warmstart games (external_values present) → soft WDL
+                    #    derived from Stockfish per-position eval. Rich signal.
+                    #  - Self-play games (no external_values) → one-hot of
+                    #    game outcome from STM POV. Lc0 pure-z target.
                     value = _wdl_target_at(idx)
                 elif self.external_values and idx < len(self.external_values):
                     # Warmstart path: external targets are already side-to-move-relative.
@@ -387,6 +409,9 @@ class ReplayBuffer:
         beta: float = 1.0,
         value_head_type: str = "support",
         history_frames: int = 1,
+        eval_to_wdl_alpha: float = 4.0,
+        eval_to_wdl_beta: float = 2.0,
+        warmstart_sample_frac: float = 0.0,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -402,11 +427,60 @@ class ReplayBuffer:
         probs = priorities ** alpha
         probs /= probs.sum()
 
-        game_indices = np.random.choice(n, size=batch_size, p=probs)
+        # Stratified sampling: when warmstart_sample_frac > 0, partition the
+        # buffer by external_values (warmstart games have it populated;
+        # self-play games don't). Sample floor(B*frac) from warmstart and the
+        # rest from self-play. Maintains a permanent SL anchor in every batch
+        # — directly attacks the catastrophic-forgetting / drawish-basin loop
+        # that triggers when self-play data fully replaces warmstart.
+        # Falls back to flat sampling when frac=0 or one stratum is empty.
+        warm_idx_arr = None
+        sp_idx_arr = None
+        if warmstart_sample_frac > 0.0:
+            warm_idx_arr = np.array(
+                [i for i in range(n) if self.buffer[i].external_values],
+                dtype=np.int64,
+            )
+            sp_idx_arr = np.array(
+                [i for i in range(n) if not self.buffer[i].external_values],
+                dtype=np.int64,
+            )
 
-        # Importance sampling weights: w_i = (1 / (N * P(i)))^beta, normalised
-        weights = (n * probs[game_indices]) ** (-beta)
-        weights = (weights / weights.max()).astype(np.float32)
+        if (warm_idx_arr is not None and len(warm_idx_arr) > 0
+                and len(sp_idx_arr) > 0):
+            n_warm = int(round(batch_size * warmstart_sample_frac))
+            n_sp = batch_size - n_warm
+
+            warm_probs = probs[warm_idx_arr]
+            warm_probs = warm_probs / warm_probs.sum()
+            sp_probs = probs[sp_idx_arr]
+            sp_probs = sp_probs / sp_probs.sum()
+
+            picked_warm_local = np.random.choice(
+                len(warm_idx_arr), size=n_warm, p=warm_probs
+            )
+            picked_sp_local = np.random.choice(
+                len(sp_idx_arr), size=n_sp, p=sp_probs
+            )
+            game_indices = np.concatenate([
+                warm_idx_arr[picked_warm_local],
+                sp_idx_arr[picked_sp_local],
+            ])
+            # IS weights computed against the per-stratum sampling probabilities.
+            # weight_i = 1 / (k_stratum * P_stratum(i)), then normalize across batch.
+            weights = np.empty(batch_size, dtype=np.float64)
+            weights[:n_warm] = (
+                len(warm_idx_arr) * warm_probs[picked_warm_local]
+            ) ** (-beta)
+            weights[n_warm:] = (
+                len(sp_idx_arr) * sp_probs[picked_sp_local]
+            ) ** (-beta)
+            weights = (weights / weights.max()).astype(np.float32)
+        else:
+            game_indices = np.random.choice(n, size=batch_size, p=probs)
+            # Importance sampling weights: w_i = (1 / (N * P(i)))^beta, normalised
+            weights = (n * probs[game_indices]) ** (-beta)
+            weights = (weights / weights.max()).astype(np.float32)
 
         target_observations = []
         target_obs_masks = []
@@ -422,6 +496,8 @@ class ReplayBuffer:
                 pos, num_unroll_steps, td_steps, discount, action_space_size,
                 value_head_type=value_head_type,
                 history_frames=history_frames,
+                eval_to_wdl_alpha=eval_to_wdl_alpha,
+                eval_to_wdl_beta=eval_to_wdl_beta,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)

@@ -150,6 +150,25 @@ class MuZeroConfig:
     # store only scalar root_values, so q_ratio>0 needs a schema extension).
     q_ratio: float = 0.0
 
+    # eval_to_wdl conversion (warmstart-only, value_head_type="wdl"): convert
+    # Stockfish per-position eval (in [-1,+1] STM POV) into a soft (P_W, P_D,
+    # P_L) target via parameterized 3-way logistic. ``alpha`` controls
+    # sharpness (4.0 ≈ Stockfish-cp-like steepness); ``beta`` controls draw-
+    # zone width (2.0 ≈ P_D=0.76 at eval=0). Restores per-position teacher
+    # signal density during warmstart that pure-z one-hot targets discarded.
+    eval_to_wdl_alpha: float = 4.0
+    eval_to_wdl_beta: float = 2.0
+
+    # Stratified sampling: at every training batch, sample
+    # floor(batch_size * warmstart_sample_frac) games from warmstart-only
+    # (games with external_values populated) and the rest from self-play.
+    # Maintains a permanent Stockfish-anchor in training even after the
+    # buffer's FIFO eviction has flipped the in-memory composition entirely
+    # to self-play. Directly attacks the catastrophic-forgetting / drawish-
+    # basin failure observed in runs 0001 / 0002 (post-pool-exhaustion drift).
+    # 0.0 = back-compat (no stratification). 0.3-0.5 = chess recommended.
+    warmstart_sample_frac: float = 0.0
+
     # AlphaZero-style history encoding: stack the last N ply observations
     # along the channel dimension before passing to the network. Newest
     # frame first. Missing frames (early game) zero-padded.
@@ -277,8 +296,16 @@ def get_config(game: str) -> MuZeroConfig:
                                         # the 5-bin scalar head. Targets game outcome z directly,
                                         # eliminating the predict-zero collapse failure mode where
                                         # the scalar head settled on the central bin.
-            draw_score=0.0,             # Lc0 default; negative values are anti-draw shaping.
+            draw_score=-0.05,           # Anti-draw MCTS shaping (Lc0 DrawScore knob,
+                                        # tree-side only). Q = WL + draw_score · D, so drawish
+                                        # positions get a small negative push during search,
+                                        # encouraging decisive moves over solid draws. Doesn't
+                                        # affect training targets.
             q_ratio=0.0,                # Lc0 default; pure z target.
+            warmstart_sample_frac=0.4,  # 40% of every training batch comes from warmstart games
+                                        # (external_values populated). Permanent Stockfish anchor —
+                                        # prevents catastrophic forgetting during self-play handoff
+                                        # that drove the basin collapse in runs 0001/0002.
             history_frames=8,           # AlphaZero canonical: 8 ply frames stacked. Lets the
                                         # network perceive threefold repetition + 50-move-rule
                                         # progress (a stateless encoder cannot). Reconstructed

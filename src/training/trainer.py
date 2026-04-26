@@ -354,6 +354,9 @@ class MuZeroTrainer:
             beta=beta,
             value_head_type=getattr(self.config, "value_head_type", "support"),
             history_frames=getattr(self.config, "history_frames", 1),
+            eval_to_wdl_alpha=getattr(self.config, "eval_to_wdl_alpha", 4.0),
+            eval_to_wdl_beta=getattr(self.config, "eval_to_wdl_beta", 2.0),
+            warmstart_sample_frac=getattr(self.config, "warmstart_sample_frac", 0.0),
         )
 
         obs = batch["observations"].to(self.device)

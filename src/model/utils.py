@@ -182,3 +182,28 @@ def outcome_to_wdl(game_outcome: float, ply_idx: int) -> tuple[float, float, flo
     stm_is_white = (ply_idx % 2 == 0)
     stm_won = (game_outcome > 0.0) == stm_is_white
     return (1.0, 0.0, 0.0) if stm_won else (0.0, 0.0, 1.0)
+
+
+def eval_to_wdl(stm_eval: float, alpha: float = 4.0, beta: float = 2.0) -> tuple[float, float, float]:
+    """Convert a Stockfish per-position eval (in [-1, +1] from STM POV) to a
+    soft (P_W, P_D, P_L) distribution.
+
+    Uses a parameterized 3-way logistic centered around 0:
+        P(W)  = sigmoid(α · eval - β)
+        P(L)  = sigmoid(α · -eval - β)
+        P(D)  = max(0, 1 - P(W) - P(L))
+    Then renormalizes to sum to 1. Default ``α=4, β=2`` gives a draw zone
+    around eval=0 (P_D ≈ 0.76 at eval=0, P_D ≈ 0.5 at |eval|=0.5, P_D ≈ 0.12
+    at |eval|=1.0). ``alpha`` controls sharpness, ``beta`` controls the
+    width of the draw zone.
+
+    Reference: not in Lc0's repo (Lc0 trains pure z, not eval). Community-
+    standard sigmoid-on-cp formulation, calibrated by visual inspection
+    against expected win/draw rates at typical Stockfish-depth-8 evals.
+    """
+    import math
+    p_w = 1.0 / (1.0 + math.exp(-(alpha * stm_eval - beta)))
+    p_l = 1.0 / (1.0 + math.exp(-(alpha * (-stm_eval) - beta)))
+    p_d = max(0.0, 1.0 - p_w - p_l)
+    s = p_w + p_d + p_l
+    return (p_w / s, p_d / s, p_l / s)
