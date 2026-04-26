@@ -136,9 +136,36 @@ class GameHistory:
 
         return gh
 
+    def _stack_history(self, idx: int, n_frames: int):
+        """Stack ``n_frames`` consecutive observations ending at ``idx``,
+        newest-first along the channel dim. Zero-pad for missing earlier
+        frames (idx < n_frames - 1, i.e. early game).
+
+        Returns a torch.Tensor of shape (C * n_frames, H, W) where C is the
+        per-frame channel count. For n_frames == 1, this reduces to a single
+        observation (current behavior).
+        """
+        if n_frames <= 1:
+            return self.observations[min(idx, len(self.observations) - 1)]
+        cap = min(idx, len(self.observations) - 1)
+        ref = self.observations[cap]  # for shape / dtype / device
+        zero = None
+        frames = []
+        for t in range(n_frames):
+            i = idx - t
+            if 0 <= i < len(self.observations):
+                frames.append(self.observations[i])
+            else:
+                if zero is None:
+                    zero = torch.zeros_like(ref)
+                frames.append(zero)
+        # newest first along channel dim
+        return torch.cat(frames, dim=0)
+
     def make_target(self, state_index: int, num_unroll_steps: int,
                     td_steps: int, discount: float, action_space_size: int,
-                    value_head_type: str = "support"):
+                    value_head_type: str = "support",
+                    history_frames: int = 1):
         """Create training target for a given position.
 
         Args:
@@ -165,7 +192,7 @@ class GameHistory:
         actions = []
         obs_list = []
         obs_mask = []
-        last_obs = self.observations[min(state_index, len(self) - 1)]
+        last_obs = self._stack_history(min(state_index, len(self) - 1), history_frames)
 
         # WDL targets: cache draw vector + outcome lookup once per call.
         wdl_draw = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -226,7 +253,7 @@ class GameHistory:
                     elif len(policy) > action_space_size:
                         policy = policy[:action_space_size]
                 policies.append(policy)
-                last_obs = self.observations[idx]
+                last_obs = self._stack_history(idx, history_frames)
                 obs_list.append(last_obs)
                 obs_mask.append(1.0)
             else:
@@ -257,6 +284,34 @@ class GameHistory:
             rewards,
             policies,
         )
+
+
+def stack_with_history(current_obs, prior_obs, n_frames: int):
+    """Build a T-frame stacked observation for inference time.
+
+    ``current_obs``: the current ply's observation (single-frame, shape (C, H, W)).
+    ``prior_obs``: chronologically-ordered list of earlier-ply observations,
+                   newest at the end (i.e. ``prior_obs[-1]`` is one ply before
+                   ``current_obs``).
+    ``n_frames``: total stack depth T.
+
+    Returns a tensor of shape (T*C, H, W) with newest frame at channel 0.
+    Zero-pads for missing earlier frames (early-game). Same plane order as
+    ``GameHistory._stack_history`` (used at training sample time).
+
+    For ``n_frames <= 1`` returns ``current_obs`` unchanged — no allocation,
+    so callers can use this regardless of history config.
+    """
+    if n_frames <= 1:
+        return current_obs
+    frames = [current_obs]
+    for t in range(1, n_frames):
+        i = len(prior_obs) - t  # t=1 → most recent prior
+        if 0 <= i < len(prior_obs):
+            frames.append(prior_obs[i])
+        else:
+            frames.append(torch.zeros_like(current_obs))
+    return torch.cat(frames, dim=0)
 
 
 def _iter_shard_games(path: str | Path, game=None):
@@ -331,6 +386,7 @@ class ReplayBuffer:
         alpha: float = 0.0,
         beta: float = 1.0,
         value_head_type: str = "support",
+        history_frames: int = 1,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -365,6 +421,7 @@ class ReplayBuffer:
             obs_list, obs_mask, actions, values, rewards, policies = game.make_target(
                 pos, num_unroll_steps, td_steps, discount, action_space_size,
                 value_head_type=value_head_type,
+                history_frames=history_frames,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)

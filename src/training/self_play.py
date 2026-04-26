@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from ..games.base import Game
 from ..mcts.mcts import MCTS, BatchedMCTS, select_action, select_action_gumbel
-from .replay_buffer import GameHistory
+from .replay_buffer import GameHistory, stack_with_history
 
 
 def get_temperature(training_step: int, config) -> float:
@@ -43,11 +43,13 @@ def play_game(
 
     state = game.reset()
     history = GameHistory(game_name=config.game)
+    n_frames = getattr(config, "history_frames", 1)
 
     move_count = 0
     action_space_size = game.action_space_size
     while not state.done:
-        obs = game.to_tensor(state)
+        single_frame = game.to_tensor(state)
+        obs = stack_with_history(single_frame, history.observations, n_frames)
         legal = game.legal_actions(state)
 
         if use_gumbel:
@@ -58,7 +60,7 @@ def play_game(
             temp = temp_init if move_count < config.temperature_drop_step else config.temperature_final
             action, action_probs = select_action(root, temperature=temp)
 
-        history.observations.append(obs)
+        history.observations.append(single_frame)
         history.actions.append(action)
         history.policies.append(action_probs)
         history.root_values.append(root.value)
@@ -97,13 +99,20 @@ def play_games_parallel(
     histories = [GameHistory(game_name=config.game) for _ in range(num_games)]
     move_counts = [0] * num_games
     active = list(range(num_games))
+    n_frames = getattr(config, "history_frames", 1)
 
     iteration = 0
     log_every = 20  # emit a progress line every 20 lockstep moves (silent for fast games)
 
     while active:
-        obs_list = [game.to_tensor(states[g]) for g in active]
+        # Single-frame current observations (stored 1× per ply, used for sample-time
+        # stack reconstruction) and T-frame stacks (passed to MCTS at inference time).
+        single_frames = [game.to_tensor(states[g]) for g in active]
         legal_list = [game.legal_actions(states[g]) for g in active]
+        obs_list = [
+            stack_with_history(single_frames[i], histories[g].observations, n_frames)
+            for i, g in enumerate(active)
+        ]
 
         roots = batched_mcts.run_batch(obs_list, legal_list, add_noise=True)
 
@@ -115,7 +124,9 @@ def play_games_parallel(
                 temp = temp_init if move_counts[g] < config.temperature_drop_step else config.temperature_final
                 action, action_probs = select_action(roots[i], temperature=temp)
 
-            histories[g].observations.append(obs_list[i])
+            # Store the SINGLE-FRAME observation. Sample-time stacking rebuilds
+            # the T-frame stack from per-ply observations.
+            histories[g].observations.append(single_frames[i])
             histories[g].actions.append(action)
             histories[g].policies.append(action_probs)
             histories[g].root_values.append(roots[i].value)

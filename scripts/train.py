@@ -126,7 +126,7 @@ def main():
     print(f"  TensorBoard: {Path(args.log_dir) / args.game / run_id}")
 
     network = MuZeroNetwork(
-        observation_channels=game.num_planes,
+        observation_channels=game.num_planes * getattr(config, "history_frames", 1),
         action_space_size=game.action_space_size,
         hidden_planes=config.hidden_planes,
         num_blocks=config.num_residual_blocks,

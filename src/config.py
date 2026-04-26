@@ -150,6 +150,16 @@ class MuZeroConfig:
     # store only scalar root_values, so q_ratio>0 needs a schema extension).
     q_ratio: float = 0.0
 
+    # AlphaZero-style history encoding: stack the last N ply observations
+    # along the channel dimension before passing to the network. Newest
+    # frame first. Missing frames (early game) zero-padded.
+    #   1: current state only (no history; pre-history-encoding behavior).
+    #   8: AlphaZero/Lc0 default for chess. Lets the network perceive
+    #      threefold repetition and 50-move-rule progress, which a stateless
+    #      encoder cannot. Reconstructed at sample time from the stored
+    #      per-ply observations — no disk impact on existing data.
+    history_frames: int = 1
+
     # Root-heavy loss weighting (MuZero paper / muzero-general pseudocode):
     # root prediction gets weight 1.0, each of the K unroll steps gets weight 1/K.
     # Default False uses the current uniform 1/(K+1) weighting (≈ LightZero's
@@ -266,6 +276,10 @@ def get_config(game: str) -> MuZeroConfig:
                                         # the scalar head settled on the central bin.
             draw_score=0.0,             # Lc0 default; negative values are anti-draw shaping.
             q_ratio=0.0,                # Lc0 default; pure z target.
+            history_frames=8,           # AlphaZero canonical: 8 ply frames stacked. Lets the
+                                        # network perceive threefold repetition + 50-move-rule
+                                        # progress (a stateless encoder cannot). Reconstructed
+                                        # at sample time from per-ply obs — no disk inflation.
             dirichlet_alpha=0.3,        # AlphaZero/MuZero/Lc0 chess default (≈10 / 35-legal-moves).
                                         # Was 0.03 (the Go constant) which under-explored chess by
                                         # ~10× and contributed to the 2026_04_24_0001 draw-basin collapse.

@@ -353,6 +353,7 @@ class MuZeroTrainer:
             alpha=self.config.per_alpha,
             beta=beta,
             value_head_type=getattr(self.config, "value_head_type", "support"),
+            history_frames=getattr(self.config, "history_frames", 1),
         )
 
         obs = batch["observations"].to(self.device)
@@ -556,11 +557,16 @@ class MuZeroTrainer:
 
         # Flatten all non-terminal positions across sampled games into one list.
         # Each entry: (obs tensor, legal_actions list, game ref, position index).
+        # Reanalyze observations: rebuild the same T-frame stack the network
+        # was trained on, so the model sees positions in the same encoding it
+        # was trained on (otherwise input distribution shifts vs training).
+        n_frames = getattr(self.config, "history_frames", 1)
         items = []
         for game in games:
             for pos in range(len(game.policies)):
                 if pos < len(game.legal_actions_list):
-                    items.append((game.observations[pos], game.legal_actions_list[pos], game, pos))
+                    obs_at_pos = game._stack_history(pos, n_frames)
+                    items.append((obs_at_pos, game.legal_actions_list[pos], game, pos))
 
         if not items:
             return
@@ -784,25 +790,41 @@ class MuZeroTrainer:
 
         All agent-turn games are collected into one BatchedMCTS.run_batch call per
         ply — scales to ~1 batched forward pass per simulation instead of one per
-        game, per move.
+        game, per move. Per-game ply observation history is tracked so the
+        T-frame history-encoded input passed to MCTS matches what the network
+        sees during training (sample-time stacking of the same per-ply obs).
         """
         import random
         from ..mcts.mcts import BatchedMCTS, select_action, select_action_gumbel
+        from .replay_buffer import stack_with_history
 
         use_gumbel = bool(getattr(self.config, "use_gumbel", False))
+        n_frames = getattr(self.config, "history_frames", 1)
         batched = BatchedMCTS(self.network, self.game, self.config, self.device)
         states = [self.game.reset() for _ in range(n_games)]
+        ply_obs_history: list[list] = [[] for _ in range(n_games)]
 
         while any(not s.done for s in states):
             for i, s in enumerate(states):
                 if not s.done and s.current_player == -1:
+                    # Capture pre-random-move obs into history so the next agent
+                    # turn sees the right T-frame window.
+                    ply_obs_history[i].append(self.game.to_tensor(s))
                     a = random.choice(self.game.legal_actions(s))
                     states[i], _, _ = self.game.step(s, a)
 
             agent_idx = [i for i, s in enumerate(states) if not s.done and s.current_player == 1]
             if not agent_idx:
                 continue
-            obs_list = [self.game.to_tensor(states[i]) for i in agent_idx]
+            single_frames = [self.game.to_tensor(states[i]) for i in agent_idx]
+            obs_list = [
+                stack_with_history(single_frames[k], ply_obs_history[i], n_frames)
+                for k, i in enumerate(agent_idx)
+            ]
+            # Append current obs to history AFTER stacking so the next iteration
+            # sees this ply as "prior".
+            for k, i in enumerate(agent_idx):
+                ply_obs_history[i].append(single_frames[k])
             legal_list = [self.game.legal_actions(states[i]) for i in agent_idx]
             roots = batched.run_batch(obs_list, legal_list, add_noise=False)
             for k, i in enumerate(agent_idx):
