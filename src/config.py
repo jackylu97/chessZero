@@ -235,7 +235,9 @@ def get_config(game: str) -> MuZeroConfig:
                                         # Base Learning Rate for Chess.
             value_loss_weight_warmstart=1.0,  # clean Stockfish targets: strong supervision
             value_loss_weight_selfplay=0.25,  # noisy MCTS bootstraps: paper-standard damp
-            dirichlet_alpha=0.03,
+            dirichlet_alpha=0.3,        # AlphaZero/MuZero/Lc0 chess default (≈10 / 35-legal-moves).
+                                        # Was 0.03 (the Go constant) which under-explored chess by
+                                        # ~10× and contributed to the 2026_04_24_0001 draw-basin collapse.
             td_steps=10,
             temperature_drop_step=30,
             reanalyze_interval=1024,   # keep 1:1 with self_play_interval

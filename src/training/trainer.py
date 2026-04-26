@@ -392,6 +392,7 @@ class MuZeroTrainer:
         with autocast(device_type=self.device.split(":")[0], enabled=self.config.use_amp):
             hidden, policy_logits, value_logits = self.network.initial_inference_logits(obs)
             value_logits_k0 = value_logits  # save for priority update
+            policy_logits_k0 = policy_logits  # save for entropy logging
 
             # Per-sample losses at root (k=0) — always full weight
             policy_loss = policy_loss_fn(policy_logits, target_policies[:, 0])
@@ -478,12 +479,29 @@ class MuZeroTrainer:
             td_errors = (pred_v_trans - true_v_trans).abs().cpu().numpy()
             value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
             value_target_std = true_v_scalar.float().std(unbiased=False).item()
+
+            # Policy entropy at root (k=0). Tracks how sharp the model's prior
+            # is (lower = sharper) and how sharp the training targets are. The
+            # gap between them shows model fit; their absolute values show the
+            # diffuse-vs-sharp regime. Both in nats over the full action space.
+            pred_probs = F.softmax(policy_logits_k0.detach().float(), dim=-1)
+            policy_entropy_pred = -(
+                pred_probs * (pred_probs + 1e-12).log()
+            ).sum(dim=-1).mean().item()
+            tgt_probs = target_policies[:, 0].float()
+            policy_entropy_target = -(
+                tgt_probs * (tgt_probs + 1e-12).log()
+            ).sum(dim=-1).mean().item()
         self.replay_buffer.update_priorities(game_indices, td_errors, self.config.per_epsilon)
 
         return {
             "total_loss": total_loss.item(),
             "policy_loss": (outer_scale * policy_loss.mean()).item(),
-            "value_loss": (outer_scale * value_weight * value_loss.mean()).item(),
+            # Drop the phase-dependent ``value_weight`` factor from the displayed
+            # metric so the TB graph is comparable across the warmstart/self-play
+            # phase boundary (the weight flips 1.0 → 0.25 there). The weighted
+            # contribution to ``total_loss`` is preserved unchanged in total_loss.
+            "value_loss": (outer_scale * value_loss.mean()).item(),
             "reward_loss": (outer_scale * reward_loss.mean()).item(),
             "consistency_loss": (outer_scale * self.config.consistency_loss_weight * consistency_loss.mean()).item(),
             "grad_norm": float(grad_norm),
@@ -491,6 +509,8 @@ class MuZeroTrainer:
             "value_mae": value_mae,
             "value_target_std": value_target_std,
             "value_loss_weight": float(value_weight),
+            "policy_entropy_pred": policy_entropy_pred,
+            "policy_entropy_target": policy_entropy_target,
         }
 
     @torch.no_grad()
@@ -602,11 +622,14 @@ class MuZeroTrainer:
         # Route loss/grad/scale scalars to their own namespaces so TensorBoard
         # groups them sensibly.
         value_keys = {"value_mae", "value_target_std", "value_loss_weight"}
+        policy_keys = {"policy_entropy_pred", "policy_entropy_target"}
         for key, value in loss_info.items():
             if key in ("grad_norm", "amp_scale"):
                 self.writer.add_scalar(f"train/{key}", value, step)
             elif key in value_keys:
                 self.writer.add_scalar(f"value/{key[len('value_'):]}", value, step)
+            elif key in policy_keys:
+                self.writer.add_scalar(f"policy/{key[len('policy_'):]}", value, step)
             else:
                 self.writer.add_scalar(f"loss/{key}", value, step)
         self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], step)
