@@ -268,9 +268,9 @@ def load_or_build_records(buffer_path: str, force_rebuild: bool = False) -> list
 
     print(f"Loading {buffer_path} ({os.path.getsize(buffer_path)/1e9:.1f} GB) ...")
     t0 = time.time()
-    # Route through ReplayBuffer.load so all three on-disk formats work:
-    # v1 legacy single-dict, v2 streaming full GameHistory, v3 streaming
-    # compact (requires a game for action replay).
+    # Route through ReplayBuffer.load so both supported formats work:
+    # v2 streaming full GameHistory, v3 streaming compact (requires a game
+    # for action replay).
     rb = ReplayBuffer(max_size=10_000_000)
     rb.load(buffer_path, game=GAME_REGISTRY["chess"]())
     buf = rb.buffer

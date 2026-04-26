@@ -200,7 +200,9 @@ def test_label_and_play_can_diverge(game):
         label_depth=8,
         max_plies=_MAX_PLIES,
         multipv=3,
+        label_multipv=1,
         move_temperature=1e-9,  # pure argmax on play side
+        tau_label=0.0,
         rng=random.Random(0),
     )
     assert history is not None, "game should terminate via threefold within _MAX_PLIES"
@@ -228,7 +230,9 @@ def test_8v8_bucket_collapses_to_one_analyse_per_ply(game):
         label_depth=8,
         max_plies=_MAX_PLIES,
         multipv=3,
+        label_multipv=1,
         move_temperature=1e-9,
+        tau_label=0.0,
         rng=random.Random(0),
     )
     assert history is not None
@@ -251,7 +255,9 @@ def test_asymmetric_bucket_makes_two_analyse_calls_per_ply(game):
         label_depth=8,
         max_plies=_MAX_PLIES,
         multipv=3,
+        label_multipv=1,
         move_temperature=1e-9,
+        tau_label=0.0,
         rng=random.Random(0),
     )
     assert history is not None
@@ -290,7 +296,9 @@ def test_external_values_come_from_label_depth(game):
         label_depth=8,
         max_plies=_MAX_PLIES,
         multipv=3,
+        label_multipv=1,
         move_temperature=1e-9,
+        tau_label=0.0,
         rng=random.Random(0),
     )
     assert history is not None
@@ -328,7 +336,9 @@ def test_action_is_played_move_not_label_move(game):
         label_depth=8,
         max_plies=_MAX_PLIES,
         multipv=3,
+        label_multipv=1,
         move_temperature=1e-9,
+        tau_label=0.0,
         rng=random.Random(0),
     )
     assert history is not None
@@ -354,7 +364,9 @@ def test_compact_encoding_handles_off_policy_games(game):
         label_depth=8,
         max_plies=_MAX_PLIES,
         multipv=3,
+        label_multipv=1,
         move_temperature=1e-9,
+        tau_label=0.0,
         rng=random.Random(0),
     )
     assert history is not None

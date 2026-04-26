@@ -21,9 +21,11 @@ GAMES_PER_WORKER=${GAMES_PER_WORKER:-16000}
 OUT_ROOT=${OUT_ROOT:-data/stockfish_injection}
 STOCKFISH_HASH=${STOCKFISH_HASH:-64}
 BUCKET_SWEEP=${BUCKET_SWEEP:-0}
-MULTIPV=${MULTIPV:-5}          # K for play-side softmax. 5 pragmatic; 10 = ~2× cost.
-LABEL_DEPTH=${LABEL_DEPTH:-8}  # depth for policy/value labels under asymmetric mode.
-DEPTH=${DEPTH:-8}              # symmetric-mode play depth (ignored under BUCKET_SWEEP=1).
+MULTIPV=${MULTIPV:-10}              # K for play-side softmax. 10 = depth-8 sweet spot.
+LABEL_MULTIPV=${LABEL_MULTIPV:-10}  # K for label-side soft policy target.
+TAU_LABEL=${TAU_LABEL:-0.10}        # softmax τ for soft policy LABEL.
+LABEL_DEPTH=${LABEL_DEPTH:-8}       # depth for policy/value labels under asymmetric mode.
+DEPTH=${DEPTH:-8}                   # symmetric-mode play depth (ignored under BUCKET_SWEEP=1).
 
 mkdir -p "$OUT_ROOT" logs
 
@@ -45,6 +47,8 @@ if [[ "$BUCKET_SWEEP" == "1" ]]; then
                 --bucket "$bucket" \
                 --label-depth "$LABEL_DEPTH" \
                 --multipv "$MULTIPV" \
+                --label-multipv "$LABEL_MULTIPV" \
+                --tau-label "$TAU_LABEL" \
                 --shard-size 500 \
                 --stockfish-threads 1 --stockfish-hash "$STOCKFISH_HASH" \
                 --seed "$seed" \

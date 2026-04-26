@@ -236,6 +236,12 @@ def _iter_shard_games(path: str | Path, game=None):
         first = pickle.load(f)
         if isinstance(first, list):
             for g in first:
+                # Canonical shards (generate_stockfish_games.py --format-version=1) carry
+                # observations as numpy arrays; rewrap to torch.Tensor (zero-copy view) so
+                # downstream code is unchanged. Storing torch.Tensor in v1 pickles SEGVs
+                # training via torch's tensor storage reducer — see CRASH_INVESTIGATION.md.
+                if g.observations and isinstance(g.observations[0], np.ndarray):
+                    g.observations = [torch.from_numpy(o) for o in g.observations]
                 yield g
         elif isinstance(first, dict) and first.get("version") == 2:
             if game is None:
@@ -401,7 +407,6 @@ class ReplayBuffer:
         """Load buffer from path. Dispatches on header version.
 
         Supported:
-          * v1 (legacy) — single pickled dict ``{buffer, priorities, total_games}``.
           * v2 — streaming header + ``(GameHistory, priority)`` pairs.
           * v3 — streaming header + ``(compact_dict, priority)`` pairs;
             requires ``game`` so ``GameHistory.from_compact_dict`` can replay
@@ -409,28 +414,26 @@ class ReplayBuffer:
         """
         with open(path, "rb") as f:
             first = pickle.load(f)
-            if isinstance(first, dict) and first.get("version") in (2, 3):
-                version = first["version"]
-                if version == 3 and game is None:
-                    raise ValueError(
-                        f"{path}: v3 (compact) buffer requires a `game` argument "
-                        f"to reconstruct observations."
-                    )
-                self.buffer = []
-                self._priorities = []
-                self.total_games = first["total_games"]
-                for _ in range(first["n_records"]):
-                    record, priority = pickle.load(f)
-                    if version == 3:
-                        record = GameHistory.from_compact_dict(record, game)
-                    self.buffer.append(record)
-                    self._priorities.append(priority)
-            else:
-                # Legacy format: single pickled dict {"buffer", "priorities", "total_games"}
-                data = first
-                self.buffer = data["buffer"]
-                self._priorities = data["priorities"]
-                self.total_games = data["total_games"]
+            if not (isinstance(first, dict) and first.get("version") in (2, 3)):
+                raise ValueError(
+                    f"{path}: unrecognized buffer format "
+                    f"(expected v2 or v3 streaming header, got {type(first).__name__})"
+                )
+            version = first["version"]
+            if version == 3 and game is None:
+                raise ValueError(
+                    f"{path}: v3 (compact) buffer requires a `game` argument "
+                    f"to reconstruct observations."
+                )
+            self.buffer = []
+            self._priorities = []
+            self.total_games = first["total_games"]
+            for _ in range(first["n_records"]):
+                record, priority = pickle.load(f)
+                if version == 3:
+                    record = GameHistory.from_compact_dict(record, game)
+                self.buffer.append(record)
+                self._priorities.append(priority)
 
     def load_warmstart_games(self, paths: list[Path | str], game=None) -> int:
         """Load pickled shards of GameHistory objects into the buffer.

@@ -208,7 +208,7 @@ def test_unknown_format_version_raises():
 
 
 # ---------------------------------------------------------------------------
-# ReplayBuffer.save / .load (v2, v3) + legacy v1
+# ReplayBuffer.save / .load (v2, v3)
 # ---------------------------------------------------------------------------
 
 
@@ -250,22 +250,6 @@ def test_replay_buffer_v2_still_loads(tmp_path: Path):
     rb2.load(path)  # no game arg needed for v2
     assert len(rb2) == 1
     _assert_gamehistory_equal(rb.buffer[0], rb2.buffer[0])
-
-
-def test_replay_buffer_v1_legacy_still_loads(tmp_path: Path):
-    """Pre-streaming single-dict .buf files (v1) must still load."""
-    gh = _tictactoe_game_onehot()
-    path = tmp_path / "v1.buf"
-    with open(path, "wb") as f:
-        pickle.dump(
-            {"buffer": [gh], "priorities": [1.0], "total_games": 1}, f,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-
-    rb = ReplayBuffer(max_size=10)
-    rb.load(path)
-    assert len(rb) == 1
-    _assert_gamehistory_equal(gh, rb.buffer[0])
 
 
 def test_replay_buffer_v3_is_smaller_than_v2(tmp_path: Path):

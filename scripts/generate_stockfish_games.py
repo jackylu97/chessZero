@@ -55,6 +55,41 @@ def score_to_value(score: chess.engine.PovScore, pov: chess.Color) -> float:
     return 2.0 * (1.0 / (1.0 + math.exp(-cp / CP_SCALE))) - 1.0
 
 
+def multipv_to_soft_policy(
+    info_list: list,
+    pov: chess.Color,
+    tau_label: float,
+    action_space_size: int,
+) -> np.ndarray:
+    """Build a soft policy target from a MultiPV analysis result.
+
+    Computes ``softmax(scores / tau_label)`` over the top-K Stockfish moves
+    (in ``score_to_value`` space, i.e. raw [-1,+1]) and packs into a dense
+    ``action_space_size`` vector with zeros elsewhere. Hubert 2021-style soft
+    target: each position carries ranking + confidence info, not just a one-hot.
+
+    Edge cases:
+      - empty ``info_list`` (no PV): all-zero policy (caller will skip).
+      - len == 1 or ``tau_label <= 0``: one-hot on top move.
+    """
+    moves = [info["pv"][0] for info in info_list if info.get("pv")]
+    policy = np.zeros(action_space_size, dtype=np.float32)
+    if not moves:
+        return policy
+    evals = np.array(
+        [score_to_value(info["score"], pov) for info in info_list[: len(moves)]],
+        dtype=np.float64,
+    )
+    if len(moves) == 1 or tau_label <= 0.0:
+        policy[_move_to_action(moves[0])] = 1.0
+        return policy
+    w = np.exp((evals - evals.max()) / tau_label)
+    w /= w.sum()
+    for move, p in zip(moves, w):
+        policy[_move_to_action(move)] = float(p)
+    return policy
+
+
 def softmax_sample_from_multipv(
     info_list: list,
     pov: chess.Color,
@@ -97,14 +132,16 @@ def generate_one_game(
     max_plies: int,
     multipv: int,
     move_temperature: float,
+    tau_label: float,
     rng: random.Random,
     gap_sink: list | None = None,
 ) -> GameHistory | None:
     """Play a single Stockfish game at fixed depth with softmax-over-top-K move sampling.
 
-    Returns the GameHistory, or None if the game hit max_plies without a natural result.
-    If ``gap_sink`` is provided, per-ply ``(best_eval - chosen_eval)`` gaps are appended
-    for diversity diagnostics.
+    Policy target: ``softmax(top_multipv_scores / tau_label)`` over the top-K moves
+    (sparse soft target). Returns the GameHistory, or None if the game hit
+    ``max_plies`` without a natural result. If ``gap_sink`` is provided, per-ply
+    ``(best_eval - chosen_eval)`` gaps are appended for diversity diagnostics.
     """
     board = chess.Board()
     state = game.reset()
@@ -128,15 +165,17 @@ def generate_one_game(
         if gap_sink is not None:
             gap_sink.append(best_eval - value_stm)
 
-        # Record position + chosen action.
+        # Record position + chosen action. Policy target is soft top-K from
+        # the SAME analyse call (label depth == play depth in symmetric mode).
         obs = game.to_tensor(state)
         action = _move_to_action(move)
-        one_hot = np.zeros(game.action_space_size, dtype=np.float32)
-        one_hot[action] = 1.0
+        policy_target = multipv_to_soft_policy(
+            info_list, board.turn, tau_label, game.action_space_size
+        )
 
         history.observations.append(obs)
         history.actions.append(action)
-        history.policies.append(one_hot)
+        history.policies.append(policy_target)
         history.root_values.append(value_stm)
         history.external_values.append(value_stm)
         history.legal_actions_list.append(game.legal_actions(state))
@@ -168,17 +207,23 @@ def generate_one_asymmetric_game(
     label_depth: int,
     max_plies: int,
     multipv: int,
+    label_multipv: int,
     move_temperature: float,
+    tau_label: float,
     rng: random.Random,
     gap_sink: list | None = None,
 ) -> GameHistory | None:
     """Asymmetric-teacher game: play at mixed depths, label everything at label_depth.
 
-    At each ply, two analyse calls (collapsed to one when play_depth == label_depth):
-      1. label_info @ depth=label_depth, MPV=1 — drives `policies` (one-hot on top move)
-         and `external_values` / `root_values` (STM eval).
-      2. play_info  @ depth=play_depth_{w,b}, MPV=multipv — drives `actions` (the move
-         actually pushed to the board) via softmax-over-top-K sampling.
+    At each ply, two analyse calls (collapsed to one when ``play_depth == label_depth``
+    AND the requested K matches):
+      1. ``label_info`` @ depth=``label_depth``, MPV=``label_multipv`` — drives
+         ``policies`` via ``softmax(scores / tau_label)`` over the top-K labels
+         (Hubert 2021-style soft policy target) and ``external_values`` /
+         ``root_values`` from the top-line STM eval.
+      2. ``play_info``  @ depth=play_depth_{w,b}, MPV=``multipv`` — drives
+         ``actions`` (the move actually pushed to the board) via
+         softmax-over-top-K sampling at ``move_temperature``.
 
     ``policies[i]`` and ``actions[i]`` diverge on positions where the weaker play
     engine would pick a different move than depth-8's preference. That divergence
@@ -196,17 +241,18 @@ def generate_one_asymmetric_game(
 
         play_depth = play_depth_white if board.turn == chess.WHITE else play_depth_black
 
-        if play_depth == label_depth:
-            # Single analyse: play engine at label depth with MPV=K covers both uses.
+        if play_depth == label_depth and multipv >= label_multipv:
+            # Single analyse: play engine at label depth with MPV=max(K_play, K_label)
+            # covers both uses. Slice top-label_multipv for the label-side target.
             play_info = engine.analyse(
                 board, chess.engine.Limit(depth=label_depth), multipv=multipv
             )
             if isinstance(play_info, dict):
                 play_info = [play_info]
-            label_info = [play_info[0]]
+            label_info = play_info[:label_multipv]
         else:
             label_info = engine.analyse(
-                board, chess.engine.Limit(depth=label_depth), multipv=1
+                board, chess.engine.Limit(depth=label_depth), multipv=label_multipv
             )
             if isinstance(label_info, dict):
                 label_info = [label_info]
@@ -216,11 +262,13 @@ def generate_one_asymmetric_game(
             if isinstance(play_info, dict):
                 play_info = [play_info]
 
-        # Label from depth-8 top line.
+        # Label from depth-8 top line (value) and top-K (soft policy).
         if not label_info or not label_info[0].get("pv"):
             return None
-        label_move = label_info[0]["pv"][0]
         label_value_stm = score_to_value(label_info[0]["score"], board.turn)
+        policy_target = multipv_to_soft_policy(
+            label_info, board.turn, tau_label, game.action_space_size
+        )
 
         # Play via softmax sample over depth-play_depth top-K.
         played_move, chosen_eval, best_eval = softmax_sample_from_multipv(
@@ -231,14 +279,11 @@ def generate_one_asymmetric_game(
         if gap_sink is not None:
             gap_sink.append(best_eval - chosen_eval)
 
-        label_action = _move_to_action(label_move)
         played_action = _move_to_action(played_move)
-        one_hot = np.zeros(game.action_space_size, dtype=np.float32)
-        one_hot[label_action] = 1.0
 
         history.observations.append(game.to_tensor(state))
         history.actions.append(played_action)          # behavior (played) — may diverge
-        history.policies.append(one_hot)                # target (labeled at depth-8)
+        history.policies.append(policy_target)          # target: soft top-K @ label_depth
         history.root_values.append(label_value_stm)
         history.external_values.append(label_value_stm)
         history.legal_actions_list.append(game.legal_actions(state))
@@ -263,26 +308,21 @@ BUCKETS = {
 }
 
 
-def save_shard(path: Path, games: list[GameHistory], format_version: int = 2) -> None:
-    """Write a shard to disk.
+def save_shard(path: Path, games: list[GameHistory]) -> None:
+    """Write a shard in the canonical v1 list format with numpy observations.
 
-    format_version:
-        1 — legacy: a single pickled ``list[GameHistory]`` (~2.8 MB/game).
-        2 — compact streaming: header dict then one compact-dict per game
-            (~10-50 KB/game for Stockfish one-hots). Default.
+    `_iter_shard_games` rewraps numpy → torch.from_numpy (zero-copy) on yield,
+    so downstream code sees torch.Tensor observations as expected. Storing
+    torch.Tensor directly would route through torch's pickle storage reducer,
+    which corrupts the heap on large shards and SIGSEGVs training; that's why
+    we explicitly convert to numpy here.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    if format_version == 1:
-        with open(path, "wb") as f:
-            pickle.dump(games, f, protocol=pickle.HIGHEST_PROTOCOL)
-        return
-    if format_version != 2:
-        raise ValueError(f"Unsupported shard format_version: {format_version}")
-    header = {"version": 2, "n_records": len(games)}
+    for g in games:
+        if g.observations and hasattr(g.observations[0], "numpy"):
+            g.observations = [o.numpy() for o in g.observations]
     with open(path, "wb") as f:
-        pickle.dump(header, f, protocol=pickle.HIGHEST_PROTOCOL)
-        for g in games:
-            pickle.dump(g.to_compact_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(games, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def main():
@@ -299,17 +339,30 @@ def main():
     ap.add_argument("--shard-index-start", type=int, default=0,
                     help="Starting shard index (for running parallel workers writing "
                          "to the same --out-dir with disjoint index ranges).")
-    ap.add_argument("--multipv", type=int, default=3,
-                    help="Top-K moves Stockfish returns per position. 1 = deterministic "
-                         "best move (no diversity).")
+    ap.add_argument("--multipv", type=int, default=10,
+                    help="Top-K moves Stockfish returns per position for play-side "
+                         "sampling. 1 = deterministic best move (no diversity). "
+                         "Bumped from 3 → 10 (2026-04-25): depth-8 ranks d4/c4 outside "
+                         "top-3, so K=3 systematically excluded those openings; top-10 "
+                         "moves at depth-8 are all within ~50cp of best.")
+    ap.add_argument("--label-multipv", type=int, default=10,
+                    help="Top-K moves used to build the soft policy LABEL "
+                         "(softmax(scores/tau_label) over top-K). Independent from "
+                         "--multipv (which controls play-side diversity sampling). "
+                         "Default 10 matches play-side K under the depth-8 flat eval "
+                         "landscape.")
+    ap.add_argument("--tau-label", type=float, default=0.10,
+                    help="Softmax temperature τ over top-K line evals (in [-1,+1] "
+                         "raw space) when building the soft policy LABEL. Smaller τ "
+                         "= sharper preference for top move; larger τ = flatter. "
+                         "At depth-8 the eval landscape is flat (top-10 within ~50cp), "
+                         "so τ has muted effect — soft labels in calm positions are "
+                         "near-uniform, sharp only in clear tactical positions.")
     ap.add_argument("--move-temperature", type=float, default=0.15,
                     help="Softmax temperature τ over the top-K line evals in [-1,+1] "
-                         "space. τ→0 = always best move; τ→∞ = uniform across top-K. "
-                         "0.15 ≈ random in flat positions, deterministic on mate threats.")
-    ap.add_argument("--format-version", type=int, default=2, choices=[1, 2],
-                    help="Shard format. 1 = legacy list[GameHistory] (~2.8 MB/game); "
-                         "2 = compact streaming (~10-50 KB/game, default). Training "
-                         "loads both transparently.")
+                         "space FOR THE PLAYED MOVE (play-side, behavior). τ→0 = "
+                         "always best move; τ→∞ = uniform across top-K. 0.15 ≈ random "
+                         "in flat positions, deterministic on mate threats.")
     ap.add_argument("--bucket", choices=list(BUCKETS.keys()), default=None,
                     help="Asymmetric-teacher bucket. 8v5/8v6/8v7 = depth-8 vs weak engine; "
                          "8v8 = depth-8 both sides (labels + K-way play sampling). Within "
@@ -373,10 +426,12 @@ def main():
                     f"asymmetric play_w={args.play_depth_white},b={args.play_depth_black}")
         print(f"Generating {args.num_games} games [{mode_str}] "
               f"label_depth={args.label_depth} multipv={args.multipv} "
-              f"τ={args.move_temperature} → {args.out_dir}")
+              f"label_multipv={args.label_multipv} τ_play={args.move_temperature} "
+              f"τ_label={args.tau_label} → {args.out_dir}")
     else:
         print(f"Generating {args.num_games} games at depth {args.depth} "
-              f"(multipv={args.multipv}, τ={args.move_temperature}) → {args.out_dir}")
+              f"(multipv={args.multipv}, τ_play={args.move_temperature}, "
+              f"τ_label={args.tau_label}) → {args.out_dir}")
     try:
         while completed < args.num_games:
             if asymmetric:
@@ -388,13 +443,15 @@ def main():
                     label_depth=args.label_depth,
                     max_plies=args.max_plies,
                     multipv=args.multipv,
+                    label_multipv=args.label_multipv,
                     move_temperature=args.move_temperature,
+                    tau_label=args.tau_label,
                     rng=rng,
                 )
             else:
                 g = generate_one_game(
                     engine, game, args.depth, args.max_plies,
-                    args.multipv, args.move_temperature, rng,
+                    args.multipv, args.move_temperature, args.tau_label, rng,
                 )
             if g is None:
                 dropped_cap += 1
@@ -404,7 +461,7 @@ def main():
 
             if len(shard) >= args.shard_size:
                 path = args.out_dir / f"shard_{shard_idx:04d}.pkl"
-                save_shard(path, shard, format_version=args.format_version)
+                save_shard(path, shard)
                 elapsed = time.time() - t0
                 rate = completed / max(elapsed, 1e-6)
                 decisive = sum(1 for gg in shard if gg.game_outcome != 0.0)
@@ -418,7 +475,7 @@ def main():
 
         if shard:
             path = args.out_dir / f"shard_{shard_idx:04d}.pkl"
-            save_shard(path, shard, format_version=args.format_version)
+            save_shard(path, shard)
             print(f"  final shard {shard_idx}: {len(shard)} games → {path}")
     finally:
         engine.quit()

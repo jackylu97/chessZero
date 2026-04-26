@@ -7,7 +7,6 @@ Usage:
 
 import argparse
 import os
-import pickle
 import sys
 from collections import Counter
 
@@ -15,7 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import chess
 
+from src.games import GAME_REGISTRY
 from src.games.chess import _action_to_move
+from src.training.replay_buffer import ReplayBuffer
 
 
 def replay_game(game):
@@ -58,12 +59,15 @@ def main():
     parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args()
 
-    with open(args.buffer, "rb") as f:
-        data = pickle.load(f)
-    buf = data["buffer"]
+    # Route through ReplayBuffer.load so both supported formats work:
+    # v2 (streaming) and v3 (compact streaming, current default).
+    # v3 needs a game for action replay; v2 ignores it.
+    rb = ReplayBuffer(max_size=10_000_000)
+    rb.load(args.buffer, game=GAME_REGISTRY["chess"]())
+    buf = rb.buffer
 
     print(f"Buffer: {args.buffer}")
-    print(f"Games stored: {len(buf)}  |  Total games ever seen: {data['total_games']}")
+    print(f"Games stored: {len(buf)}  |  Total games ever seen: {rb.total_games}")
 
     lengths = [len(g) for g in buf]
     outcomes = [g.game_outcome for g in buf]
