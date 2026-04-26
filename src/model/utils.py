@@ -128,3 +128,57 @@ def support_to_scalar(probs: torch.Tensor, support_size: int) -> torch.Tensor:
     support = torch.arange(-support_size, support_size + 1,
                            device=probs.device, dtype=probs.dtype)
     return (probs * support).sum(dim=1)
+
+
+# --- WDL (Win/Draw/Loss) head — Lc0-style 3-output classifier ---
+#
+# Convention: WDL output is from the side-to-move's perspective at the position.
+# Index order is (W, D, L). This matches Lc0's `(P_W, P_D, P_L)` convention in
+# `lc0/src/neural/backends/blas/network_blas.cc:86-103` (and identical logic
+# across backends).
+
+WDL_W = 0
+WDL_D = 1
+WDL_L = 2
+
+
+def wdl_to_scalar(logits: torch.Tensor, draw_score: float = 0.0) -> torch.Tensor:
+    """Convert WDL logits to a scalar value used by MCTS Q backups.
+
+    The standard Lc0 conversion is ``V = P(W) - P(L)`` (draws contribute 0).
+    With non-zero ``draw_score`` we add ``draw_score * P(D)`` so that drawish
+    positions are nudged toward / away from 0 — matching Lc0's tree-side
+    formula ``Q = WL + DrawScore · D`` from
+    ``lc0/src/search/classic/node.h:168``.
+
+    Args:
+        logits: (B, 3) tensor of WDL logits.
+        draw_score: float in [-1, +1]. 0 (default) is paper-faithful AlphaZero;
+                    negative values penalize draws (anti-draw shaping).
+
+    Returns:
+        (B,) scalar values in roughly [-1, +1].
+    """
+    probs = torch.softmax(logits, dim=-1)
+    return probs[..., WDL_W] - probs[..., WDL_L] + draw_score * probs[..., WDL_D]
+
+
+def outcome_to_wdl(game_outcome: float, ply_idx: int) -> tuple[float, float, float]:
+    """Convert a game's final outcome to a one-hot WDL distribution from the
+    side-to-move's POV at ply ``ply_idx``.
+
+    Args:
+        game_outcome: +1 (white win), -1 (black win), or 0 (draw),
+                      from white's POV.
+        ply_idx: 0-indexed ply within the game. Even = white to move,
+                 odd = black to move.
+
+    Returns:
+        (P_W, P_D, P_L) one-hot tuple from the side-to-move's perspective.
+    """
+    if game_outcome == 0.0:
+        return (0.0, 1.0, 0.0)
+    # White's perspective: wins iff outcome == +1
+    stm_is_white = (ply_idx % 2 == 0)
+    stm_won = (game_outcome > 0.0) == stm_is_white
+    return (1.0, 0.0, 0.0) if stm_won else (0.0, 0.0, 1.0)

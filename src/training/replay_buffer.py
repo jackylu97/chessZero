@@ -137,8 +137,16 @@ class GameHistory:
         return gh
 
     def make_target(self, state_index: int, num_unroll_steps: int,
-                    td_steps: int, discount: float, action_space_size: int):
+                    td_steps: int, discount: float, action_space_size: int,
+                    value_head_type: str = "support"):
         """Create training target for a given position.
+
+        Args:
+            value_head_type: 'support' (default, scalar value targets via
+                bootstrap or external_values) or 'wdl' (3-vector one-hot WDL
+                targets from game outcome — Lc0 style; td_steps and
+                external_values are ignored under WDL since the target is
+                always the actual game result from each ply's STM POV).
 
         Returns:
             target_observations: list of K+1 obs at state_index..state_index+K
@@ -146,7 +154,8 @@ class GameHistory:
             target_obs_mask: list of K+1 floats — 1.0 where the index is within
                 the game, 0.0 past game end. Used by EfficientZero consistency loss.
             target_actions: K future actions (padded with 0 if game ended)
-            target_values: K+1 values (bootstrapped or game outcome)
+            target_values: K+1 entries — scalars under 'support', shape-(3,)
+                np.ndarray under 'wdl'.
             target_rewards: K+1 rewards
             target_policies: K+1 policy targets
         """
@@ -158,11 +167,33 @@ class GameHistory:
         obs_mask = []
         last_obs = self.observations[min(state_index, len(self) - 1)]
 
+        # WDL targets: cache draw vector + outcome lookup once per call.
+        wdl_draw = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        wdl_w = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        wdl_l = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+        def _wdl_target_at(ply_idx: int) -> np.ndarray:
+            """One-hot WDL from the side-to-move's POV at ply_idx.
+
+            Convention: ply 0 is white-to-move, even ply indices are white-stm,
+            odd are black-stm. game_outcome > 0 means white wins.
+            """
+            if self.game_outcome == 0.0:
+                return wdl_draw
+            stm_is_white = (ply_idx % 2 == 0)
+            stm_won = (self.game_outcome > 0.0) == stm_is_white
+            return wdl_w if stm_won else wdl_l
+
         for i in range(num_unroll_steps + 1):
             idx = state_index + i
 
             if idx < len(self):
-                if self.external_values and idx < len(self.external_values):
+                if value_head_type == "wdl":
+                    # Pure z (Lc0 q_ratio=0 path). external_values ignored —
+                    # we deliberately use game outcome for both warmstart
+                    # and self-play to keep target distribution shape unified.
+                    value = _wdl_target_at(idx)
+                elif self.external_values and idx < len(self.external_values):
                     # Warmstart path: external targets are already side-to-move-relative.
                     value = self.external_values[idx]
                 elif td_steps == -1:
@@ -199,7 +230,13 @@ class GameHistory:
                 obs_list.append(last_obs)
                 obs_mask.append(1.0)
             else:
-                values.append(0.0)
+                # Past game end: the obs_mask zeros these out of the loss,
+                # so the precise filler value doesn't matter for training.
+                # Use the matching shape so downstream tensor stacking works.
+                if value_head_type == "wdl":
+                    values.append(wdl_draw)
+                else:
+                    values.append(0.0)
                 rewards.append(0.0)
                 policies.append(np.full(action_space_size, 1.0 / action_space_size, dtype=np.float32))
                 obs_list.append(last_obs)
@@ -293,6 +330,7 @@ class ReplayBuffer:
         action_space_size: int,
         alpha: float = 0.0,
         beta: float = 1.0,
+        value_head_type: str = "support",
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -325,7 +363,8 @@ class ReplayBuffer:
             game = self.buffer[g_idx]
             pos = np.random.randint(0, len(game))
             obs_list, obs_mask, actions, values, rewards, policies = game.make_target(
-                pos, num_unroll_steps, td_steps, discount, action_space_size
+                pos, num_unroll_steps, td_steps, discount, action_space_size,
+                value_head_type=value_head_type,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)
@@ -343,7 +382,10 @@ class ReplayBuffer:
             "target_observations": target_observations_t,
             "target_obs_mask": torch.tensor(target_obs_masks, dtype=torch.float32),
             "actions": torch.tensor(actions_batch, dtype=torch.long),
-            "target_values": torch.tensor(values_batch, dtype=torch.float32),
+            # values_batch may be list-of-list-of-floats (support head) or
+            # list-of-list-of-(3,)-arrays (WDL head). np.asarray handles both
+            # shapes and avoids the slow per-element conversion warning.
+            "target_values": torch.from_numpy(np.asarray(values_batch, dtype=np.float32)),
             "target_rewards": torch.tensor(rewards_batch, dtype=torch.float32),
             "target_policies": torch.from_numpy(np.stack(policies_batch)),
         }

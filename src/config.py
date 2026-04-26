@@ -125,6 +125,31 @@ class MuZeroConfig:
     # at {-1, -0.5, 0, +0.5, +1} in raw-value terms.
     value_target_scale: float = 1.0
 
+    # Value head type — 'support' (default, MuZero paper) or 'wdl' (Lc0).
+    #   support: 2*value_support_size+1 bins over a discrete support; trained
+    #            via cross-entropy with two-hot scalar-target encoding.
+    #   wdl:     3-output (Win, Draw, Loss) classifier; trained on one-hot
+    #            game outcome from the side-to-move's POV. Decoded to scalar
+    #            via V = P(W) - P(L) + draw_score · P(D). Best fit for chess
+    #            (canonical class structure: {-1, 0, +1} game outcomes).
+    value_head_type: str = "support"
+
+    # Draw shaping for the WDL head's scalar conversion (search-time only):
+    #   V = P(W) - P(L) + draw_score · P(D)
+    # Lc0 default 0.0. Negative values penalize draws (anti-draw shaping);
+    # paper-faithful is 0.0. Does NOT affect training targets — only the
+    # scalar exposed to MCTS PUCT and Q backups.
+    draw_score: float = 0.0
+
+    # MCTS Q-blend ratio for WDL training targets:
+    #   target = q_ratio · q_mcts + (1 - q_ratio) · z
+    # where z is the one-hot game outcome and q_mcts is the MCTS root WDL
+    # captured during self-play. Lc0 default 0.0 (pure z, Monte Carlo).
+    # Higher values mitigate the credit-assignment problem on noisy self-play
+    # outcomes. Requires storing MCTS root WDL in GameHistory (currently we
+    # store only scalar root_values, so q_ratio>0 needs a schema extension).
+    q_ratio: float = 0.0
+
     # Root-heavy loss weighting (MuZero paper / muzero-general pseudocode):
     # root prediction gets weight 1.0, each of the K unroll steps gets weight 1/K.
     # Default False uses the current uniform 1/(K+1) weighting (≈ LightZero's
@@ -235,10 +260,18 @@ def get_config(game: str) -> MuZeroConfig:
                                         # Base Learning Rate for Chess.
             value_loss_weight_warmstart=1.0,  # clean Stockfish targets: strong supervision
             value_loss_weight_selfplay=0.25,  # noisy MCTS bootstraps: paper-standard damp
+            value_head_type="wdl",      # Lc0-style 3-output W/D/L classifier; replaces
+                                        # the 5-bin scalar head. Targets game outcome z directly,
+                                        # eliminating the predict-zero collapse failure mode where
+                                        # the scalar head settled on the central bin.
+            draw_score=0.0,             # Lc0 default; negative values are anti-draw shaping.
+            q_ratio=0.0,                # Lc0 default; pure z target.
             dirichlet_alpha=0.3,        # AlphaZero/MuZero/Lc0 chess default (≈10 / 35-legal-moves).
                                         # Was 0.03 (the Go constant) which under-explored chess by
                                         # ~10× and contributed to the 2026_04_24_0001 draw-basin collapse.
-            td_steps=10,
+            td_steps=-1,                # Monte Carlo (full game return). Required by WDL —
+                                        # n-step bootstrap doesn't compose with categorical
+                                        # outcome targets. Matches AlphaZero / Lc0 design.
             temperature_drop_step=30,
             reanalyze_interval=1024,   # keep 1:1 with self_play_interval
             reanalyze_batch_size=256,

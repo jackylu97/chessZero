@@ -4,7 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import ResidualBlock, mlp_head, norm_layer, support_to_scalar, inverse_scalar_transform
+from .utils import (
+    ResidualBlock,
+    inverse_scalar_transform,
+    mlp_head,
+    norm_layer,
+    support_to_scalar,
+    wdl_to_scalar,
+)
 
 
 class RepresentationNetwork(nn.Module):
@@ -115,7 +122,18 @@ class DynamicsNetwork(nn.Module):
 
 
 class PredictionNetwork(nn.Module):
-    """f(hidden_state) -> (policy, value)"""
+    """f(hidden_state) -> (policy, value).
+
+    Two value head types are supported:
+
+    - ``value_head_type="support"`` (default, MuZero paper): output a categorical
+      distribution over a discrete support {-K, ..., 0, ..., +K}. Decoded to a
+      scalar via ``support_to_scalar``. Width = ``2 * value_support_size + 1``.
+
+    - ``value_head_type="wdl"`` (Lc0 production): output 3 logits over
+      (Win, Draw, Loss) from the side-to-move's POV. Decoded to a scalar via
+      ``wdl_to_scalar`` (V = P(W) - P(L) + draw_score · P(D)).
+    """
 
     def __init__(
         self,
@@ -125,9 +143,11 @@ class PredictionNetwork(nn.Module):
         latent_w: int,
         fc_hidden: int,
         value_support_size: int = 1,
+        value_head_type: str = "support",
     ):
         super().__init__()
         self.value_support_size = value_support_size
+        self.value_head_type = value_head_type
 
         # Policy head
         self.policy_head = nn.Sequential(
@@ -139,8 +159,13 @@ class PredictionNetwork(nn.Module):
         )
         _zero_init_last_linear(self.policy_head)
 
-        # Value head outputs categorical distribution
-        value_out = 2 * value_support_size + 1
+        # Value head: shape depends on the head type.
+        if value_head_type == "support":
+            value_out = 2 * value_support_size + 1
+        elif value_head_type == "wdl":
+            value_out = 3
+        else:
+            raise ValueError(f"Unknown value_head_type: {value_head_type!r}")
         self.value_head = nn.Sequential(
             nn.Conv2d(hidden_planes, 1, 1, bias=False),
             norm_layer(1, (latent_h, latent_w)),
@@ -154,7 +179,9 @@ class PredictionNetwork(nn.Module):
         """
         Returns:
             policy_logits: (B, action_space_size)
-            value_logits: (B, 2*support_size+1)
+            value_logits:
+              - support head: (B, 2*support_size+1)
+              - wdl head:     (B, 3)  — order (W, D, L)
         """
         return self.policy_head(hidden_state), self.value_head(hidden_state)
 
@@ -231,6 +258,8 @@ class MuZeroNetwork(nn.Module):
         pred_out: int = 1024,
         use_scalar_transform: bool = True,
         value_target_scale: float = 1.0,
+        value_head_type: str = "support",
+        draw_score: float = 0.0,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -239,6 +268,8 @@ class MuZeroNetwork(nn.Module):
         self.use_consistency_loss = use_consistency_loss
         self.use_scalar_transform = use_scalar_transform
         self.value_target_scale = value_target_scale
+        self.value_head_type = value_head_type
+        self.draw_score = draw_score
 
         self.representation = RepresentationNetwork(
             observation_channels, hidden_planes, num_blocks,
@@ -251,6 +282,7 @@ class MuZeroNetwork(nn.Module):
         self.prediction = PredictionNetwork(
             hidden_planes, action_space_size,
             latent_h, latent_w, fc_hidden, value_support_size,
+            value_head_type=value_head_type,
         )
 
         if use_consistency_loss:
@@ -322,6 +354,8 @@ class MuZeroNetwork(nn.Module):
         return next_hidden, reward_logits, policy_logits, value_logits
 
     def _value_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "value_head_type", "support") == "wdl":
+            return wdl_to_scalar(logits, draw_score=getattr(self, "draw_score", 0.0)).unsqueeze(-1)
         scalar = support_to_scalar(logits, self.value_support_size)
         if self.use_scalar_transform:
             scalar = inverse_scalar_transform(scalar)
@@ -495,6 +529,8 @@ class MultiGameMuZeroNetwork(nn.Module):
         return x, reward_logits, policy_logits, value_logits
 
     def _value_logits_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "value_head_type", "support") == "wdl":
+            return wdl_to_scalar(logits, draw_score=getattr(self, "draw_score", 0.0)).unsqueeze(-1)
         scalar = support_to_scalar(logits, self.value_support_size)
         if self.use_scalar_transform:
             scalar = inverse_scalar_transform(scalar)

@@ -352,6 +352,7 @@ class MuZeroTrainer:
             self.game.action_space_size,
             alpha=self.config.per_alpha,
             beta=beta,
+            value_head_type=getattr(self.config, "value_head_type", "support"),
         )
 
         obs = batch["observations"].to(self.device)
@@ -467,18 +468,34 @@ class MuZeroTrainer:
         # mean. CE loss hits a floor once targets are concentrated, so MAE-vs-std
         # is the more honest "is the value head learning?" signal.
         with torch.no_grad():
-            pred_v_trans = support_to_scalar(value_logits_k0.detach().float(), self.network.value_support_size).squeeze(-1)
-            true_v_scalar = target_values[:, 0]
-            if self.config.use_scalar_transform:
-                true_v_trans = scalar_transform(true_v_scalar)
-                pred_v_scalar = inverse_scalar_transform(pred_v_trans)
+            if getattr(self.config, "value_head_type", "support") == "wdl":
+                # WDL diagnostics: predicted scalar V = P(W) - P(L); target
+                # scalar V = z[W] - z[L] (one-hot, so just +1/0/-1). MAE in
+                # raw [-1, +1] space. target_std is the std of the target
+                # scalar over the batch.
+                from src.model.utils import wdl_to_scalar
+                pred_v_scalar = wdl_to_scalar(
+                    value_logits_k0.detach().float(),
+                    draw_score=getattr(self.config, "draw_score", 0.0),
+                )
+                tgt_wdl = target_values[:, 0]  # (B, 3)
+                true_v_scalar = (tgt_wdl[..., 0] - tgt_wdl[..., 2]).float()
+                td_errors = (pred_v_scalar - true_v_scalar).abs().cpu().numpy()
+                value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
+                value_target_std = true_v_scalar.std(unbiased=False).item()
             else:
-                scale = self.config.value_target_scale
-                true_v_trans = true_v_scalar * scale
-                pred_v_scalar = pred_v_trans / scale if scale != 1.0 else pred_v_trans
-            td_errors = (pred_v_trans - true_v_trans).abs().cpu().numpy()
-            value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
-            value_target_std = true_v_scalar.float().std(unbiased=False).item()
+                pred_v_trans = support_to_scalar(value_logits_k0.detach().float(), self.network.value_support_size).squeeze(-1)
+                true_v_scalar = target_values[:, 0]
+                if self.config.use_scalar_transform:
+                    true_v_trans = scalar_transform(true_v_scalar)
+                    pred_v_scalar = inverse_scalar_transform(pred_v_trans)
+                else:
+                    scale = self.config.value_target_scale
+                    true_v_trans = true_v_scalar * scale
+                    pred_v_scalar = pred_v_trans / scale if scale != 1.0 else pred_v_trans
+                td_errors = (pred_v_trans - true_v_trans).abs().cpu().numpy()
+                value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
+                value_target_std = true_v_scalar.float().std(unbiased=False).item()
 
             # Policy entropy at root (k=0). Tracks how sharp the model's prior
             # is (lower = sharper) and how sharp the training targets are. The
@@ -601,9 +618,21 @@ class MuZeroTrainer:
         log_p = F.log_softmax(logits, dim=1)
         return F.kl_div(log_p, targets, reduction="none").sum(dim=1)
 
-    def _value_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,
+    def _value_loss(self, logits: torch.Tensor, target: torch.Tensor,
                     support_size: int) -> torch.Tensor:
-        """Per-sample cross-entropy for categorical value prediction."""
+        """Per-sample cross-entropy for value prediction.
+
+        Two paths depending on ``self.config.value_head_type``:
+        - 'support' (default): scalar target → categorical via scalar_to_support → CE
+          against logits of shape (B, 2*support_size+1).
+        - 'wdl': target is already a (B, 3) probability distribution; CE directly
+          against logits of shape (B, 3). support_size is unused.
+        """
+        if getattr(self.config, "value_head_type", "support") == "wdl":
+            # target shape: (B, 3) — already a probability distribution.
+            return -(target * F.log_softmax(logits, dim=1)).sum(dim=1)
+        # Support-head path (original behaviour).
+        target_scalar = target
         if self.config.use_scalar_transform:
             transformed = scalar_transform(target_scalar)
         else:

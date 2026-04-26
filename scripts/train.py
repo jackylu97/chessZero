@@ -144,6 +144,8 @@ def main():
         pred_out=config.pred_out,
         use_scalar_transform=config.use_scalar_transform,
         value_target_scale=config.value_target_scale,
+        value_head_type=getattr(config, "value_head_type", "support"),
+        draw_score=getattr(config, "draw_score", 0.0),
     )
 
     trainer = MuZeroTrainer(
