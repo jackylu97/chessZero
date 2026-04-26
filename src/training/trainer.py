@@ -110,13 +110,21 @@ class MuZeroTrainer:
         # Cold-start bootstrap. If a Stockfish pool is attached, bulk-inject
         # enough games to start training on non-trivial buffer diversity.
         # Otherwise fall back to a random self-play round.
+        #
+        # Resume-with-empty-buffer trap: when resuming from a .pt whose paired
+        # .buf is missing AND the injection cursor was already at pool-end
+        # (e.g. resuming from checkpoint_30000.pt of a prior run that had
+        # consumed all 32k warmstart games), the inject call fills 0 games
+        # and the first train_step crashes on np.random.choice(0,...). Guard
+        # by falling through to self-play if the inject leaves us empty.
         if len(self.replay_buffer) == 0:
             if self._injection_shards:
                 n = max(self.config.stockfish_injection_games, self.config.min_buffer_size)
                 print(f"Bootstrapping buffer with {n} Stockfish games from injection pool")
                 self._inject_stockfish_games(n)
-            else:
-                print("Generating initial self-play games...")
+            if len(self.replay_buffer) == 0:
+                print("Buffer still empty after injection bootstrap — "
+                      "falling back to self-play to seed the buffer")
                 self._run_self_play()
 
         start_step = self.global_step
