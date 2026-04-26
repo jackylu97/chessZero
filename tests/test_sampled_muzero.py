@@ -186,6 +186,54 @@ def test_gumbel_topk_accepts_numpy_input():
     assert len(set(actions.tolist())) == 3
 
 
+# --- _sample_iid_with_replacement: Hubert 2021 Proposed Modification core --
+
+def _make_dummy_batched(action_space=9):
+    """BatchedMCTS instance just for calling _sample_iid_with_replacement;
+    network/game are unused for this helper."""
+    return _make_batched(action_space=action_space, sample_k=4, num_simulations=1)
+
+
+def test_sample_iid_returns_unique_indices_and_beta_hat():
+    """Helper returns (unique_indices, β̂) with β̂ = count/K, sums to 1."""
+    mcts = _make_dummy_batched(action_space=20)
+    probs = np.zeros(20); probs[0] = 0.62; probs[1] = 0.21; probs[2] = 0.10
+    probs[3:] = (1.0 - probs.sum()) / 17
+    K = 50
+    unique, beta_hat = mcts._sample_iid_with_replacement(probs, K)
+    assert len(unique) == len(beta_hat)
+    assert len(unique) == len(set(unique.tolist()))      # all unique
+    assert beta_hat.sum() == pytest.approx(1.0)
+    counts = beta_hat * K
+    np.testing.assert_allclose(counts, np.round(counts), atol=1e-9)
+
+
+def test_sample_iid_with_sharp_policy_concentrates():
+    """β̂ on the dominant prior should be close to its π in expectation."""
+    mcts = _make_dummy_batched(action_space=20)
+    probs = np.zeros(20); probs[0] = 0.62; probs[1] = 0.21; probs[2] = 0.10
+    probs[3:] = (1.0 - probs.sum()) / 17
+    K = 5000
+    unique, beta_hat = mcts._sample_iid_with_replacement(probs, K)
+    # Empirical frequency of action 0 should converge to 0.62 ± small.
+    idx0 = int(np.where(unique == 0)[0][0])
+    sigma = (probs[0] * (1 - probs[0]) / K) ** 0.5
+    assert abs(beta_hat[idx0] - probs[0]) < 5 * sigma
+
+
+def test_sample_iid_with_uniform_policy_gives_near_uniform_beta_hat():
+    """Uniform π over a small N=20 with K=5000 → all 20 actions sampled,
+    β̂ ≈ 1/20."""
+    mcts = _make_dummy_batched(action_space=20)
+    probs = np.ones(20) / 20
+    K = 5000
+    unique, beta_hat = mcts._sample_iid_with_replacement(probs, K)
+    assert len(unique) == 20
+    expected = 1 / 20
+    sigma = (expected * (1 - expected) / K) ** 0.5
+    assert np.all(np.abs(beta_hat - expected) < 5 * sigma)
+
+
 # --- MCTSNode storage: single-prior field, no separate IS denominator -----
 
 def test_mctsnode_has_no_child_priors_net_field():
@@ -375,20 +423,25 @@ def test_batched_mcts_sample_k_larger_than_legals_is_no_op_at_root():
     assert sorted(roots[0].child_actions.tolist()) == [1, 3, 5, 7]
 
 
-def test_batched_mcts_sample_k_smaller_than_legals_samples_k_at_root():
-    """When K < |legals|, root expands exactly K distinct legal actions."""
+def test_batched_mcts_sample_k_smaller_than_legals_samples_at_most_k_at_root():
+    """When K < |legals|, root expands at most K *unique* legal actions
+    (Hubert 2021 Proposed Modification — i.i.d. sampling with replacement, so
+    the unique count can be less than K when β = π is sharp)."""
     mcts = _make_batched(action_space=9, sample_k=3, num_simulations=4)
     obs = [torch.zeros(3, 3, 3)]
     legals = [list(range(9))]
     roots = mcts.run_batch(obs, legals, add_noise=False)
-    assert len(roots[0].child_actions) == 3
-    assert len(set(roots[0].child_actions.tolist())) == 3
+    n_unique = len(roots[0].child_actions)
+    assert 1 <= n_unique <= 3
+    assert len(set(roots[0].child_actions.tolist())) == n_unique
     for a in roots[0].child_actions:
         assert a in set(legals[0])
 
 
 def test_batched_mcts_sample_k_applies_at_leaves_too():
-    """Leaves always use K sampled children when sample_k is set."""
+    """Leaves use at most K unique sampled children when sample_k is set
+    (Hubert 2021 Proposed Modification — i.i.d. with replacement collapses to
+    a varying K_unique ≤ K)."""
     mcts = _make_batched(action_space=9, sample_k=4, num_simulations=8)
     obs = [torch.zeros(3, 3, 3)]
     legals = [list(range(9))]
@@ -396,33 +449,43 @@ def test_batched_mcts_sample_k_applies_at_leaves_too():
     found = False
     for child in roots[0].children:
         if child.child_actions is not None:
-            assert len(child.child_actions) == 4
-            assert len(set(child.child_actions.tolist())) == 4
+            n_unique = len(child.child_actions)
+            assert 1 <= n_unique <= 4
+            assert len(set(child.child_actions.tolist())) == n_unique
             found = True
             break
     assert found, "expected at least one leaf to have been expanded"
 
 
-def test_batched_mcts_sampled_priors_are_renormalized_over_sigma():
-    """Proposed Modification contract: after sampling, PUCT prior over σ
-    must sum to 1 (π_net renormalized over the sampled subspace).
-    This is the code path the paper's Theorem 1 actually prescribes."""
-    mcts = _make_batched(action_space=9, sample_k=4, num_simulations=4)
+def test_batched_mcts_sampled_priors_are_beta_hat():
+    """Proposed Modification contract (Hubert 2021 §5.1): under β = π, the
+    PUCT prior over the *unique* sampled actions is β̂(a) = count(a)/K.
+    Therefore prior sums to 1 (Σ β̂ = K/K), all entries are integer multiples
+    of 1/K, and entries are strictly positive (only sampled actions appear)."""
+    K = 4
+    mcts = _make_batched(action_space=9, sample_k=K, num_simulations=4)
     obs = [torch.zeros(3, 3, 3)]
     legals = [list(range(9))]
-    # add_noise=False so we inspect the renormalized-over-σ priors directly,
-    # before Dirichlet mixing would obscure the invariant at the root.
     roots = mcts.run_batch(obs, legals, add_noise=False)
     root = roots[0]
     assert root.child_priors.sum() == pytest.approx(1.0), \
-        "root priors over σ must sum to 1 (Hubert 2021 Proposed Modification)"
-    assert np.all(root.child_priors > 0)
+        "root priors β̂ must sum to 1"
+    assert np.all(root.child_priors > 0), \
+        "only sampled actions appear with positive prior"
+    # Each entry is count(a)/K — a multiple of 1/K.
+    counts = root.child_priors * K
+    np.testing.assert_allclose(counts, np.round(counts), atol=1e-9)
+    assert int(round(counts.sum())) == K
     # Check a leaf too.
     for child in root.children:
-        if child.child_priors is not None and len(child.child_priors) == 4:
-            assert child.child_priors.sum() == pytest.approx(1.0), \
-                "leaf priors over σ must sum to 1"
+        if child.child_priors is not None:
+            n_unique = len(child.child_priors)
+            assert 1 <= n_unique <= K
+            assert child.child_priors.sum() == pytest.approx(1.0)
             assert np.all(child.child_priors > 0)
+            leaf_counts = child.child_priors * K
+            np.testing.assert_allclose(leaf_counts, np.round(leaf_counts), atol=1e-9)
+            assert int(round(leaf_counts.sum())) == K
             break
 
 

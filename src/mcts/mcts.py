@@ -187,6 +187,24 @@ class MCTS:
 
         self._expand_from_priors(node, actions_np, priors_np)
 
+    def _sample_iid_with_replacement(
+        self, probs: np.ndarray, k: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Hubert 2021 §5.1 / §5.4 sampling step for the Proposed Modification.
+
+        Sample k actions i.i.d. with replacement from β = π. Return
+        ``(unique_indices, beta_hat)`` where ``beta_hat[i] = count(unique_i) / k``.
+
+        Under the Proposed Modification with β = π, the PUCT prior π̂_β(a)
+        ∝ (β̂(a)/β(a))·π(a) reduces to β̂(a). So β̂ is used directly as the
+        PUCT prior over the unique sampled actions. K_unique ≤ k and varies by
+        position: for sharp π only a handful of distinct actions sample;
+        for diffuse π the sampling fills out close to k distinct actions.
+        """
+        sampled = self._rng.choice(len(probs), size=k, replace=True, p=probs)
+        unique, counts = np.unique(sampled, return_counts=True)
+        return unique, counts.astype(np.float64) / k
+
     def _expand_from_priors(self, node: MCTSNode,
                             actions_np: np.ndarray, priors_np: np.ndarray):
         """Populate parallel-array storage from pre-computed numpy priors.
@@ -194,11 +212,11 @@ class MCTS:
         Pure numpy — no GPU ops, no CPU↔GPU transfer. Callers batch the softmax
         and .cpu() transfer across all games in a sim step, then hand off here.
 
-        `priors_np` is the PUCT prior over the children being installed. For
-        Sampled MuZero the sampled call sites renormalize π_net over σ before
-        calling this; for full expansion it is the full masked softmax. Root
-        Dirichlet noise is applied later via `_add_dirichlet_noise` on
-        `child_priors`.
+        ``priors_np`` is the PUCT prior over the children being installed.
+        Under Sampled MuZero (Hubert 2021 Proposed Modification) sampled call
+        sites pass β̂(a) = count(a)/K from i.i.d. multinomial sampling; under
+        full expansion it is the full masked softmax. Root Dirichlet noise is
+        applied later via ``_add_dirichlet_noise`` on ``child_priors``.
 
         Children are allocated lazily: `node.children` is a list of `None`
         placeholders. `_select_child_*` materializes the concrete MCTSNode
@@ -360,14 +378,13 @@ class BatchedMCTS(MCTS):
     (one per game per step); at N=64 this is a ~60× reduction in
     sync-barrier count.
 
-    If `config.sample_k` is set, uses Gumbel-Top-K sampling (Kool 2019) at
-    roots and leaves — the Sampled MuZero policy-improvement operator
-    (Hubert 2021, Proposed Modification). After sampling σ, priors are
-    renormalized over σ so PUCT uses π_net restricted to the sampled
-    subspace; the training target is then raw `N(a)/ΣN` — Theorem 1 gives
-    that this already approximates the improved policy Î_β π. No post-hoc
-    β̂/β correction at target time (the Naive variant the paper flags as
-    unstable). `sample_k=None` expands the full action space at each leaf
+    If ``config.sample_k`` is set, implements Hubert 2021 §5.1 Proposed
+    Modification: at each node with ``sample_k`` < legal-action-space, sample
+    K actions i.i.d. *with replacement* from β = π and use β̂(a) = count(a)/K
+    as the PUCT prior over the *unique* sampled actions. Training target is
+    raw ``N(a)/ΣN`` over sampled children — Theorem 1 gives that this
+    approximates the improved policy Î_β π. No post-hoc β̂/β correction at
+    target time. ``sample_k=None`` expands the full action space at each leaf
     (tractable only for small action spaces).
 
     Under ``config.use_gumbel`` (Plain Gumbel MuZero, Danihelka 2022): the
@@ -516,13 +533,14 @@ class BatchedMCTS(MCTS):
                 continue
 
             if use_sampled_leaf and len(legals_np) > sample_k:
-                # Sample K distinct legal actions via Gumbel-Top-K over their logits.
-                # Renormalize π_net over σ so PUCT has a proper prior on the
-                # sampled subspace (Hubert 2021 Proposed Modification).
-                sampled_local, _ = sample_topk_gumbel(legal_logits, sample_k, rng=self._rng)
-                actions_np = legals_np[sampled_local]
-                sampled_priors = full_priors[sampled_local]
-                priors_np = sampled_priors / sampled_priors.sum()
+                # Hubert 2021 §5.1 Proposed Modification: sample K i.i.d. with
+                # replacement from β = π over legal actions. Use β̂(a) = count(a)/K
+                # as the PUCT prior over the unique sampled actions. K_unique ≤ K.
+                unique_local, beta_hat = self._sample_iid_with_replacement(
+                    full_priors, sample_k
+                )
+                actions_np = legals_np[unique_local]
+                priors_np = beta_hat
             else:
                 actions_np = legals_np
                 priors_np = full_priors
@@ -574,17 +592,22 @@ class BatchedMCTS(MCTS):
             values_list = value_batch.view(-1).tolist()
             probs_gpu = torch.softmax(policy_batch, dim=-1)
             if use_sampled_leaf:
-                # Gumbel-Top-K: argmax(logits + Gumbel) = sample K distinct actions
-                # from softmax(logits) without replacement (Kool 2019). Priors
-                # are renormalized over σ (Hubert 2021 Proposed Modification).
-                u = torch.rand_like(policy_batch).clamp_(1e-20, 1 - 1e-20)
-                gumbel = -torch.log(-torch.log(u))
-                perturbed = policy_batch + gumbel
-                sampled_idx = torch.topk(perturbed, sample_k, dim=-1).indices
-                sampled_priors = torch.gather(probs_gpu, dim=-1, index=sampled_idx)
-                sampled_priors = sampled_priors / sampled_priors.sum(dim=-1, keepdim=True)
-                topk_actions_np = sampled_idx.detach().cpu().numpy().astype(np.int64)
-                topk_priors_np = sampled_priors.detach().cpu().numpy().astype(np.float64)
+                # Hubert 2021 §5.1 Proposed Modification: sample K i.i.d. with
+                # replacement from β = π. Aggregate per-game to unique actions
+                # with β̂(a) = count(a)/K as the PUCT prior. K_unique ≤ K varies
+                # per game.
+                sampled_idx_gpu = torch.multinomial(
+                    probs_gpu, sample_k, replacement=True
+                )
+                sampled_idx_np = sampled_idx_gpu.detach().cpu().numpy().astype(np.int64)
+                topk_actions_list: list[np.ndarray] = []
+                topk_priors_list: list[np.ndarray] = []
+                for sample_row in sampled_idx_np:
+                    unique, counts = np.unique(sample_row, return_counts=True)
+                    topk_actions_list.append(unique)
+                    topk_priors_list.append(
+                        counts.astype(np.float64) / sample_k
+                    )
             else:
                 probs_np = probs_gpu.detach().cpu().numpy().astype(np.float64)
 
@@ -593,7 +616,9 @@ class BatchedMCTS(MCTS):
                 leaf.hidden_state = next_hiddens[g]
                 leaf.reward = rewards_list[g]
                 if use_sampled_leaf:
-                    self._expand_from_priors(leaf, topk_actions_np[g], topk_priors_np[g])
+                    self._expand_from_priors(
+                        leaf, topk_actions_list[g], topk_priors_list[g]
+                    )
                 else:
                     self._expand_from_priors(leaf, all_actions_np, probs_np[g])
                 self._backpropagate(search_paths[g], path_indices_all[g],
@@ -616,10 +641,10 @@ def select_action(
 
     The returned dense policy is raw-normalized visit counts `N(a)/ΣN(a)` over
     the root's children. Under Sampled MuZero (Hubert 2021 Proposed
-    Modification) the search already accounts for the sampling via the
-    renormalized-over-σ prior inside PUCT, so no post-hoc β̂/β correction is
-    applied here — Theorem 1 gives that raw visit counts already approximate
-    the improved policy Î_β π.
+    Modification) the search already accounts for the sampling via β̂(a) =
+    count(a)/K as the PUCT prior, so no post-hoc β̂/β correction is applied
+    here — Theorem 1 gives that raw visit counts already approximate the
+    improved policy Î_β π.
 
     Returns:
         action: selected action index
