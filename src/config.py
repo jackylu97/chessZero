@@ -246,7 +246,10 @@ def get_config(game: str) -> MuZeroConfig:
             num_residual_blocks=16,
             latent_h=8, latent_w=8,
             fc_hidden=256,
-            num_simulations=200,     # 200 for ~12 visits/candidate on m=16 Gumbel (was 100 ≈ 6/candidate)
+            num_simulations=400,     # 400 to give Q-backups room to dominate the diffuse prior
+                                     # at our policy strength. Doubled from 200 for the WDL+history
+                                     # bundle (2026-04-25); production AlphaZero used 800. Trade:
+                                     # ~2× self-play wall-time per batch.
             batch_size=256,
             training_steps=150000,
             checkpoint_interval=1000,
@@ -280,9 +283,13 @@ def get_config(game: str) -> MuZeroConfig:
                                         # network perceive threefold repetition + 50-move-rule
                                         # progress (a stateless encoder cannot). Reconstructed
                                         # at sample time from per-ply obs — no disk inflation.
-            dirichlet_alpha=0.3,        # AlphaZero/MuZero/Lc0 chess default (≈10 / 35-legal-moves).
-                                        # Was 0.03 (the Go constant) which under-explored chess by
-                                        # ~10× and contributed to the 2026_04_24_0001 draw-basin collapse.
+            dirichlet_alpha=0.1,        # Compromise between 0.03 (Go's value, was over-sharp for
+                                        # chess) and 0.3 (AlphaZero chess default, over-disperses
+                                        # our soft-MultiPV diffuse prior — produced 88% draws in
+                                        # run 2026_04_25_0001 vs 76% with 0.03). α=0.1 keeps real
+                                        # exploration noise without compounding policy diffusion.
+                                        # Tune up toward 0.3 once WDL + the visit-count loop
+                                        # sharpen the policy.
             td_steps=-1,                # Monte Carlo (full game return). Required by WDL —
                                         # n-step bootstrap doesn't compose with categorical
                                         # outcome targets. Matches AlphaZero / Lc0 design.
