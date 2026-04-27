@@ -385,6 +385,93 @@ def test_stratified_sampling_disabled_default():
     assert len(idxs) == 10
 
 
+# --- Two-pool FIFO buffer (warmstart-protected) -----------------------------
+
+def test_two_pool_buffer_evicts_within_warmstart_pool_only():
+    """Filling the warmstart pool past its cap evicts old warmstart games,
+    not self-play games. Self-play count stays untouched."""
+    rb = ReplayBuffer(max_size=10, warmstart_max_size=3)
+    # Add 2 self-play games first.
+    for _ in range(2):
+        gh = _build_warmstart_history([0.0], game_outcome=0.0)
+        gh.external_values = []  # mark as self-play
+        rb.save_game(gh)
+    # Now overflow the warmstart pool (cap=3, push 5).
+    warm_games = [_build_warmstart_history([float(i)], game_outcome=0.0)
+                  for i in range(5)]
+    for g in warm_games:
+        rb.save_game(g)
+    # 2 self-play kept + 3 warmstart kept = 5 total; warmstart cap honored.
+    assert len(rb.buffer) == 5
+    n_warm = sum(1 for g in rb.buffer if g.external_values)
+    n_self = sum(1 for g in rb.buffer if not g.external_values)
+    assert n_warm == 3
+    assert n_self == 2
+    # The youngest 3 warmstart games survive (FIFO within pool).
+    surviving_warm = [g for g in rb.buffer if g.external_values]
+    surviving_evals = [g.external_values[0] for g in surviving_warm]
+    assert surviving_evals == [2.0, 3.0, 4.0]
+
+
+def test_two_pool_buffer_evicts_within_selfplay_pool_only():
+    """Filling the self-play pool past its cap evicts old self-play games,
+    not warmstart games. Warmstart count stays untouched."""
+    rb = ReplayBuffer(max_size=10, warmstart_max_size=3)
+    # Fill warmstart pool to its cap.
+    for i in range(3):
+        rb.save_game(_build_warmstart_history([float(i)], game_outcome=0.0))
+    # Overflow the self-play pool (cap = 10 - 3 = 7, push 9).
+    for _ in range(9):
+        gh = _build_warmstart_history([0.0], game_outcome=0.0)
+        gh.external_values = []
+        rb.save_game(gh)
+    assert len(rb.buffer) == 10  # cap = 3 + 7
+    n_warm = sum(1 for g in rb.buffer if g.external_values)
+    assert n_warm == 3  # warmstart pool untouched
+
+
+def test_two_pool_buffer_disabled_default_is_legacy_fifo():
+    """Without warmstart_max_size set, save_game uses single-pool FIFO."""
+    rb = ReplayBuffer(max_size=3)  # legacy mode
+    rb.save_game(_build_warmstart_history([0.0], game_outcome=0.0))  # warm
+    for _ in range(3):
+        gh = _build_warmstart_history([0.0], game_outcome=0.0)
+        gh.external_values = []  # self-play
+        rb.save_game(gh)
+    # Single-pool FIFO: 4 saved past cap=3 → oldest evicted = the warmstart.
+    assert len(rb.buffer) == 3
+    assert all(not g.external_values for g in rb.buffer)
+
+
+def test_sample_batch_returns_is_warmstart_mask():
+    """sample_batch exposes an is_warmstart mask aligned with game_indices."""
+    rb = ReplayBuffer(max_size=20, warmstart_max_size=5)
+    for _ in range(3):
+        rb.save_game(_build_warmstart_history([0.0, 0.0], game_outcome=0.0))
+    for _ in range(3):
+        gh = _build_warmstart_history([0.0, 0.0], game_outcome=0.0)
+        gh.external_values = []
+        rb.save_game(gh)
+    np.random.seed(0)
+    batch, idxs, _ = rb.sample_batch(
+        batch_size=10, num_unroll_steps=1, td_steps=-1, discount=1.0,
+        action_space_size=ChessGame().action_space_size,
+        value_head_type="wdl",
+        warmstart_sample_frac=0.5,
+    )
+    assert "is_warmstart" in batch
+    mask = batch["is_warmstart"].numpy()
+    assert mask.dtype == bool
+    assert mask.shape == (10,)
+    # Mask should match the buffer membership lookups.
+    expected = np.array(
+        [bool(rb.buffer[i].external_values) for i in idxs], dtype=bool
+    )
+    np.testing.assert_array_equal(mask, expected)
+    # With frac=0.5, exactly 5 should be warmstart.
+    assert mask.sum() == 5
+
+
 def test_make_target_support_head_unchanged():
     """Backwards compat: support-head path returns scalars (default value_head_type)."""
     gh = _build_chess_game_history(outcome=1.0, n_plies=6)

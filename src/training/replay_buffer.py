@@ -382,8 +382,17 @@ class ReplayBuffer:
     With alpha=0 or beta=1, degrades gracefully to uniform sampling.
     """
 
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, warmstart_max_size: int | None = None):
         self.max_size = max_size
+        # Two-pool FIFO mode. When ``warmstart_max_size`` is set, the buffer is
+        # logically partitioned by ``external_values``: warmstart games (set)
+        # vs self-play games (unset). Each pool evicts independently within its
+        # own cap, so warmstart games can never be FIFO'd out by incoming
+        # self-play traffic. Required for ``warmstart_sample_frac > 0`` to keep
+        # working past the warmstart-pool exhaustion phase. Without it,
+        # warmstart games age out within ~10 self-play rounds and the
+        # stratified sampler silently degrades to flat sampling.
+        self.warmstart_max_size = warmstart_max_size
         self.buffer: list[GameHistory] = []
         self._priorities: list[float] = []
         self.total_games = 0
@@ -391,9 +400,29 @@ class ReplayBuffer:
     def save_game(self, game_history: GameHistory):
         # New games get max current priority so they're sampled at least once
         max_p = max(self._priorities) if self._priorities else 1.0
-        if len(self.buffer) >= self.max_size:
-            self.buffer.pop(0)
-            self._priorities.pop(0)
+        is_warm = bool(game_history.external_values)
+        if self.warmstart_max_size is not None:
+            # Two-pool eviction: count games in the relevant pool; if at cap,
+            # evict the oldest game in THAT pool only. Cross-pool eviction
+            # never happens, so a warmstart game cannot be displaced by an
+            # incoming self-play game (or vice versa).
+            sp_max = self.max_size - self.warmstart_max_size
+            cap = self.warmstart_max_size if is_warm else sp_max
+            cur = sum(
+                1 for g in self.buffer
+                if bool(g.external_values) == is_warm
+            )
+            if cur >= cap:
+                for i, g in enumerate(self.buffer):
+                    if bool(g.external_values) == is_warm:
+                        self.buffer.pop(i)
+                        self._priorities.pop(i)
+                        break
+        else:
+            # Legacy single-pool FIFO eviction.
+            if len(self.buffer) >= self.max_size:
+                self.buffer.pop(0)
+                self._priorities.pop(0)
         self.buffer.append(game_history)
         self._priorities.append(max_p)
         self.total_games += 1
@@ -508,6 +537,15 @@ class ReplayBuffer:
 
         target_observations_t = torch.stack(target_observations)  # (B, K+1, C, H, W)
 
+        # Per-sample warmstart membership — lets the trainer log per-stratum
+        # losses (warmstart vs self-play) so we can detect lever-2 health
+        # (warmstart loss → 0 while self-play diverges signals overfitting on
+        # the anchor; both staying high signals the anchor is too small).
+        is_warmstart = np.array(
+            [bool(self.buffer[i].external_values) for i in game_indices],
+            dtype=bool,
+        )
+
         batch = {
             # Root obs (k=0) kept at "observations" for back-compat with callers that
             # only need the initial inference input.
@@ -521,6 +559,7 @@ class ReplayBuffer:
             "target_values": torch.from_numpy(np.asarray(values_batch, dtype=np.float32)),
             "target_rewards": torch.tensor(rewards_batch, dtype=torch.float32),
             "target_policies": torch.from_numpy(np.stack(policies_batch)),
+            "is_warmstart": torch.from_numpy(is_warmstart),
         }
         return batch, game_indices, weights
 

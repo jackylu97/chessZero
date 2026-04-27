@@ -53,6 +53,14 @@ class MuZeroConfig:
     # Replay buffer
     replay_buffer_size: int = 5000  # number of games
     min_buffer_size: int = 50  # min games before training starts
+    # Two-pool FIFO mode. When set, ``replay_buffer_size`` is partitioned into
+    # a warmstart pool of this size and a self-play pool of
+    # ``replay_buffer_size - warmstart_buffer_size``; each pool evicts FIFO
+    # within its own cap. Required for ``warmstart_sample_frac > 0`` to remain
+    # effective past pool exhaustion — without it, single-pool FIFO drains
+    # warmstart games as self-play arrives and the stratified sampler silently
+    # degrades to flat. None = legacy single-pool FIFO.
+    warmstart_buffer_size: int | None = None
     # Cap the number of most-recent self-play games persisted to .buf per
     # checkpoint. None = no cap (save everything the in-memory buffer holds).
     # The in-memory buffer is unaffected; only the on-disk snapshot is trimmed.
@@ -283,6 +291,13 @@ def get_config(game: str) -> MuZeroConfig:
                                         # games displaced shorter stockfish ones).
                                         # Revert to 5000 once compact GameHistory
                                         # encoding lands (see plan_compact_gamehistory_encoding.md).
+            warmstart_buffer_size=1000, # Reserve 1000/2500 slots for the warmstart pool;
+                                        # the remaining 1500 hold self-play games. Each
+                                        # pool evicts FIFO within its own cap, so the
+                                        # warmstart anchor for `warmstart_sample_frac=0.4`
+                                        # survives past pool exhaustion. With ~80 plies/game,
+                                        # 1000 distinct Stockfish games provides ~80k
+                                        # positions to draw from, plenty for 102 batch slots.
             min_buffer_size=500,
             num_self_play_games=256,   # one num_parallel_games sweep per round
             self_play_interval=512,   # 2:1 train:selfplay ratio

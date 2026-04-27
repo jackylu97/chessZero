@@ -85,7 +85,10 @@ class MuZeroTrainer:
             self.scheduler = decay_scheduler
 
         self.scaler = GradScaler("cuda", enabled=config.use_amp)
-        self.replay_buffer = ReplayBuffer(config.replay_buffer_size)
+        self.replay_buffer = ReplayBuffer(
+            config.replay_buffer_size,
+            warmstart_max_size=getattr(config, "warmstart_buffer_size", None),
+        )
 
         self.writer = SummaryWriter(log_dir=os.path.join(log_dir, config.game, run_id))
         self.global_step = 0
@@ -521,6 +524,26 @@ class MuZeroTrainer:
             policy_entropy_target = -(
                 tgt_probs * (tgt_probs + 1e-12).log()
             ).sum(dim=-1).mean().item()
+
+            # Per-stratum loss: warmstart vs self-play. Lever-2 health probes:
+            #   - both staying high → anchor too small to absorb teaching
+            #   - warmstart→0 while self-play diverges → overfitting on anchor
+            #   - both falling together → working as intended
+            # NaN when a stratum is empty in this batch (rare under stratified
+            # sampling, common before pool exhaustion / after lever decays).
+            is_warm = batch["is_warmstart"].to(self.device)
+            n_warm = int(is_warm.sum().item())
+            n_sp = is_warm.numel() - n_warm
+            policy_per_sample = (outer_scale * policy_loss).detach().float()
+            value_per_sample = (outer_scale * value_loss).detach().float()
+            policy_loss_warm = (policy_per_sample[is_warm].mean().item()
+                                if n_warm > 0 else float("nan"))
+            policy_loss_self = (policy_per_sample[~is_warm].mean().item()
+                                if n_sp > 0 else float("nan"))
+            value_loss_warm = (value_per_sample[is_warm].mean().item()
+                               if n_warm > 0 else float("nan"))
+            value_loss_self = (value_per_sample[~is_warm].mean().item()
+                               if n_sp > 0 else float("nan"))
         self.replay_buffer.update_priorities(game_indices, td_errors, self.config.per_epsilon)
 
         return {
@@ -540,6 +563,11 @@ class MuZeroTrainer:
             "value_loss_weight": float(value_weight),
             "policy_entropy_pred": policy_entropy_pred,
             "policy_entropy_target": policy_entropy_target,
+            "policy_loss_warmstart": policy_loss_warm,
+            "policy_loss_selfplay": policy_loss_self,
+            "value_loss_warmstart": value_loss_warm,
+            "value_loss_selfplay": value_loss_self,
+            "batch_warmstart_frac": (n_warm / max(1, is_warm.numel())),
         }
 
     @torch.no_grad()
@@ -669,14 +697,22 @@ class MuZeroTrainer:
         # groups them sensibly.
         value_keys = {"value_mae", "value_target_std", "value_loss_weight"}
         policy_keys = {"policy_entropy_pred", "policy_entropy_target"}
+        train_keys = {"batch_warmstart_frac"}
         for key, value in loss_info.items():
-            if key in ("grad_norm", "amp_scale"):
+            if key in ("grad_norm", "amp_scale") or key in train_keys:
                 self.writer.add_scalar(f"train/{key}", value, step)
             elif key in value_keys:
                 self.writer.add_scalar(f"value/{key[len('value_'):]}", value, step)
             elif key in policy_keys:
                 self.writer.add_scalar(f"policy/{key[len('policy_'):]}", value, step)
             else:
+                # Per-stratum keys (policy_loss_warmstart etc.) and the rest
+                # land in loss/ alongside the aggregate counterparts so they
+                # graph next to each other in TB.
+                # NaN-skip: tensorboard treats NaN as a real point and grays
+                # the curve; emit nothing when the stratum was empty.
+                if isinstance(value, float) and value != value:  # NaN
+                    continue
                 self.writer.add_scalar(f"loss/{key}", value, step)
         self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], step)
         self.writer.add_scalar("train/per_beta", self.config.per_beta_init + (1.0 - self.config.per_beta_init) * (
