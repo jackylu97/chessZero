@@ -40,20 +40,26 @@ TRAIN_LOG="chess_train.log"
 GAME=""
 RUN_ID=""
 INITIAL_RESUME=""
+RESET_INJECTION_CURSOR=0
 PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help)         usage; exit 0 ;;
-    --max-retries)     MAX_RETRIES="$2"; shift 2 ;;
-    --max-no-progress) MAX_NO_PROGRESS="$2"; shift 2 ;;
-    --backoff-base)    BACKOFF_BASE="$2"; shift 2 ;;
-    --backoff-cap)     BACKOFF_CAP="$2"; shift 2 ;;
-    --train-log)       TRAIN_LOG="$2"; shift 2 ;;
-    --game)            GAME="$2"; PASSTHROUGH+=("$1" "$2"); shift 2 ;;
-    --run-id)          RUN_ID="$2"; PASSTHROUGH+=("$1" "$2"); shift 2 ;;
-    --resume)          INITIAL_RESUME="$2"; shift 2 ;;
-    *)                 PASSTHROUGH+=("$1"); shift ;;
+    -h|--help)                 usage; exit 0 ;;
+    --max-retries)             MAX_RETRIES="$2"; shift 2 ;;
+    --max-no-progress)         MAX_NO_PROGRESS="$2"; shift 2 ;;
+    --backoff-base)            BACKOFF_BASE="$2"; shift 2 ;;
+    --backoff-cap)             BACKOFF_CAP="$2"; shift 2 ;;
+    --train-log)               TRAIN_LOG="$2"; shift 2 ;;
+    --game)                    GAME="$2"; PASSTHROUGH+=("$1" "$2"); shift 2 ;;
+    --run-id)                  RUN_ID="$2"; PASSTHROUGH+=("$1" "$2"); shift 2 ;;
+    --resume)                  INITIAL_RESUME="$2"; shift 2 ;;
+    # First-attempt-only: passes through with --resume on attempt 1, dropped
+    # on retries. Resetting on every retry would clobber partially-advanced
+    # cursors (an early-crash retry would re-inject the warmstart pool from
+    # scratch, losing per-step injection progress).
+    --reset-injection-cursor)  RESET_INJECTION_CURSOR=1; shift ;;
+    *)                         PASSTHROUGH+=("$1"); shift ;;
   esac
 done
 
@@ -104,7 +110,12 @@ while true; do
   resume_args=()
   if [[ $retry -eq 0 && -n "$INITIAL_RESUME" ]]; then
     resume_args=(--resume "$INITIAL_RESUME")
-    sup_log "attempt $((retry+1)): user-supplied --resume $INITIAL_RESUME"
+    if [[ $RESET_INJECTION_CURSOR -eq 1 ]]; then
+      resume_args+=(--reset-injection-cursor)
+      sup_log "attempt $((retry+1)): user-supplied --resume $INITIAL_RESUME (with --reset-injection-cursor)"
+    else
+      sup_log "attempt $((retry+1)): user-supplied --resume $INITIAL_RESUME"
+    fi
   elif [[ -n "$step" ]]; then
     resume_args=(--resume "$CHECKPOINT_DIR/checkpoint_${step}.pt")
     sup_log "attempt $((retry+1)): resume from step $step"

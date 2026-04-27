@@ -82,6 +82,14 @@ def main():
                              "warmstart, instead of bucket-sequential curriculum order). "
                              "Pass a negative value to disable shuffling (consume in sorted "
                              "alphabetical order — legacy behavior, reproducible across resumes).")
+    parser.add_argument("--reset-injection-cursor", action="store_true",
+                        help="After --resume, reset the Stockfish injection cursor to 0 so "
+                             "the warmstart pool re-fills from the start. Required when "
+                             "resuming into a checkpoint whose injection_loaded=pool_size "
+                             "but you want lever-2 (warmstart_sample_frac) to actually "
+                             "have warmstart games to anchor on. The model is allowed to "
+                             "see the same teacher games multiple times across resumes — "
+                             "that is the point of the anchor.")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -157,6 +165,11 @@ def main():
 
     if args.resume:
         trainer.load_checkpoint(args.resume)
+        if args.reset_injection_cursor:
+            old_cursor = trainer._injection_loaded
+            trainer._injection_loaded = 0
+            print(f"Reset Stockfish injection cursor: {old_cursor} → 0 "
+                  f"(--reset-injection-cursor)")
 
     if args.stockfish_injection_path:
         import glob
