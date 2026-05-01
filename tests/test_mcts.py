@@ -290,7 +290,13 @@ def test_backpropagate_syncs_parent_arrays_with_children():
 
 
 def test_backpropagate_alternates_value_sign():
-    """Signs alternate along the path (two-player zero-sum)."""
+    """Signs alternate along the path (two-player zero-sum).
+
+    Form B convention: ``value`` enters at the leaf in leaf-POV; the recurrence
+    ``value = node.reward - γ·value`` flips perspective at each ply going up.
+    With reward = 0 along the path this matches the previous depth-parity
+    sign trick: leaf gets +V_leaf, root (one ply up) gets -V_leaf.
+    """
     mcts = _make_mcts()
     root = _make_node(3, seed=5, parent_visits=0)
     # Reset children's stats so we can observe deltas cleanly.
@@ -307,8 +313,86 @@ def test_backpropagate_alternates_value_sign():
     path_indices = [-1, 0]
 
     mcts._backpropagate(search_path, path_indices, value=1.0, min_max_stats=MinMaxStats())
-    # Leaf (depth=n-1): sign=+1 → +1.0. Root (depth=0): sign=-1 → -1.0.
+    # Leaf gets +V_leaf in its own POV; root sees the parent-POV negation.
     assert c.value_sum == pytest.approx(1.0)
+    assert root.value_sum == pytest.approx(-1.0)
+
+
+def test_select_child_prefers_winning_child():
+    """Regression: PUCT must push selection TOWARD a child with high mover-POV
+    reward (predicted +1 for a winning move), not away from it.
+
+    Pre-fix: ``raw_q = -reward - γ·child.value`` made +1 reward look like a
+    losing Q (-1), and the search ran AWAY from winning lines.
+    Post-fix: ``raw_q = +reward - γ·child.value`` makes +1 reward look like
+    a winning Q (+1), and the search heads TOWARD it.
+    """
+    mcts = _make_mcts()
+    node = MCTSNode(visit_count=10)
+    k = 3
+    # All children have the same prior and the same accumulated child value.
+    # The only difference is child_rewards: child 1 has +1 (winning move),
+    # the others have 0. Pre-warm visits and value_sums so the value_score
+    # branch activates.
+    node.child_actions = np.arange(k, dtype=np.int64)
+    node.child_priors = np.full(k, 1.0 / k, dtype=np.float64)
+    node.child_visits = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+    node.child_rewards = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    node.child_value_sums = np.zeros(k, dtype=np.float64)
+    node.children = [None] * k
+
+    stats = MinMaxStats()
+    # Prime min/max with a representative range so normalization activates.
+    stats.update(0.0)
+    stats.update(1.0)
+
+    loop_action, loop_idx, _ = mcts._select_child_loop(node, stats)
+    vec_action, vec_idx, _ = mcts._select_child_vectorized(node, stats)
+    assert loop_idx == 1, "loop path failed to select winning child"
+    assert vec_idx == 1, "vectorized path failed to select winning child"
+    assert loop_action == 1 and vec_action == 1
+
+
+def test_backpropagate_winning_leaf_is_positive_at_mover_parent():
+    """Regression: with mover-POV reward, a leaf that was just reached by a
+    winning move must back-propagate as +1 at the parent who made the move
+    (in that parent's own POV) and as -1 one ply up (the opposite player).
+
+    This is the exact signal that drives the search toward winning lines.
+    Pre-fix the value_sum flowed with the wrong sign at terminals.
+    """
+    mcts = _make_mcts()
+    # Build path [root, c1, leaf] where the action from c1 → leaf was a
+    # checkmate by c1's mover. So leaf.reward = +1 in c1's POV.
+    root = MCTSNode(visit_count=0)
+    root.child_actions = np.array([0], dtype=np.int64)
+    root.child_priors = np.array([1.0])
+    root.child_visits = np.zeros(1)
+    root.child_rewards = np.zeros(1)
+    root.child_value_sums = np.zeros(1)
+    c1 = MCTSNode(visit_count=0, value_sum=0.0, reward=0.0)
+    root.children = [c1]
+
+    c1.child_actions = np.array([0], dtype=np.int64)
+    c1.child_priors = np.array([1.0])
+    c1.child_visits = np.zeros(1)
+    c1.child_rewards = np.zeros(1)
+    c1.child_value_sums = np.zeros(1)
+    leaf = MCTSNode(visit_count=0, value_sum=0.0, reward=1.0)
+    c1.children = [leaf]
+
+    search_path = [root, c1, leaf]
+    path_indices = [-1, 0, 0]
+    # Network value at the (terminal) leaf: 0 by convention; the win shows up
+    # in the predicted reward.
+    mcts._backpropagate(search_path, path_indices, value=0.0,
+                        min_max_stats=MinMaxStats())
+
+    # Leaf: V_leaf = 0 → leaf.value_sum = 0.
+    assert leaf.value_sum == pytest.approx(0.0)
+    # c1's POV: it just delivered mate → +1 expected return through this leaf.
+    assert c1.value_sum == pytest.approx(1.0)
+    # Root's POV: c1 (the opponent) is winning → -1 expected return.
     assert root.value_sum == pytest.approx(-1.0)
 
 

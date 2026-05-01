@@ -283,7 +283,13 @@ class MCTS:
             v = visits[i]
             prior_score = pb_c * priors[i] * sqrt_n / (1.0 + v)
             if v > 0:
-                raw_q = -rewards[i] - discount * (value_sums[i] / v)
+                # Mover-POV Q at this child:
+                #   Q(parent POV) = child.reward + γ * V(child)_parent_POV
+                #                 = child.reward + γ * (-child.value_child_POV)
+                #                 = child.reward - γ * child.value
+                # child.value_sums/v is stored in the child's own POV (see
+                # _backpropagate) — flip via the -γ · child.value term.
+                raw_q = rewards[i] - discount * (value_sums[i] / v)
                 value_score = (raw_q - mm_min) / mm_span if has_range else raw_q
             else:
                 value_score = 0.0
@@ -307,7 +313,8 @@ class MCTS:
 
         with np.errstate(invalid="ignore", divide="ignore"):
             child_values = np.where(visits > 0, value_sums / np.maximum(visits, 1.0), 0.0)
-        raw_q = -rewards - self.config.discount * child_values
+        # Mover-POV Q (see _select_child_loop for the derivation).
+        raw_q = rewards - self.config.discount * child_values
 
         if min_max_stats.maximum > min_max_stats.minimum:
             normalized_q = (raw_q - min_max_stats.minimum) / (min_max_stats.maximum - min_max_stats.minimum)
@@ -325,13 +332,21 @@ class MCTS:
 
         path_indices[i] is the index of search_path[i] in search_path[i-1]'s
         child arrays (or -1 for the root, which has no parent).
+
+        Sign convention (mover-POV, matches game.step + the trainer reward
+        target). On entry ``value`` is the leaf network's V_leaf in the leaf
+        player's POV. At each iteration ``value`` is in the frame of ``node``,
+        so it is added to ``node.value_sum`` directly. To re-express it in the
+        parent's frame for the next iteration we apply
+        ``value = node.reward - γ · value`` — node.reward is from the parent
+        (mover) POV already, and -γ·value flips the leaf's-POV cumulative into
+        the parent's POV (two-player zero-sum: each ply up swaps perspectives).
         """
         n = len(search_path)
         for depth in range(n - 1, -1, -1):
             node = search_path[depth]
-            sign = 1.0 if ((n - 1 - depth) % 2 == 0) else -1.0
             node.visit_count += 1
-            node.value_sum += value * sign
+            node.value_sum += value
 
             if depth > 0:
                 parent = search_path[depth - 1]
@@ -341,9 +356,10 @@ class MCTS:
                 parent.child_rewards[idx] = node.reward
 
             if node.visit_count > 0:
-                min_max_stats.update(-node.reward - self.config.discount * node.value)
+                # Mover-POV Q used by selection — must match _select_child.
+                min_max_stats.update(node.reward - self.config.discount * node.value)
 
-            value = node.reward + self.config.discount * value
+            value = node.reward - self.config.discount * value
 
 
 def _masked_softmax_np(logits: np.ndarray, legal_actions: np.ndarray) -> np.ndarray:
@@ -418,7 +434,8 @@ class BatchedMCTS(MCTS):
             child_values = np.where(
                 visits > 0, value_sums / np.maximum(visits, 1.0), 0.0
             )
-        raw_q = -rewards - self.config.discount * child_values
+        # Mover-POV Q (matches _select_child).
+        raw_q = rewards - self.config.discount * child_values
         if mm.maximum > mm.minimum:
             q_norm = (raw_q - mm.minimum) / (mm.maximum - mm.minimum)
         else:
@@ -703,14 +720,14 @@ def select_action_gumbel(
     sampled_value_sums = root.child_value_sums.astype(np.float64)
     perturbed = root.root_sampled_perturbed
 
-    # Raw Q at each sampled child (perspective flip + reward — matches PUCT).
+    # Mover-POV Q at each sampled child (matches PUCT).
     with np.errstate(invalid="ignore", divide="ignore"):
         sampled_child_values = np.where(
             sampled_visits > 0,
             sampled_value_sums / np.maximum(sampled_visits, 1.0),
             0.0,
         )
-    raw_q_sampled = -sampled_rewards - config.discount * sampled_child_values
+    raw_q_sampled = sampled_rewards - config.discount * sampled_child_values
 
     # Softmax over legal logits — used as π in v_mix.
     shifted = legal_logits - legal_logits.max()
