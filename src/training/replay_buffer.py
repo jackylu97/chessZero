@@ -261,7 +261,16 @@ class GameHistory:
                         value += (discount ** td_steps) * sign * self.root_values[bootstrap_idx]
 
                 values.append(value)
-                rewards.append(self.rewards[idx] if idx < len(self.rewards) else 0.0)
+                # DeepMind MuZero convention: target_rewards[i] is the reward of the
+                # transition INTO state (state_index + i), i.e. self.rewards[idx - 1].
+                # target_rewards[0] is therefore the reward INTO the root and is unused
+                # by the trainer (initial_inference predicts no reward). The trainer
+                # reads target_rewards[:, k+1] at unroll step k, which under this
+                # indexing equals self.rewards[state_index + k] — the reward of
+                # transition s_{state_index+k} → s_{state_index+k+1}, which is exactly
+                # what recurrent_inference(hidden_k, actions[:, k]) predicts.
+                prev = idx - 1
+                rewards.append(self.rewards[prev] if 0 <= prev < len(self.rewards) else 0.0)
 
                 policy = self.policies[idx] if idx < len(self.policies) else None
                 if policy is None or len(policy) == 0:
