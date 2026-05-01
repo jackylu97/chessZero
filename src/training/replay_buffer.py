@@ -253,7 +253,11 @@ class GameHistory:
                     value = 0.0
                     for j in range(idx, min(bootstrap_idx, len(self))):
                         r = self.rewards[j] if j < len(self.rewards) else 0.0
-                        value += (discount ** (j - idx)) * r
+                        # 2-player zero-sum: self.rewards[j] is in the mover-at-j
+                        # POV; rebase to the STM-at-idx POV by flipping when the
+                        # plies have opposite parity.
+                        parity = 1.0 if ((j % 2) == (idx % 2)) else -1.0
+                        value += (discount ** (j - idx)) * parity * r
                     # root_values has one fewer entry than observations (no root_value
                     # for the terminal observation), so guard against that off-by-one.
                     if bootstrap_idx < len(self.root_values):
