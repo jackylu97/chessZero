@@ -223,6 +223,13 @@ class MuZeroConfig:
     pred_hid: int = 512
     pred_out: int = 1024
 
+    # GPU-resident chess env. When True (chess only), self-play env ops
+    # (to_tensor / legal_actions / step) run as batched torch ops via
+    # GpuChessGame instead of per-game python-chess calls. The MCTS itself
+    # is unchanged. Cross-validated against python-chess on 50k random
+    # positions and 1k random-play games. See plan_gpu_chess_engine.md.
+    use_gpu_chess: bool = False
+
     # Multi-game (Phase 2)
     multi_game: bool = False
     games: list[str] = field(default_factory=lambda: ["tictactoe"])

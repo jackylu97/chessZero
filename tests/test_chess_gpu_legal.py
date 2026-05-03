@@ -3,6 +3,7 @@
 ChessGame is the oracle. Every legal action set the GPU code produces must
 exactly match python-chess's `legal_moves` (encoded via `_move_to_action`).
 """
+import gc
 import random
 
 import chess
@@ -101,19 +102,51 @@ def test_legal_mask_random_small_corpus():
 
     Surfaces EP-pins, castling-through-check, double-check, and other edge
     cases that the smaller obs/attacks corpora don't reach.
+
+    Chunked at 5k positions/chunk: the legal_mask path allocates ~25 MB per
+    intermediate `(N, 64)` int64 tensor over ~2.5k Python-loop allocations
+    (Kogge-Stone slider attacks × 8 directions × 64 from-squares). At
+    N=50k that pegs WSL's allocator into 1-2 GB of cached churn, which
+    on this box has historically tripped Hyper-V instability. 5k×10
+    keeps peak working set bounded and forces allocator reuse via gc.
     """
-    boards = _random_positions(50_000, seed=99)
+    chunk_size = 5_000
+    n_total = 50_000
+    seed = 99
     gg = GpuChessGame()
-    state = gg.from_python_chess(boards)
-    mask = gg.legal_mask(state)
+
+    # Generate positions chunk-by-chunk to bound python-chess board memory too.
+    rng = random.Random(seed)
     fails: list[tuple[int, str]] = []
-    for i, b in enumerate(boards):
-        oracle = _oracle_legal_set(b)
-        got = _gpu_legal_set(mask[i])
-        if got != oracle:
-            fails.append((i, _diff_report(b, oracle, got)))
-            if len(fails) >= 3:
-                break
+    n_seen = 0
+    while n_seen < n_total and len(fails) < 3:
+        chunk_n = min(chunk_size, n_total - n_seen)
+        boards: list[chess.Board] = []
+        while len(boards) < chunk_n:
+            b = chess.Board()
+            n_plies = rng.randint(0, 80)
+            for _ in range(n_plies):
+                if b.is_game_over(claim_draw=False):
+                    break
+                b.push(rng.choice(list(b.legal_moves)))
+            boards.append(b.copy())
+
+        state = gg.from_python_chess(boards)
+        mask = gg.legal_mask(state)
+        for i, b in enumerate(boards):
+            oracle = _oracle_legal_set(b)
+            got = _gpu_legal_set(mask[i])
+            if got != oracle:
+                fails.append((n_seen + i, _diff_report(b, oracle, got)))
+                if len(fails) >= 3:
+                    break
+        n_seen += chunk_n
+
+        # Drop refs + force gc so allocator reuses memory across chunks
+        # rather than letting cached intermediates accumulate.
+        del state, mask, boards
+        gc.collect()
+
     if fails:
         msg = "\n\n".join(f"--- position {i} ---{rep}" for i, rep in fails)
-        raise AssertionError(f"{len(fails)} divergences in 100 positions:\n{msg}")
+        raise AssertionError(f"{len(fails)} divergences in {n_seen} positions:\n{msg}")

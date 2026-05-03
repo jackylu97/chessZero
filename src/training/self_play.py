@@ -160,6 +160,124 @@ def play_games_parallel(
     return histories
 
 
+def play_games_parallel_gpu(
+    network,
+    config,
+    num_games: int,
+    device: str = "cpu",
+    training_step: int = 0,
+) -> list[GameHistory]:
+    """GPU-resident batched self-play (Phase 5 of the GPU chess plan).
+
+    Same MCTS structure as `play_games_parallel`; the only difference is the
+    env. Per-game `to_tensor` / `legal_actions` / `step` calls are replaced
+    by single batched calls to `GpuChessGame`. MCTS internals are unchanged
+    (latent space — no game state needed past the root).
+
+    Currently chess-specific (only game with a `BatchedGame` impl).
+    """
+    from ..games.chess import ChessGame
+    from ..games.chess_gpu import GpuChessGame
+
+    network.eval()
+    chess_game = ChessGame()  # for MCTS action_space + legacy interface bits
+    gpu_game = GpuChessGame()
+    batched_mcts = BatchedMCTS(network, chess_game, config, device)
+    temp_init = get_temperature(training_step, config)
+    use_gumbel = bool(getattr(config, "use_gumbel", False))
+    action_space_size = chess_game.action_space_size
+    n_frames = getattr(config, "history_frames", 1)
+
+    state = gpu_game.reset_batch(num_games, device=device)
+    histories = [GameHistory(game_name=config.game) for _ in range(num_games)]
+    move_counts = [0] * num_games
+    active = list(range(num_games))
+
+    iteration = 0
+    log_every = 20
+
+    while active:
+        # One batched call each — replaces N per-game python-chess calls.
+        obs_batch = gpu_game.to_tensor_batch(state)        # (N, 19, 8, 8)
+        legal_mask_batch = gpu_game.legal_mask(state)      # (N, 4672) bool
+
+        # One bulk transfer to CPU; per-game Python iteration after.
+        obs_cpu = obs_batch.cpu()
+        legal_mask_cpu = legal_mask_batch.cpu()
+
+        single_frames_active: list[torch.Tensor] = []
+        legal_list_active: list[list[int]] = []
+        obs_list_active: list[torch.Tensor] = []
+        for g in active:
+            single_frame = obs_cpu[g]
+            legals = legal_mask_cpu[g].nonzero(as_tuple=True)[0].tolist()
+            single_frames_active.append(single_frame)
+            legal_list_active.append(legals)
+            obs_list_active.append(
+                stack_with_history(single_frame, histories[g].observations, n_frames)
+            )
+
+        roots = batched_mcts.run_batch(obs_list_active, legal_list_active, add_noise=True)
+
+        actions_per_game = [0] * num_games
+        for i, g in enumerate(active):
+            if use_gumbel:
+                action, action_probs = select_action_gumbel(roots[i], config, action_space_size)
+            else:
+                temp = temp_init if move_counts[g] < config.temperature_drop_step else config.temperature_final
+                action, action_probs = select_action(roots[i], temperature=temp)
+
+            histories[g].observations.append(single_frames_active[i])
+            histories[g].actions.append(action)
+            histories[g].policies.append(action_probs)
+            histories[g].root_values.append(roots[i].value)
+            histories[g].legal_actions_list.append(legal_list_active[i])
+
+            actions_per_game[g] = action
+            move_counts[g] += 1
+
+        # Step all games (done ones get sentinel action 0 — they're filtered
+        # below). step_batch keeps `state.done` sticky so re-stepping a
+        # finished game doesn't corrupt its outcome.
+        actions_tensor = torch.tensor(actions_per_game, dtype=torch.int64, device=state.device)
+        state, rewards, _ = gpu_game.step_batch(state, actions_tensor)
+        rewards_cpu = rewards.cpu().tolist()
+        done_cpu = state.done.cpu().tolist()
+        winner_cpu = state.winner.cpu().tolist()
+
+        still_active: list[int] = []
+        terminal_indices: list[int] = []
+        for g in active:
+            histories[g].rewards.append(rewards_cpu[g])
+            if done_cpu[g]:
+                histories[g].game_outcome = winner_cpu[g]
+                terminal_indices.append(g)
+            else:
+                still_active.append(g)
+
+        # Append terminal observations (matches play_games_parallel's contract).
+        if terminal_indices:
+            final_obs = gpu_game.to_tensor_batch(state).cpu()
+            for g in terminal_indices:
+                histories[g].observations.append(final_obs[g])
+
+        active = still_active
+        iteration += 1
+
+        if iteration % log_every == 0:
+            done = num_games - len(active)
+            done_lengths = [len(h.actions) for h in histories if h.game_outcome is not None]
+            avg_done = (sum(done_lengths) / len(done_lengths)) if done_lengths else 0.0
+            tqdm.write(
+                f"  self-play (gpu) batch: move {iteration}, "
+                f"{len(active)}/{num_games} active, "
+                f"{done} done"
+                + (f" (avg length {avg_done:.0f})" if done_lengths else "")
+            )
+
+    return histories
+
+
 def run_self_play(
     network,
     game: Game,
@@ -171,6 +289,28 @@ def run_self_play(
 ) -> list[GameHistory]:
     """Run multiple self-play games, using parallel batched MCTS when configured."""
     n_parallel = getattr(config, "num_parallel_games", 1)
+
+    # GPU-resident chess env path. Gated by config.use_gpu_chess (default off).
+    # Only kicks in for chess; other games still go through python-chess /
+    # python-state implementations.
+    use_gpu_chess = (
+        bool(getattr(config, "use_gpu_chess", False))
+        and config.game == "chess"
+        and n_parallel > 1
+    )
+    if use_gpu_chess:
+        histories = []
+        remaining = num_games
+        iterator = range(0, num_games, n_parallel)
+        if show_progress:
+            iterator = tqdm(iterator, desc="Self-play (gpu)", leave=False)
+        for _ in iterator:
+            batch = min(n_parallel, remaining)
+            histories.extend(
+                play_games_parallel_gpu(network, config, batch, device, training_step)
+            )
+            remaining -= batch
+        return histories
 
     if n_parallel > 1:
         histories = []
