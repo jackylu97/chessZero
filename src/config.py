@@ -70,6 +70,7 @@ class MuZeroConfig:
     num_self_play_games: int = 100  # games per self-play batch
     self_play_interval: int = 100  # training steps between self-play rounds
     num_parallel_games: int = 1    # games to run simultaneously in batched MCTS (1 = serial)
+    random_opening_plies: int = 0  # play N random legal moves before MCTS; 0 = disabled
 
     # AMP
     use_amp: bool = True
@@ -230,6 +231,21 @@ class MuZeroConfig:
     # positions and 1k random-play games. See plan_gpu_chess_engine.md.
     use_gpu_chess: bool = False
 
+    # Tensor-native MCTS. When True, the parallel batched self-play paths
+    # use TensorMCTS (GPU-resident tree, 0 syncs/sim, 1 sync/ply) instead of
+    # BatchedMCTS (numpy tree, 3 syncs/sim). Currently supports the Sampled
+    # MuZero §5.1 Proposed Modification only; Gumbel root is not yet
+    # implemented in the tensor path. See plan_tensor_mcts_implementation.md.
+    use_tensor_mcts: bool = False
+    # Storage dtype for the per-node hidden states in TensorMCTS. The
+    # node_hidden tensor is by far the dominant memory ([N, M, C, H, W]); at
+    # chess preset (N=256, M=401, C=256, H=W=8) it's ~6.7 GB at fp32 and
+    # ~3.4 GB at fp16. fp32 is safest; fp16 trades a small precision loss
+    # on stored latents (cast back to compute dtype before each
+    # recurrent_inference call) for ~2× memory headroom. "float32" or
+    # "float16".
+    tensor_mcts_hidden_dtype: str = "float32"
+
     # Multi-game (Phase 2)
     multi_game: bool = False
     games: list[str] = field(default_factory=lambda: ["tictactoe"])
@@ -342,6 +358,10 @@ def get_config(game: str) -> MuZeroConfig:
             td_steps=-1,                # Monte Carlo (full game return). Required by WDL —
                                         # n-step bootstrap doesn't compose with categorical
                                         # outcome targets. Matches AlphaZero / Lc0 design.
+            random_opening_plies=8,   # play N random legal moves before MCTS kicks in;
+                                        # diversifies self-play openings (untrained net
+                                        # produces near-identical games from start pos).
+                                        # 8 plies ≈ 4 moves/side, reaching common structures.
             temperature_drop_step=30,
             reanalyze_interval=1024,   # keep 1:1 with self_play_interval
             reanalyze_batch_size=256,

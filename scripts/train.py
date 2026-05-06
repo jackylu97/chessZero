@@ -90,6 +90,10 @@ def main():
                              "have warmstart games to anchor on. The model is allowed to "
                              "see the same teacher games multiple times across resumes — "
                              "that is the point of the anchor.")
+    parser.add_argument("--num-simulations", type=int, default=None,
+                        help="Override config.num_simulations.")
+    parser.add_argument("--num-parallel-games", type=int, default=None,
+                        help="Override config.num_parallel_games.")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -118,6 +122,10 @@ def main():
         config.stockfish_injection_games = args.stockfish_injection_games
     if args.stockfish_injection_interval is not None:
         config.stockfish_injection_interval = args.stockfish_injection_interval
+    if args.num_simulations is not None:
+        config.num_simulations = args.num_simulations
+    if args.num_parallel_games is not None:
+        config.num_parallel_games = args.num_parallel_games
 
     # Use CPU AMP settings appropriately
     if device == "cpu":

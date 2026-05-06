@@ -1,11 +1,49 @@
 """Self-play game generation for MuZero."""
 
+import random
+
+import numpy as np
 import torch
 from tqdm import tqdm
 
 from ..games.base import Game
 from ..mcts.mcts import MCTS, BatchedMCTS, select_action, select_action_gumbel
 from .replay_buffer import GameHistory, stack_with_history
+
+
+def _make_batched_mcts(network, game, config, device):
+    """Build the configured batched-MCTS implementation.
+
+    Default: numpy-backed ``BatchedMCTS``. With ``config.use_tensor_mcts``
+    set, swap in the GPU tensor-native ``TensorMCTS`` (0 syncs/sim, 1 sync/ply,
+    Sampled MuZero only — Gumbel root not yet implemented in the tensor path).
+    Both expose the same ``run_batch(observations, legal_actions_list,
+    add_noise=True)`` signature returning a list of ``MCTSNode``-equivalents.
+    """
+    if getattr(config, "use_tensor_mcts", False):
+        if getattr(config, "use_gumbel", False):
+            raise NotImplementedError(
+                "TensorMCTS does not support Gumbel root (use_gumbel=True). "
+                "Either disable use_gumbel or use BatchedMCTS."
+            )
+        from ..mcts.tensor_mcts import TensorMCTS
+        dtype_str = getattr(config, "tensor_mcts_hidden_dtype", "float32")
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        if dtype_str not in dtype_map:
+            raise ValueError(
+                f"Unknown tensor_mcts_hidden_dtype={dtype_str!r}; "
+                f"must be one of {list(dtype_map)}."
+            )
+        return TensorMCTS(
+            network, game, config,
+            device=device,
+            hidden_dtype=dtype_map[dtype_str],
+        )
+    return BatchedMCTS(network, game, config, device)
 
 
 def get_temperature(training_step: int, config) -> float:
@@ -47,23 +85,31 @@ def play_game(
 
     move_count = 0
     action_space_size = game.action_space_size
+    n_random = getattr(config, "random_opening_plies", 0)
     while not state.done:
         single_frame = game.to_tensor(state)
-        obs = stack_with_history(single_frame, history.observations, n_frames)
         legal = game.legal_actions(state)
 
-        if use_gumbel:
-            root = mcts_batched.run_batch([obs], [legal], add_noise=True)[0]
-            action, action_probs = select_action_gumbel(root, config, action_space_size)
+        if move_count < n_random:
+            action = random.choice(legal)
+            action_probs = np.zeros(action_space_size, dtype=np.float32)
+            action_probs[action] = 1.0
+            root_value = 0.0
         else:
-            root = mcts_serial.run(obs, legal, add_noise=True)
-            temp = temp_init if move_count < config.temperature_drop_step else config.temperature_final
-            action, action_probs = select_action(root, temperature=temp)
+            obs = stack_with_history(single_frame, history.observations, n_frames)
+            if use_gumbel:
+                root = mcts_batched.run_batch([obs], [legal], add_noise=True)[0]
+                action, action_probs = select_action_gumbel(root, config, action_space_size)
+            else:
+                root = mcts_serial.run(obs, legal, add_noise=True)
+                temp = temp_init if move_count < config.temperature_drop_step else config.temperature_final
+                action, action_probs = select_action(root, temperature=temp)
+            root_value = root.value
 
         history.observations.append(single_frame)
         history.actions.append(action)
         history.policies.append(action_probs)
-        history.root_values.append(root.value)
+        history.root_values.append(root_value)
         history.legal_actions_list.append(legal)
 
         state, reward, done = game.step(state, action)
@@ -90,7 +136,7 @@ def play_games_parallel(
     network forward pass per simulation step, amortizing GPU kernel overhead.
     """
     network.eval()
-    batched_mcts = BatchedMCTS(network, game, config, device)
+    batched_mcts = _make_batched_mcts(network, game, config, device)
     temp_init = get_temperature(training_step, config)
     use_gumbel = bool(getattr(config, "use_gumbel", False))
     action_space_size = game.action_space_size
@@ -100,6 +146,7 @@ def play_games_parallel(
     move_counts = [0] * num_games
     active = list(range(num_games))
     n_frames = getattr(config, "history_frames", 1)
+    n_random = getattr(config, "random_opening_plies", 0)
 
     iteration = 0
     log_every = 20  # emit a progress line every 20 lockstep moves (silent for fast games)
@@ -109,27 +156,43 @@ def play_games_parallel(
         # stack reconstruction) and T-frame stacks (passed to MCTS at inference time).
         single_frames = [game.to_tensor(states[g]) for g in active]
         legal_list = [game.legal_actions(states[g]) for g in active]
-        obs_list = [
-            stack_with_history(single_frames[i], histories[g].observations, n_frames)
-            for i, g in enumerate(active)
-        ]
 
-        roots = batched_mcts.run_batch(obs_list, legal_list, add_noise=True)
+        # Split active games into random-opening vs MCTS groups.
+        mcts_indices = [i for i, g in enumerate(active) if move_counts[g] >= n_random]
+
+        roots_by_active_idx: dict[int, object] = {}
+        if mcts_indices:
+            obs_list = [
+                stack_with_history(single_frames[i], histories[active[i]].observations, n_frames)
+                for i in mcts_indices
+            ]
+            legal_sub = [legal_list[i] for i in mcts_indices]
+            mcts_roots = batched_mcts.run_batch(obs_list, legal_sub, add_noise=True)
+            for j, i in enumerate(mcts_indices):
+                roots_by_active_idx[i] = mcts_roots[j]
 
         still_active = []
         for i, g in enumerate(active):
-            if use_gumbel:
-                action, action_probs = select_action_gumbel(roots[i], config, action_space_size)
+            if move_counts[g] < n_random:
+                action = random.choice(legal_list[i])
+                action_probs = np.zeros(action_space_size, dtype=np.float32)
+                action_probs[action] = 1.0
+                root_value = 0.0
             else:
-                temp = temp_init if move_counts[g] < config.temperature_drop_step else config.temperature_final
-                action, action_probs = select_action(roots[i], temperature=temp)
+                root = roots_by_active_idx[i]
+                if use_gumbel:
+                    action, action_probs = select_action_gumbel(root, config, action_space_size)
+                else:
+                    temp = temp_init if move_counts[g] < config.temperature_drop_step else config.temperature_final
+                    action, action_probs = select_action(root, temperature=temp)
+                root_value = root.value
 
             # Store the SINGLE-FRAME observation. Sample-time stacking rebuilds
             # the T-frame stack from per-ply observations.
             histories[g].observations.append(single_frames[i])
             histories[g].actions.append(action)
             histories[g].policies.append(action_probs)
-            histories[g].root_values.append(roots[i].value)
+            histories[g].root_values.append(root_value)
             histories[g].legal_actions_list.append(legal_list[i])
 
             state, reward, _ = game.step(states[g], action)
@@ -182,7 +245,7 @@ def play_games_parallel_gpu(
     network.eval()
     chess_game = ChessGame()  # for MCTS action_space + legacy interface bits
     gpu_game = GpuChessGame()
-    batched_mcts = BatchedMCTS(network, chess_game, config, device)
+    batched_mcts = _make_batched_mcts(network, chess_game, config, device)
     temp_init = get_temperature(training_step, config)
     use_gumbel = bool(getattr(config, "use_gumbel", False))
     action_space_size = chess_game.action_space_size
@@ -192,6 +255,7 @@ def play_games_parallel_gpu(
     histories = [GameHistory(game_name=config.game) for _ in range(num_games)]
     move_counts = [0] * num_games
     active = list(range(num_games))
+    n_random = getattr(config, "random_opening_plies", 0)
 
     iteration = 0
     log_every = 20
@@ -207,30 +271,45 @@ def play_games_parallel_gpu(
 
         single_frames_active: list[torch.Tensor] = []
         legal_list_active: list[list[int]] = []
-        obs_list_active: list[torch.Tensor] = []
         for g in active:
-            single_frame = obs_cpu[g]
-            legals = legal_mask_cpu[g].nonzero(as_tuple=True)[0].tolist()
-            single_frames_active.append(single_frame)
-            legal_list_active.append(legals)
-            obs_list_active.append(
-                stack_with_history(single_frame, histories[g].observations, n_frames)
+            single_frames_active.append(obs_cpu[g])
+            legal_list_active.append(
+                legal_mask_cpu[g].nonzero(as_tuple=True)[0].tolist()
             )
 
-        roots = batched_mcts.run_batch(obs_list_active, legal_list_active, add_noise=True)
+        # Only run MCTS for games past the random-opening phase.
+        mcts_active_indices = [i for i, g in enumerate(active) if move_counts[g] >= n_random]
+        roots_by_active_idx: dict[int, object] = {}
+        if mcts_active_indices:
+            obs_list_mcts = [
+                stack_with_history(single_frames_active[i], histories[active[i]].observations, n_frames)
+                for i in mcts_active_indices
+            ]
+            legal_list_mcts = [legal_list_active[i] for i in mcts_active_indices]
+            mcts_roots = batched_mcts.run_batch(obs_list_mcts, legal_list_mcts, add_noise=True)
+            for j, i in enumerate(mcts_active_indices):
+                roots_by_active_idx[i] = mcts_roots[j]
 
         actions_per_game = [0] * num_games
         for i, g in enumerate(active):
-            if use_gumbel:
-                action, action_probs = select_action_gumbel(roots[i], config, action_space_size)
+            if move_counts[g] < n_random:
+                action = random.choice(legal_list_active[i])
+                action_probs = np.zeros(action_space_size, dtype=np.float32)
+                action_probs[action] = 1.0
+                root_value = 0.0
             else:
-                temp = temp_init if move_counts[g] < config.temperature_drop_step else config.temperature_final
-                action, action_probs = select_action(roots[i], temperature=temp)
+                root = roots_by_active_idx[i]
+                if use_gumbel:
+                    action, action_probs = select_action_gumbel(root, config, action_space_size)
+                else:
+                    temp = temp_init if move_counts[g] < config.temperature_drop_step else config.temperature_final
+                    action, action_probs = select_action(root, temperature=temp)
+                root_value = root.value
 
             histories[g].observations.append(single_frames_active[i])
             histories[g].actions.append(action)
             histories[g].policies.append(action_probs)
-            histories[g].root_values.append(roots[i].value)
+            histories[g].root_values.append(root_value)
             histories[g].legal_actions_list.append(legal_list_active[i])
 
             actions_per_game[g] = action
