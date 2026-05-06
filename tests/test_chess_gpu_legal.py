@@ -14,7 +14,7 @@ from src.games.chess_gpu import GpuChessGame
 
 
 def _oracle_legal_set(board: chess.Board) -> set[int]:
-    return {_move_to_action(m) for m in board.legal_moves}
+    return {_move_to_action(m, board.turn) for m in board.legal_moves}
 
 
 def _gpu_legal_set(mask_row: torch.Tensor) -> set[int]:
@@ -75,7 +75,7 @@ def test_legal_mask_ep_pin_horizontal():
     oracle = _oracle_legal_set(b)
     # Sanity: make sure oracle has the right shape (king moves + maybe a push,
     # but NOT the f5xg6 EP capture).
-    f5xg6_action = _move_to_action(chess.Move(chess.F5, chess.G6))
+    f5xg6_action = _move_to_action(chess.Move(chess.F5, chess.G6), b.turn)
     assert f5xg6_action not in oracle, "oracle should reject f5xg6 EP"
 
     gg = GpuChessGame()

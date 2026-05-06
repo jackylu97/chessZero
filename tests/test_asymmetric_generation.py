@@ -169,7 +169,7 @@ def game():
 def _uci_from_action(board: chess.Board, action: int) -> str:
     """Decode an action index back to a UCI string via the legal-move map."""
     for m in board.legal_moves:
-        if _move_to_action(m) == action:
+        if _move_to_action(m, board.turn) == action:
             return m.uci()
     raise ValueError(f"action {action} not legal from {board.fen()}")
 

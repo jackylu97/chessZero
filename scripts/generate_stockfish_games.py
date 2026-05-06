@@ -81,12 +81,12 @@ def multipv_to_soft_policy(
         dtype=np.float64,
     )
     if len(moves) == 1 or tau_label <= 0.0:
-        policy[_move_to_action(moves[0])] = 1.0
+        policy[_move_to_action(moves[0], pov)] = 1.0
         return policy
     w = np.exp((evals - evals.max()) / tau_label)
     w /= w.sum()
     for move, p in zip(moves, w):
-        policy[_move_to_action(move)] = float(p)
+        policy[_move_to_action(move, pov)] = float(p)
     return policy
 
 
@@ -168,7 +168,7 @@ def generate_one_game(
         # Record position + chosen action. Policy target is soft top-K from
         # the SAME analyse call (label depth == play depth in symmetric mode).
         obs = game.to_tensor(state)
-        action = _move_to_action(move)
+        action = _move_to_action(move, board.turn)
         policy_target = multipv_to_soft_policy(
             info_list, board.turn, tau_label, game.action_space_size
         )
@@ -279,7 +279,7 @@ def generate_one_asymmetric_game(
         if gap_sink is not None:
             gap_sink.append(best_eval - chosen_eval)
 
-        played_action = _move_to_action(played_move)
+        played_action = _move_to_action(played_move, board.turn)
 
         history.observations.append(game.to_tensor(state))
         history.actions.append(played_action)          # behavior (played) — may diverge

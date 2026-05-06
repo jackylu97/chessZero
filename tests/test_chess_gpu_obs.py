@@ -40,6 +40,7 @@ def _oracle_tensor(board: chess.Board) -> torch.Tensor:
     return cg.to_tensor(GameState(board=board, current_player=cp))
 
 
+
 def test_to_tensor_batch_matches_single_state_random():
     boards = _random_positions(10_000, seed=42)
     oracle = torch.stack([_oracle_tensor(b) for b in boards])  # (N, 19, 8, 8)
@@ -67,6 +68,7 @@ def test_to_tensor_batch_starting_position():
     expected = _oracle_tensor(chess.Board())
     for i in range(4):
         assert torch.equal(batched[i], expected)
+
 
 
 def test_to_tensor_batch_ep_square_set():
@@ -97,6 +99,7 @@ def test_to_tensor_batch_castling_revoked_one_side():
     state = gg.from_python_chess([b])
     batched = gg.to_tensor_batch(state)
     assert torch.equal(batched[0], expected)
+
 
 
 def test_to_tensor_batch_mixed_batch():

@@ -353,6 +353,9 @@ def get_config(game: str) -> MuZeroConfig:
             stockfish_injection_interval=240,  # ~3 center-touches per position (×6 unroll = ~18 loss terms);
                                                # with a 32k-game pool this runs ~30k steps before exhaustion,
                                                # at which point self-play + reanalyze flip on automatically
+            per_alpha=0.0,               # DeepMind uses uniform sampling (not PER) for board games.
+                                        # PER adds IS-weight noise with no benefit when TD errors
+                                        # cluster near zero (draw basin). Matches paper Appendix.
             use_scalar_transform=False,  # chess values live in [-1,+1]; h(x) would collapse them onto bin 0
             value_support_size=2,        # 5 bins at {-2,-1,0,+1,+2}; paired with value_target_scale=2.0 gives {-1,-0.5,0,+0.5,+1} in raw space
             value_target_scale=2.0,      # spread raw [-1,+1] targets across the full 5-bin support

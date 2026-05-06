@@ -13,10 +13,19 @@ NUM_MOVE_TYPES = 73
 ACTION_SPACE = 64 * NUM_MOVE_TYPES  # 4672
 
 
-def _move_to_action(move: chess.Move) -> int:
-    """Encode a chess move as a flat action index."""
+def _move_to_action(move: chess.Move, turn: bool = chess.WHITE) -> int:
+    """Encode a chess move as a flat action index in STM perspective.
+
+    Actions are always encoded from the side-to-move's perspective (AlphaZero
+    convention): the board is rank-flipped for black so that "forward" is always
+    increasing rank. Pass ``turn`` so the flip is applied correctly.
+    """
     from_sq = move.from_square
     to_sq = move.to_square
+
+    if turn == chess.BLACK:
+        from_sq ^= 56
+        to_sq ^= 56
 
     from_row, from_col = divmod(from_sq, 8)
     to_row, to_col = divmod(to_sq, 8)
@@ -60,11 +69,15 @@ def _move_to_action(move: chess.Move) -> int:
 
 
 def _action_to_move(action: int, board: chess.Board) -> chess.Move | None:
-    """Decode flat action index back to a chess move, validating against board."""
+    """Decode flat action index (STM perspective) back to a chess move.
+
+    The action is encoded from the side-to-move's perspective. For black,
+    from/to squares are un-flipped to absolute board coordinates.
+    """
     from_sq = action // NUM_MOVE_TYPES
     move_type = action % NUM_MOVE_TYPES
-
     from_row, from_col = divmod(from_sq, 8)
+    promotion = None
 
     if move_type < 56:
         # Queen-type move
@@ -85,31 +98,35 @@ def _action_to_move(action: int, board: chess.Board) -> chess.Move | None:
         to_row = from_row + dr
         to_col = from_col + dc
     else:
-        # Underpromotion
+        # Underpromotion — always dr=+1 in STM space (pawn moves "north")
         idx = move_type - 64
-        promo_idx = idx // 3  # 0=rook, 1=bishop, 2=knight
-        direction = idx % 3  # 0=straight, 1=right capture, 2=left capture
+        promo_idx = idx // 3
+        direction = idx % 3
         promo_map = {0: chess.ROOK, 1: chess.BISHOP, 2: chess.KNIGHT}
+        promotion = promo_map[promo_idx]
         dc = [0, 1, -1][direction]
-        dr = 1 if board.turn == chess.WHITE else -1
-        to_row = from_row + dr
+        to_row = from_row + 1
         to_col = from_col + dc
 
-        if 0 <= to_row < 8 and 0 <= to_col < 8:
-            to_sq = to_row * 8 + to_col
-            return chess.Move(from_sq, to_sq, promotion=promo_map[promo_idx])
+    if not (0 <= to_row < 8 and 0 <= to_col < 8):
         return None
 
-    if 0 <= to_row < 8 and 0 <= to_col < 8:
-        to_sq = to_row * 8 + to_col
-        # Check if this is a queen promotion
+    to_sq = to_row * 8 + to_col
+
+    # Un-flip from STM space to absolute board coordinates
+    if board.turn == chess.BLACK:
+        from_sq ^= 56
+        to_sq ^= 56
+
+    # Detect queen promotion (pawn reaching back rank)
+    if promotion is None:
         piece = board.piece_at(from_sq)
         if piece and piece.piece_type == chess.PAWN:
-            if (board.turn == chess.WHITE and to_row == 7) or \
-               (board.turn == chess.BLACK and to_row == 0):
-                return chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
-        return chess.Move(from_sq, to_sq)
-    return None
+            abs_to_rank = to_sq // 8
+            if abs_to_rank == 0 or abs_to_rank == 7:
+                promotion = chess.QUEEN
+
+    return chess.Move(from_sq, to_sq, promotion=promotion)
 
 
 class ChessGame(Game):
@@ -158,38 +175,48 @@ class ChessGame(Game):
         return GameState(board=board, current_player=-state.current_player), 0.0, False
 
     def legal_actions(self, state: GameState) -> list[int]:
-        return [_move_to_action(m) for m in state.board.legal_moves]
+        return [_move_to_action(m, state.board.turn) for m in state.board.legal_moves]
 
     def to_tensor(self, state: GameState) -> torch.Tensor:
+        """Observation from the side-to-move's perspective (AlphaZero convention).
+
+        Planes 0-5 = own pieces (P,N,B,R,Q,K), 6-11 = opponent pieces.
+        When black to move the board is rank-flipped so own back rank is row 0.
+        """
         board = state.board
         planes = np.zeros((self.num_planes, 8, 8), dtype=np.float32)
+        is_black = board.turn == chess.BLACK
 
-        # Piece planes: P=0, N=1, B=2, R=3, Q=4, K=5 for white; +6 for black.
-        # Always encoded from white's perspective (row 0 = rank 1).
-        # The network learns separate white/black strategies via the turn plane.
-        # Proper perspective flipping (like AlphaZero) would also require flipping
-        # action indices in legal_actions() — deferred as a future improvement.
         piece_map = board.piece_map()
         for sq, piece in piece_map.items():
             row, col = divmod(sq, 8)
+            if is_black:
+                row = 7 - row
             plane_idx = piece.piece_type - 1  # 0-5
-            if piece.color == chess.BLACK:
+            is_own = (piece.color == chess.WHITE) != is_black
+            if not is_own:
                 plane_idx += 6
             planes[plane_idx, row, col] = 1.0
 
-        # Castling rights
-        planes[12, :, :] = float(board.has_kingside_castling_rights(chess.WHITE))
-        planes[13, :, :] = float(board.has_queenside_castling_rights(chess.WHITE))
-        planes[14, :, :] = float(board.has_kingside_castling_rights(chess.BLACK))
-        planes[15, :, :] = float(board.has_queenside_castling_rights(chess.BLACK))
+        # Castling rights — planes 12-13 = own, 14-15 = opponent
+        own_color = chess.BLACK if is_black else chess.WHITE
+        opp_color = chess.WHITE if is_black else chess.BLACK
+        planes[12, :, :] = float(board.has_kingside_castling_rights(own_color))
+        planes[13, :, :] = float(board.has_queenside_castling_rights(own_color))
+        planes[14, :, :] = float(board.has_kingside_castling_rights(opp_color))
+        planes[15, :, :] = float(board.has_queenside_castling_rights(opp_color))
 
-        # En passant
+        # En passant — flip square for black
         if board.ep_square is not None:
-            row, col = divmod(board.ep_square, 8)
+            ep_sq = board.ep_square
+            if is_black:
+                ep_sq ^= 56
+            row, col = divmod(ep_sq, 8)
             planes[16, row, col] = 1.0
 
-        # Current player
-        planes[17, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+        # Player color (1.0 = white, 0.0 = black) — lets the network know
+        # which side it is despite the symmetric encoding
+        planes[17, :, :] = 0.0 if is_black else 1.0
 
         # Move count (normalized)
         planes[18, :, :] = min(board.fullmove_number / 200.0, 1.0)
@@ -241,7 +268,7 @@ class ChessGame(Game):
                 return None
         if move not in board.legal_moves:
             return None
-        return _move_to_action(move)
+        return _move_to_action(move, board.turn)
 
     def clone_state(self, state: GameState) -> GameState:
         return GameState(

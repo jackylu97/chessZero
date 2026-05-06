@@ -1018,37 +1018,35 @@ def _legal_mask_impl(state: "ChessBatchedState") -> torch.Tensor:
         )
 
     # Encode pseudo_targets into action mask (N, 4672).
-    target_w = ACTION_TARGET_W.to(device)                           # (4672,)
-    target_b = ACTION_TARGET_B.to(device)
+    # Actions are STM-encoded: from_sq and to_sq are always "as if white".
+    # Convert STM → absolute before indexing into pseudo_targets (absolute coords).
+    target_stm = ACTION_TARGET_W.to(device)                         # (4672,) — STM to_sq
     is_underpromo = ACTION_IS_UNDERPROMO.to(device)
-    from_sq_arr = ACTION_FROM_SQ.to(device)                         # (4672,)
+    from_sq_stm = ACTION_FROM_SQ.to(device)                         # (4672,) — STM from_sq
 
-    # Per-game action target.
-    action_target = torch.where(is_white.unsqueeze(-1), target_w.unsqueeze(0).expand(N, 4672),
-                                target_b.unsqueeze(0).expand(N, 4672))  # (N, 4672)
-    action_valid = action_target >= 0                                # (N, 4672) bool
+    from_sq_stm_exp = from_sq_stm.unsqueeze(0).expand(N, 4672)
+    target_stm_exp = target_stm.unsqueeze(0).expand(N, 4672)
+    is_w = is_white.unsqueeze(-1)
 
-    # For each (game, action_idx): bit `action_target` of pseudo[game, from_sq_arr[idx]].
-    # First gather pseudo at from_sq for each action: (N, 4672) int64.
-    # gather along last dim: index = from_sq_arr broadcast to (N, 4672).
-    from_idx = from_sq_arr.unsqueeze(0).expand(N, 4672)
-    pseudo_at_from = pseudo.gather(1, from_idx)                     # (N, 4672) int64 — pseudo[from_sq] per action
-    # Extract bit `action_target`:
-    bit_at_target = (_lsr_tensor(pseudo_at_from, action_target.clamp(min=0)) & 1).bool()  # (N, 4672)
-    # action_legal_for_general = bit set AND action_valid.
+    # STM → absolute: for black, rank-flip via ^ 56.
+    from_sq_abs = torch.where(is_w, from_sq_stm_exp, from_sq_stm_exp ^ 56)
+    target_abs = torch.where(is_w, target_stm_exp, target_stm_exp ^ 56)
+    action_valid = target_stm_exp >= 0                               # (N, 4672) bool
+    target_abs = torch.where(action_valid, target_abs,
+                             torch.tensor(-1, dtype=torch.int64, device=device))
+
+    # For each (game, action_idx): bit `target_abs` of pseudo[game, from_sq_abs].
+    pseudo_at_from = pseudo.gather(1, from_sq_abs)                   # (N, 4672) int64
+    bit_at_target = (_lsr_tensor(pseudo_at_from, target_abs.clamp(min=0)) & 1).bool()
     legal_general = bit_at_target & action_valid
 
-    # For underpromo actions: additionally require pawn at from_sq (use pseudo_pawn)
-    # AND from_sq is on the promotion rank for our side (white rank 7 / black rank 2,
-    # 0-indexed rank 6 / 1). Without the rank check, e.g. a white pawn on a2 would
-    # mark "underpromo to a3" as legal — chess.py's encoder reserves m=64..72 for
-    # actual back-rank promotions only.
-    pseudo_pawn_at_from = pseudo_pawn.gather(1, from_idx)            # (N, 4672)
-    bit_at_target_pawn = (_lsr_tensor(pseudo_pawn_at_from, action_target.clamp(min=0)) & 1).bool()
-    from_rank = from_sq_arr // 8                                     # (4672,) rank of action's from_sq
-    promo_rank_w = (from_rank == 6).unsqueeze(0).expand(N, 4672)     # white pawn promoting from rank 7
-    promo_rank_b = (from_rank == 1).unsqueeze(0).expand(N, 4672)     # black pawn promoting from rank 2
-    promo_rank_ok = torch.where(is_white.unsqueeze(-1), promo_rank_w, promo_rank_b)
+    # For underpromo actions: additionally require pawn at from_sq on the
+    # STM promotion rank. In STM coords, promotion is always rank 6 → 7
+    # (mover's pawns always go "north").
+    pseudo_pawn_at_from = pseudo_pawn.gather(1, from_sq_abs)
+    bit_at_target_pawn = (_lsr_tensor(pseudo_pawn_at_from, target_abs.clamp(min=0)) & 1).bool()
+    from_rank_stm = from_sq_stm // 8                                 # (4672,)
+    promo_rank_ok = (from_rank_stm == 6).unsqueeze(0).expand(N, 4672)
     legal_pawn_specific = bit_at_target_pawn & action_valid & promo_rank_ok
 
     # Combine: underpromo idxs use pawn-specific check; others use general.
@@ -1108,10 +1106,10 @@ class ChessBatchedState(BatchedGameState):
     # of the positions reached since the last "irreversibility" — capture,
     # pawn move, castling-rights change, or EP-availability change. Two
     # positions are repeated only if both match on side/castling/EP, which is
-    # baked into the hash. K=120 is enough because the 50-move rule (halfmove
-    # cap 100) triggers before that, and irreversibility resets here cover a
-    # superset of the events that reset the halfmove clock.
-    rep_hashes: torch.Tensor | None = None   # (N, 120) int64.
+    # baked into the hash. K=160 is sized for the 75-move auto-draw cap
+    # (halfmove ≥ 150) with a small margin; irreversibility resets here cover
+    # a superset of the events that reset the halfmove clock.
+    rep_hashes: torch.Tensor | None = None   # (N, REP_HISTORY_K) int64.
     rep_count: torch.Tensor | None = None    # (N,) int16 — # valid entries.
 
     @property
@@ -1193,42 +1191,58 @@ class GpuChessGame(BatchedGame):
         return state
 
     def to_tensor_batch(self, state: ChessBatchedState) -> torch.Tensor:
-        """Return `(N, 19, 8, 8)` observation tensor.
+        """Return `(N, 19, 8, 8)` observation tensor in STM-relative encoding.
 
         Plane layout (must match `ChessGame.to_tensor`):
-          0..5   : white P, N, B, R, Q, K
-          6..11  : black P, N, B, R, Q, K
-          12..15 : castling rights WK, WQ, BK, BQ (broadcast)
+          0..5   : own P, N, B, R, Q, K (side-to-move's pieces)
+          6..11  : opponent P, N, B, R, Q, K
+          12..13 : own castling rights KS, QS (broadcast)
+          14..15 : opponent castling rights KS, QS (broadcast)
           16     : en-passant target square (one-hot, zeros if no ep)
           17     : turn (1.0 white-to-move, 0.0 black-to-move) (broadcast)
           18     : fullmove_number / 200 clipped to 1.0 (broadcast)
+
+        For black-to-move: ranks are flipped (row 0 = black's back rank),
+        own/opponent planes are swapped, castling planes reordered.
         """
         n = state.n
         device = state.device
+        is_black = (state.side == 1)
 
         # Piece planes via bit-extract.
-        bit_idx = torch.arange(64, device=device, dtype=torch.int64)         # (64,)
+        bit_idx = torch.arange(64, device=device, dtype=torch.int64)
         bb = state.pieces.unsqueeze(-1)                                      # (N, 12, 1)
         bits = ((bb >> bit_idx) & 1).to(torch.float32)                       # (N, 12, 64)
         piece_planes = bits.view(n, 12, 8, 8)                                # row=sq//8, col=sq%8
 
-        # Castling planes: (N, 4) bool → broadcast to (N, 4, 8, 8).
-        castle_planes = (
-            state.castling.to(torch.float32).view(n, 4, 1, 1).expand(n, 4, 8, 8)
-        )
+        # STM: for black, flip ranks and swap own(white)/opp(black) planes.
+        if is_black.any():
+            flipped = piece_planes.flip(2)
+            swapped = torch.cat([flipped[:, 6:12], flipped[:, 0:6]], dim=1)
+            piece_planes = torch.where(
+                is_black.view(n, 1, 1, 1), swapped, piece_planes,
+            )
 
-        # EP plane: 1.0 at ep square if valid, else all zeros.
+        # Castling: STM reorders [WK,WQ,BK,BQ] → [own_KS,own_QS,opp_KS,opp_QS].
+        castle_abs = state.castling.to(torch.float32)                        # (N, 4)
+        castle_stm = torch.where(
+            is_black.view(n, 1),
+            torch.cat([castle_abs[:, 2:4], castle_abs[:, 0:2]], dim=1),
+            castle_abs,
+        )
+        castle_planes = castle_stm.view(n, 4, 1, 1).expand(n, 4, 8, 8)
+
+        # EP plane: for black, flip square rank (sq ^ 56).
         ep_plane = torch.zeros((n, 1, 8, 8), dtype=torch.float32, device=device)
-        ep_valid = state.ep >= 0  # (N,)
+        ep_valid = state.ep >= 0
         ep_idx = state.ep.to(torch.int64).clamp(0, 63)
-        ep_row = ep_idx // 8
-        ep_col = ep_idx % 8
-        # Per-row scatter: writes 0 where invalid (no-op on already-zero plane),
-        # 1.0 where valid.
+        ep_idx_stm = torch.where(is_black, ep_idx ^ 56, ep_idx)
+        ep_row = ep_idx_stm // 8
+        ep_col = ep_idx_stm % 8
         ep_plane[torch.arange(n, device=device), 0, ep_row, ep_col] = ep_valid.to(torch.float32)
 
         # Turn plane: 1 if white to move (side == 0), else 0.
-        turn_plane = (state.side == 0).to(torch.float32).view(n, 1, 1, 1).expand(n, 1, 8, 8)
+        turn_plane = (~is_black).to(torch.float32).view(n, 1, 1, 1).expand(n, 1, 8, 8)
 
         # Move-count plane: clipped fullmove / 200.
         mc = (state.fullmove.to(torch.float32) / 200.0).clamp(0.0, 1.0)
@@ -1263,7 +1277,7 @@ class GpuChessGame(BatchedGame):
 
 
 # -- Zobrist hashing for threefold detection ---------------------------------
-REP_HISTORY_K = 120  # ring buffer depth; see ChessBatchedState.rep_hashes docstring.
+REP_HISTORY_K = 160  # ring buffer depth; see ChessBatchedState.rep_hashes docstring.
 
 # Random int64s seeded once at import. The rng has a fixed seed so hashes are
 # deterministic across runs (useful for comparing buffers / replays).
@@ -1340,20 +1354,21 @@ def _step_batch_impl(
     side = state.side.to(torch.int64)                              # (N,)
     is_white = side == 0                                            # (N,) bool
 
-    # Lookup action metadata (color-aware target).
-    target_w = ACTION_TARGET_W.to(device)
-    target_b = ACTION_TARGET_B.to(device)
+    # Lookup action metadata. Actions are STM-encoded (as-if-white);
+    # convert from_sq and to_sq to absolute coordinates for internal use.
+    target_stm_all = ACTION_TARGET_W.to(device)                      # STM table
     is_underpromo_all = ACTION_IS_UNDERPROMO.to(device)
     promo_piece_all = _ACTION_TABLES["promo_piece"].to(device)
-    from_sq_all = ACTION_FROM_SQ.to(device)
+    from_sq_stm_all = ACTION_FROM_SQ.to(device)
 
     actions_long = actions.to(torch.int64)
-    action_target = torch.where(is_white,
-                                 target_w[actions_long],
-                                 target_b[actions_long])             # (N,) int64
+    from_sq_stm = from_sq_stm_all[actions_long]                     # (N,) STM from_sq
+    to_sq_stm = target_stm_all[actions_long]                         # (N,) STM to_sq
+    # STM → absolute: for black, rank-flip via ^ 56.
+    from_sq = torch.where(is_white, from_sq_stm, from_sq_stm ^ 56)
+    action_target = torch.where(is_white, to_sq_stm, to_sq_stm ^ 56)
     is_underpromo = is_underpromo_all[actions_long]                  # (N,) bool
     promo_piece = promo_piece_all[actions_long]                      # (N,) int64; -1 if not underpromo
-    from_sq = from_sq_all[actions_long]                              # (N,) int64
 
     one = torch.tensor(1, dtype=torch.int64, device=device)
     zero = torch.tensor(0, dtype=torch.int64, device=device)
@@ -1574,10 +1589,13 @@ def _step_batch_impl(
 
     mate = no_legal & in_check_new
     stalemate = no_legal & ~in_check_new
-    fifty_move = new_halfmove >= 100
+    # 75-move rule (auto) — not the claimable 50-move rule. Matches
+    # python-chess `is_seventyfive_moves` (halfmove_clock >= 150) which
+    # ChessGame.step picks up via `is_game_over(claim_draw=False)`.
+    seventy_five_move = new_halfmove >= 150
     ply_cap = new_ply >= max_plies
 
-    done = mate | stalemate | fifty_move | ply_cap | threefold
+    done = mate | stalemate | seventy_five_move | ply_cap | threefold
 
     # Mover-POV reward (matches Game.step). Mover = side just moved = old side.
     reward = torch.where(mate, 1.0, 0.0).to(torch.float32)

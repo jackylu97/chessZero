@@ -13,6 +13,12 @@ import random
 import chess
 
 from src.games.chess import ACTION_SPACE, _action_to_move, _move_to_action
+from src.games.chess_gpu import (
+    ACTION_FROM_SQ,
+    ACTION_IS_UNDERPROMO,
+    ACTION_TARGET_W,
+    _ACTION_TABLES,
+)
 
 
 def _random_positions(n: int, seed: int = 0) -> list[chess.Board]:
@@ -33,7 +39,7 @@ def test_action_index_in_range():
     """Encoded action must always land in [0, ACTION_SPACE)."""
     for board in _random_positions(200, seed=1):
         for move in board.legal_moves:
-            idx = _move_to_action(move)
+            idx = _move_to_action(move, board.turn)
             assert 0 <= idx < ACTION_SPACE, f"OOB index {idx} for {move}"
 
 
@@ -43,7 +49,7 @@ def test_round_trip_random_positions():
     n_moves = 0
     for b in boards:
         for move in b.legal_moves:
-            idx = _move_to_action(move)
+            idx = _move_to_action(move, b.turn)
             decoded = _action_to_move(idx, b)
             assert decoded == move, (
                 f"round-trip failed: {move.uci()} → {idx} → "
@@ -76,7 +82,7 @@ def test_round_trip_underpromotion():
         for move in b.legal_moves:
             if move.promotion is None:
                 continue
-            idx = _move_to_action(move)
+            idx = _move_to_action(move, b.turn)
             decoded = _action_to_move(idx, b)
             assert decoded == move, (
                 f"underpromotion round-trip failed: {move.uci()} → {idx} → "
@@ -84,6 +90,60 @@ def test_round_trip_underpromotion():
             )
             n_promos += 1
     assert n_promos >= 8, f"expected ≥8 promotion moves, got {n_promos}"
+
+
+def test_gpu_action_tables_match_decoder():
+    """For every action 0..4671, GpuChessGame's precomputed STM action table
+    must agree with the chess.py decoder.
+
+    Both engines now use STM encoding (as-if-white). ACTION_TARGET_W is the
+    single STM table; this cross-checks it against `chess.py:_action_to_move`
+    decoded on a white-to-move board (= STM decode).
+    """
+    promo_piece_table = _ACTION_TABLES["promo_piece"]
+
+    b_w = chess.Board.empty()
+    b_w.turn = chess.WHITE
+
+    for action in range(ACTION_SPACE):
+        from_sq = action // 73
+        mt = action % 73
+        is_underpromo = mt >= 64
+
+        assert int(ACTION_FROM_SQ[action].item()) == from_sq, (
+            f"action {action}: ACTION_FROM_SQ={int(ACTION_FROM_SQ[action].item())} "
+            f"vs expected {from_sq}"
+        )
+        assert bool(ACTION_IS_UNDERPROMO[action].item()) == is_underpromo, (
+            f"action {action}: ACTION_IS_UNDERPROMO={bool(ACTION_IS_UNDERPROMO[action].item())} "
+            f"vs expected {is_underpromo}"
+        )
+
+        move_w = _action_to_move(action, b_w)
+        expected_target = -1 if move_w is None else move_w.to_square
+        assert int(ACTION_TARGET_W[action].item()) == expected_target, (
+            f"action {action} (from={from_sq}, mt={mt}): "
+            f"ACTION_TARGET_W={int(ACTION_TARGET_W[action].item())} vs "
+            f"chess.py decode→{None if move_w is None else move_w.uci()}"
+        )
+
+        if is_underpromo:
+            expected_promo = (mt - 64) // 3  # 0=R, 1=B, 2=N
+            assert int(promo_piece_table[action].item()) == expected_promo, (
+                f"action {action}: promo_piece={int(promo_piece_table[action].item())} "
+                f"vs expected {expected_promo}"
+            )
+            if move_w is not None:
+                chess_py_promo = {chess.ROOK: 0, chess.BISHOP: 1, chess.KNIGHT: 2}[move_w.promotion]
+                assert chess_py_promo == expected_promo, (
+                    f"action {action}: chess.py promo={move_w.promotion} "
+                    f"vs GPU code={expected_promo}"
+                )
+        else:
+            assert int(promo_piece_table[action].item()) == -1, (
+                f"action {action}: non-underpromo has promo_piece="
+                f"{int(promo_piece_table[action].item())}"
+            )
 
 
 def test_round_trip_castling():
@@ -99,6 +159,6 @@ def test_round_trip_castling():
         for move in b.legal_moves:
             if not b.is_castling(move):
                 continue
-            idx = _move_to_action(move)
+            idx = _move_to_action(move, b.turn)
             decoded = _action_to_move(idx, b)
             assert decoded == move, f"castle round-trip failed: {move.uci()} ↔ {idx}"

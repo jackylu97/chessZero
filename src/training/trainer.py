@@ -377,9 +377,9 @@ class MuZeroTrainer:
         target_policies = batch["target_policies"].to(self.device)
         is_weights_t = torch.tensor(is_weights, device=self.device)
         use_consistency = bool(getattr(self.config, "use_consistency_loss", False))
+        target_obs_mask = batch["target_obs_mask"].to(self.device)             # (B, K+1)
         if use_consistency:
             target_observations = batch["target_observations"].to(self.device)  # (B, K+1, C, H, W)
-            target_obs_mask = batch["target_obs_mask"].to(self.device)          # (B, K+1)
 
         # Under Plain Gumbel MuZero the target is π' (softmax over π_net + σ(completedQ));
         # KL matches the paper's L_policy and reports 0 when π_net ≡ π'. Otherwise use
@@ -389,12 +389,18 @@ class MuZeroTrainer:
             else self._policy_loss
         )
 
-        # Phase-dependent value_loss_weight: clean Stockfish targets deserve stronger
-        # supervision than noisy MCTS bootstraps. Gate on the existing pool_alive signal
-        # so the switch happens automatically at pool exhaustion (mirrors self-play and
-        # reanalyze gating). If a preset leaves both phase fields at None (default), fall
-        # back to the scalar value_loss_weight so older presets are unaffected.
-        value_weight = self._current_value_loss_weight()
+        is_warm = batch["is_warmstart"].to(self.device)
+
+        # Per-sample value_loss_weight: warmstart games (clean Stockfish targets)
+        # get stronger supervision than self-play games (noisy MCTS bootstraps).
+        # Gated per-sample via is_warmstart so the weight is always correct
+        # regardless of pool exhaustion state.
+        w_warm = getattr(self.config, "value_loss_weight_warmstart", None)
+        w_self = getattr(self.config, "value_loss_weight_selfplay", None)
+        if w_warm is not None and w_self is not None:
+            value_weight = torch.where(is_warm, w_warm, w_self)
+        else:
+            value_weight = self.config.value_loss_weight
 
         # Loss-weighting mode. See config.use_root_heavy_loss docstring.
         K = self.config.num_unroll_steps
@@ -423,11 +429,12 @@ class MuZeroTrainer:
 
                 hidden.register_hook(lambda grad: grad * 0.5)
 
-                policy_loss = policy_loss + unroll_scale * policy_loss_fn(policy_logits, target_policies[:, k + 1])
+                mask_k = target_obs_mask[:, k + 1]
+                policy_loss = policy_loss + unroll_scale * policy_loss_fn(policy_logits, target_policies[:, k + 1]) * mask_k
                 value_loss = value_loss + unroll_scale * self._value_loss(value_logits, target_values[:, k + 1],
-                                                                          self.network.value_support_size)
+                                                                          self.network.value_support_size) * mask_k
                 reward_loss = reward_loss + unroll_scale * self._reward_loss(reward_logits, target_rewards[:, k + 1],
-                                                                             self.network.reward_support_size)
+                                                                             self.network.reward_support_size) * mask_k
 
                 if use_consistency:
                     # SimSiam: online branch via dynamics (grad); target branch via representation
@@ -531,7 +538,6 @@ class MuZeroTrainer:
             #   - both falling together → working as intended
             # NaN when a stratum is empty in this batch (rare under stratified
             # sampling, common before pool exhaustion / after lever decays).
-            is_warm = batch["is_warmstart"].to(self.device)
             n_warm = int(is_warm.sum().item())
             n_sp = is_warm.numel() - n_warm
             policy_per_sample = (outer_scale * policy_loss).detach().float()
@@ -560,7 +566,7 @@ class MuZeroTrainer:
             "amp_scale": float(self.scaler.get_scale()),
             "value_mae": value_mae,
             "value_target_std": value_target_std,
-            "value_loss_weight": float(value_weight),
+            "value_loss_weight": float(value_weight.mean()) if isinstance(value_weight, torch.Tensor) else float(value_weight),
             "policy_entropy_pred": policy_entropy_pred,
             "policy_entropy_target": policy_entropy_target,
             "policy_loss_warmstart": policy_loss_warm,
