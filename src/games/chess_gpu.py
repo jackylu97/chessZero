@@ -170,15 +170,35 @@ def _from_sq_attacks(piece_bb: torch.Tensor, attack_table: torch.Tensor) -> torc
     Returns:
         (N,) int64 — OR of `attack_table[sq]` over all `sq` set in `piece_bb`.
 
-    The Python-loop over 64 squares is fine: each iteration is a single
-    batched bitwise op on (N,) — no per-game overhead. Compiles cleanly.
+    Vectorized: build the (N, 64) per-square contribution tensor in one
+    pass, then tree-OR-reduce along the 64-axis in O(log 64) = 6 passes.
+    Replaces the previous ``for sq in range(64)`` which fired 64 small
+    GPU launches per call — and this function gets called 3× per
+    ``attacks_by_color`` (pawn / knight / king) × multiple times per
+    legal_mask.
     """
-    out = torch.zeros_like(piece_bb)
-    for sq in range(64):
-        on_sq = ((piece_bb >> sq) & 1).to(torch.int64)  # (N,) — 0 or 1
-        # Branchless: 0 stays 0 (no contribution), 1 contributes attack_table[sq].
-        out = out | (on_sq * attack_table[sq])
-    return out
+    N = piece_bb.shape[0]
+    dev = piece_bb.device
+    sq_idx = torch.arange(64, device=dev, dtype=torch.int64)
+
+    # on_sq[i, s] = piece sits at square s for game i.
+    on_sq = ((piece_bb.unsqueeze(1) >> sq_idx) & 1).bool()    # (N, 64)
+    # contributions[i, s] = attack_table[s] if on_sq else 0.
+    contrib = torch.where(
+        on_sq,
+        attack_table.unsqueeze(0),
+        torch.zeros((), dtype=torch.int64, device=dev),
+    )                                                          # (N, 64)
+    # Tree reduce: 64 → 32 → 16 → 8 → 4 → 2 → 1 via half-and-OR.
+    while contrib.shape[1] > 1:
+        size = contrib.shape[1]
+        if size % 2 == 1:
+            pad = torch.zeros(N, 1, dtype=torch.int64, device=dev)
+            contrib = torch.cat([contrib, pad], dim=1)
+            size += 1
+        half = size // 2
+        contrib = contrib[:, :half] | contrib[:, half:]
+    return contrib.squeeze(1)
 
 
 def _slider_attacks(sliders: torch.Tensor, empty: torch.Tensor,
@@ -573,77 +593,71 @@ def _compute_pawn_pseudo_targets(state: "ChessBatchedState",
         torch.tensor(0, dtype=torch.int64, device=device),
     )
 
-    # Pawn pushes — built per-color, then selected per-game.
-    # White single push: pawn at s pushes to s+8 if empty.
-    # Express as (N, 64) per-from-sq bb of the single-push target.
-    # For each from_sq s, if s is a white pawn AND s+8 is empty, push_target_bb has bit s+8.
-    # Easier to build via global pawn-push bb, then attribute back to from_sq.
-    one_w = (our_pawn << 8) & empty                                # (N,) — bb of valid push *targets*
-    # Per-from-sq: at sq s, if s+8 in one_w AND our_pawn has s, then push to s+8.
-    # We want push_target_bb[N, s] = bit (s+8) if our_pawn[s] AND one_w has (s+8). Else 0.
-    # Express: for each s, push_bb = (1 << (s+8)) if (s+8) in one_w AND our_pawn[s].
-    # Vectorize per s in a Python loop.
-    # Simpler: produce full per-sq push bb only at squares where pawn exists.
-    # one_push_w[N, s] = bit at (s+8) of one_w if our_pawn has s and s<56, else 0.
-    # one_push_w[N, s] = (((one_w >> (s+8)) & 1) << (s+8)) if pawn at s.
-    # Loop over from_sq (64 ops) is fine.
-    push_w = torch.zeros((N, 64), dtype=torch.int64, device=device)
-    push_b = torch.zeros((N, 64), dtype=torch.int64, device=device)
-    one = torch.tensor(1, dtype=torch.int64, device=device)
-    for s in range(64):
-        # White push.
-        if s + 8 < 64:
-            target_w = (one << (s + 8))
-            valid_w = ((one_w >> (s + 8)) & 1).bool()  # (N,) — is the push target reached by any white pawn push?
-            # Restrict to "this from_sq" via pawn_at_sq[:, s].
-            push_w[:, s] = torch.where(valid_w & pawn_at_sq[:, s], target_w, torch.tensor(0, dtype=torch.int64, device=device))
-        # Black push.
-        if s - 8 >= 0:
-            target_b = (one << (s - 8))
-            # Black single push: pawn at s pushes to s-8 if empty.
-            # One-shot bb: ((our_pawn >> 8) & empty) shifts pawn bb south then masks empty.
-            # But we'd need _lsr on int64 — black pawn could be on h8 (bit 63), shift would sign-extend.
-            # For pawns on rank 7+ this isn't a concern (pawns can't be on rank 8). Pawns sit on rank 1-6 for white, 1-6 for black.
-            pass
-
-    # For now: a simpler combined-direction shifted approach, computed once globally and attributed:
-    # white push targets: (our_pawn << 8) & empty
-    # black push targets: _lsr(our_pawn, 8) & empty
-    # double push: starting from rank-2 pawns, one extra step if both squares empty.
-    one_w_global = (our_pawn << 8) & empty
-    one_b_global = _lsr(our_pawn, 8) & empty
-    # Double push: white from rank 2 (squares 8..15) pushing to rank 4 (sqaures 24..31), with rank 3 also empty.
-    rank2_mask = sum(1 << s for s in range(8, 16))
-    rank2_mask = int(np.uint64(rank2_mask).view(np.int64))
-    rank7_mask = sum(1 << s for s in range(48, 56))
-    rank7_mask = int(np.uint64(rank7_mask).view(np.int64))
-    # Pawns on rank 2 that can single-push: (our_pawn & rank2_mask) << 8 & empty.
-    # Then double push: that result << 8 & empty.
+    # Pawn pushes — built globally per-color, then attributed back to per-from-sq
+    # bitboards in a single vectorized pass (no Python `for s in range(64)`).
+    one_w_global = (our_pawn << 8) & empty                       # (N,) white single-push targets
+    one_b_global = _lsr(our_pawn, 8) & empty                     # (N,) black single-push targets
+    # Double push: rank-2 white (sq 8..15) → rank 4; rank-7 black (sq 48..55) → rank 5.
+    rank2_mask = int(np.uint64(sum(1 << s for s in range(8, 16))).view(np.int64))
+    rank7_mask = int(np.uint64(sum(1 << s for s in range(48, 56))).view(np.int64))
     two_w_global = ((((our_pawn & rank2_mask) << 8) & empty) << 8) & empty
     two_b_global = _lsr(_lsr(our_pawn & rank7_mask, 8) & empty, 8) & empty
 
-    # Distribute per-from-sq.
-    push_targets = torch.zeros((N, 64), dtype=torch.int64, device=device)
-    for s in range(64):
-        pa = pawn_at_sq[:, s]                                     # (N,) bool
-        # White single push from s → s+8.
-        if s + 8 < 64:
-            push_w_s = (((one_w_global >> (s + 8)) & 1) << (s + 8))
-            push_targets[:, s] = push_targets[:, s] | torch.where(pa & is_white, push_w_s, torch.tensor(0, dtype=torch.int64, device=device))
-        # Black single push from s → s-8.
-        if s - 8 >= 0:
-            push_b_s = (((_lsr(one_b_global, s - 8 if s - 8 >= 0 else 0)) & 1) << (s - 8))
-            # Slight care: _lsr by negative is undefined. Already gated by s-8 >= 0.
-            push_targets[:, s] = push_targets[:, s] | torch.where(pa & ~is_white, push_b_s, torch.tensor(0, dtype=torch.int64, device=device))
-        # White double push from rank-2 s → s+16.
-        if s + 16 < 64 and 8 <= s < 16:
-            push_w2_s = (((two_w_global >> (s + 16)) & 1) << (s + 16))
-            push_targets[:, s] = push_targets[:, s] | torch.where(pa & is_white, push_w2_s, torch.tensor(0, dtype=torch.int64, device=device))
-        # Black double push from rank-7 s → s-16.
-        if s - 16 >= 0 and 48 <= s < 56:
-            push_b2_s = (((_lsr(two_b_global, s - 16)) & 1) << (s - 16))
-            push_targets[:, s] = push_targets[:, s] | torch.where(pa & ~is_white, push_b2_s, torch.tensor(0, dtype=torch.int64, device=device))
+    # Vectorized per-from-sq distribution. For each square s the per-from-sq
+    # push contribution sets bit (s ± offset) in push_targets[:, s] iff the
+    # corresponding global push bb has that target bit set AND our pawn sits
+    # at s. Build per-sq target indices + masks once, broadcast against (N,)
+    # global bbs.
+    sq = torch.arange(64, device=device, dtype=torch.int64)       # (64,)
+    one64 = torch.tensor(1, dtype=torch.int64, device=device)
+    is_white_b = is_white.view(N, 1)
+    is_black_b = ~is_white_b
 
+    # White single push s → s+8 (only valid for s < 56).
+    s_plus_8 = (sq + 8).clamp(max=63)                             # (64,)
+    valid_w1 = (sq + 8 < 64).unsqueeze(0)                         # (1, 64)
+    push_w1_bit = ((one_w_global.unsqueeze(1) >> s_plus_8) & 1).bool()  # (N, 64) target reachable?
+    push_w1 = torch.where(
+        pawn_at_sq & is_white_b & push_w1_bit & valid_w1,
+        one64 << s_plus_8,
+        torch.zeros((), dtype=torch.int64, device=device),
+    )
+
+    # Black single push s → s-8 (only valid for s >= 8).
+    s_minus_8 = (sq - 8).clamp(min=0)
+    valid_b1 = (sq >= 8).unsqueeze(0)
+    push_b1_bit = ((_lsr_tensor(one_b_global.unsqueeze(1), s_minus_8) & 1).bool()
+                   if False else ((one_b_global.unsqueeze(1) >> s_minus_8) & 1).bool())
+    # (one_b_global is non-negative per the _lsr definition; right-shift by
+    # non-negative s_minus_8 is safe — sign bit was already cleared in
+    # _lsr(our_pawn, 8) above.)
+    push_b1 = torch.where(
+        pawn_at_sq & is_black_b & push_b1_bit & valid_b1,
+        one64 << s_minus_8,
+        torch.zeros((), dtype=torch.int64, device=device),
+    )
+
+    # White double push s → s+16 (only valid for s in 8..15).
+    s_plus_16 = (sq + 16).clamp(max=63)
+    valid_w2 = ((sq >= 8) & (sq < 16)).unsqueeze(0)
+    push_w2_bit = ((two_w_global.unsqueeze(1) >> s_plus_16) & 1).bool()
+    push_w2 = torch.where(
+        pawn_at_sq & is_white_b & push_w2_bit & valid_w2,
+        one64 << s_plus_16,
+        torch.zeros((), dtype=torch.int64, device=device),
+    )
+
+    # Black double push s → s-16 (only valid for s in 48..55).
+    s_minus_16 = (sq - 16).clamp(min=0)
+    valid_b2 = ((sq >= 48) & (sq < 56)).unsqueeze(0)
+    push_b2_bit = ((two_b_global.unsqueeze(1) >> s_minus_16) & 1).bool()
+    push_b2 = torch.where(
+        pawn_at_sq & is_black_b & push_b2_bit & valid_b2,
+        one64 << s_minus_16,
+        torch.zeros((), dtype=torch.int64, device=device),
+    )
+
+    push_targets = push_w1 | push_b1 | push_w2 | push_b2
     return cap_per_sq | push_targets
 
 
