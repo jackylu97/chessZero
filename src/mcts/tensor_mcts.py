@@ -1,0 +1,938 @@
+"""Tensor-native MCTS for MuZero — GPU-resident search tree.
+
+Companion to ``src/mcts/mcts.py`` (the existing Python+numpy ``BatchedMCTS``).
+Same outer interface — ``run_batch(observations, legal_actions_list,
+add_noise=True)`` returns a list of ``MCTSNode``-equivalent objects so callers
+in ``src/training/self_play.py`` can swap implementations with no further
+changes.
+
+Internally everything per-simulation runs on GPU tensors:
+
+- 0 GPU↔CPU syncs per simulation (vs. 3 in ``BatchedMCTS``).
+- 1 sync per ply (compat shim copies root data back when run_batch returns).
+
+v1 scope (per ``plan_tensor_mcts_implementation.md``):
+
+- Sampled MuZero §5.1 Proposed Modification at root and leaves.
+- Mover-POV value/reward sign convention (matches ``BatchedMCTS``):
+    Q(parent) = reward + γ·V(child)_parent_POV = reward − γ·child.value_child_POV
+- Root Dirichlet noise applied after the K-action sample.
+- MinMaxStats Q-normalization per game.
+- v1 dedup choice: keep duplicates with β̂(slot) = 1/K (option (b) from the
+  plan). Mathematically equivalent to count(a)/K in the limit; PUCT may visit
+  the same action across multiple slots, materializing parallel copies of the
+  same conceptual subtree. Dedup happens in the compat shim before priors and
+  visit counts are exposed to ``select_action``.
+
+Out of scope for v1:
+
+- Gumbel root (Sequential Halving). Caller must keep ``use_gumbel=False``.
+- Full-action root expansion. ``config.sample_k`` must be set; for tiny action
+  spaces fall back to the existing ``BatchedMCTS``.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import torch
+
+from src.mcts.mcts import MCTSNode
+
+
+_NEG_INF = float("-inf")
+
+
+def select_action_gpu(
+    child_actions: torch.Tensor,
+    child_visits: torch.Tensor,
+    temperature: torch.Tensor,
+    action_space_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GPU-resident action selection from MCTS visit counts.
+
+    Replaces the pattern ``select_action(MCTSNode, temperature)`` for the
+    GPU-resident self-play path. Stays on the GPU throughout — no per-game
+    Python loops, no .cpu() transfers.
+
+    Args:
+        child_actions: [N, K] int32 — sampled actions at root (may contain
+            -1 padding and option-(b) duplicates).
+        child_visits: [N, K] int32 — visit count per slot.
+        temperature: [N] float32 — per-game temperature (0 for greedy,
+            >0 for stochastic). Pass a 0-d tensor to broadcast.
+        action_space_size: A — width of the dense policy output.
+
+    Returns:
+        action: [N] int64 — chosen action per game.
+        dense_policy: [N, A] float32 — visit-count-weighted distribution
+            (option-(b) duplicates are summed via scatter_add). For greedy
+            games this is one-hot at the chosen action.
+    """
+    n, K = child_actions.shape
+    dev = child_actions.device
+
+    if temperature.dim() == 0:
+        temperature = temperature.expand(n)
+
+    visits_f = child_visits.to(torch.float32)
+    valid = child_actions != -1                                       # [N, K]
+    visits_f = torch.where(valid, visits_f, torch.zeros_like(visits_f))
+
+    is_greedy = temperature == 0                                       # [N]
+
+    # Greedy path: argmax visits.
+    greedy_slot = visits_f.argmax(dim=1)                               # [N]
+
+    # Sampled path: softmax(log(visits) / T). log-space is numerically stable
+    # for high inv_temp; zero-visit slots get -inf logits → 0 prob.
+    safe_temp = temperature.clamp(min=1e-3)
+    inv_temp = (1.0 / safe_temp).unsqueeze(1)                          # [N, 1]
+    log_visits = torch.log(visits_f.clamp(min=1e-9))                   # [N, K]
+    slot_logits = log_visits * inv_temp                                # [N, K]
+    # Mask invalid slots to -inf so they get 0 prob.
+    slot_logits = torch.where(
+        valid, slot_logits, torch.full_like(slot_logits, _NEG_INF)
+    )
+    slot_probs = torch.softmax(slot_logits, dim=1)                     # [N, K]
+    # If a row is all-invalid (or all zero visits), softmax of all -inf is
+    # NaN. Fall back to uniform over valid (or any) — this is a safety net;
+    # in practice the root always has at least one valid sampled slot.
+    has_any = valid.any(dim=1, keepdim=True)
+    safe_probs = torch.where(
+        valid, torch.ones_like(slot_probs), torch.zeros_like(slot_probs)
+    )
+    safe_probs = safe_probs / safe_probs.sum(dim=1, keepdim=True).clamp(min=1.0)
+    nan_mask = torch.isnan(slot_probs).any(dim=1, keepdim=True) | ~has_any
+    slot_probs = torch.where(nan_mask, safe_probs, slot_probs)
+
+    sampled_slot = torch.multinomial(slot_probs, 1).squeeze(1)         # [N]
+
+    next_slot = torch.where(is_greedy, greedy_slot, sampled_slot)
+    action = child_actions.gather(1, next_slot.unsqueeze(1)).squeeze(1).long()
+
+    # Dense policy.
+    actions_long = child_actions.clamp(min=0).long()
+    masked_probs = torch.where(
+        valid, slot_probs, torch.zeros_like(slot_probs)
+    )
+    dense_sampled = torch.zeros(n, action_space_size, device=dev, dtype=torch.float32)
+    dense_sampled.scatter_add_(1, actions_long, masked_probs)
+
+    dense_greedy = torch.zeros_like(dense_sampled)
+    dense_greedy.scatter_(1, action.unsqueeze(1), 1.0)
+
+    dense = torch.where(is_greedy.unsqueeze(1), dense_greedy, dense_sampled)
+    return action, dense
+
+
+class TensorMCTS:
+    """Sampled MuZero tensor-native MCTS.
+
+    Tree storage is pre-allocated on first ``run_batch`` and reused across
+    plies; re-allocates if N, M, or hidden shape changes.
+
+    Args:
+        network: MuZero network with ``initial_inference`` /
+            ``recurrent_inference`` returning scalar value/reward.
+        game: provides ``action_space_size``.
+        config: ``MuZeroConfig``-like (reads ``num_simulations``, ``sample_k``,
+            ``discount``, ``dirichlet_alpha``, ``dirichlet_epsilon``).
+        device: torch device for the search tree (typically same as network).
+        hidden_dtype: storage dtype for ``node_hidden``. Default fp32; cast to
+            fp16 when memory pressure matters (chess preset @ N=256/M=401 needs
+            ~6.7 GB fp32 for the hidden tensor alone, ~3.4 GB at fp16).
+    """
+
+    PB_C_BASE = 19652
+    PB_C_INIT = 1.25
+
+    def __init__(
+        self,
+        network,
+        game,
+        config,
+        device: str | torch.device = "cuda",
+        hidden_dtype: torch.dtype = torch.float32,
+        compile: bool = True,
+        amp_dtype: torch.dtype | None = None,
+    ):
+        self.network = network
+        self.game = game
+        self.config = config
+        self.device = torch.device(device)
+        self.hidden_dtype = hidden_dtype
+        # Inference autocast for the network calls inside MCTS (initial +
+        # recurrent inference). Tree storage stays at hidden_dtype; only the
+        # network forward gets the autocast benefit. Set ``amp_dtype=None`` to
+        # disable. fp16 is the standard choice for inference; values/rewards
+        # in [-1, 1] keep enough precision.
+        self.amp_dtype = amp_dtype if self.device.type == "cuda" else None
+        # Inference-time global settings. cudnn.benchmark auto-tunes conv
+        # algorithms for the network's fixed shapes; TF32 enables Ampere's
+        # fast matmul path for fp32 ops. Both are no-ops for non-CUDA.
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        # Whether to wrap _select / _backprop with torch.compile. Each iteration
+        # of the per-step selection loop fires ~25 small kernels (gathers, PUCT,
+        # argmax, writes); torch.compile fuses them via reduce-overhead mode +
+        # CUDA graphs, cutting per-iteration kernel-launch overhead by 5-10×.
+        # Set False when debugging to read clean tracebacks.
+        self.compile = compile and self.device.type == "cuda"
+
+        self.action_space_size = int(game.action_space_size)
+        sample_k = getattr(config, "sample_k", None)
+        if sample_k is None or int(sample_k) >= self.action_space_size:
+            # Fall through to "K = action_space"; the multinomial path still
+            # works (sampling from a categorical of size A with K=A and
+            # replacement). Callers with tiny action spaces should usually
+            # prefer BatchedMCTS, which expands all legal actions at root.
+            sample_k = self.action_space_size
+        self.K = int(sample_k)
+
+        # Tree storage — populated by _allocate on first run_batch.
+        self._allocated_n = -1
+        self._allocated_m = -1
+        self._allocated_hidden_shape: tuple[int, int, int] | None = None
+        self._cached_compute_dtype: torch.dtype | None = None
+        # Cached compiled callables (set after first _allocate so dynamo sees
+        # static shapes in tracing).
+        self._select_step_compiled = None
+        self._backprop_compiled = None
+
+    def _compute_dtype(self) -> torch.dtype:
+        """Network's parameter dtype — used to cast inputs before recurrent_inference.
+
+        Falls back to ``hidden_dtype`` when the stub network has no parameters
+        (test fixtures). Cached on first call.
+        """
+        if self._cached_compute_dtype is not None:
+            return self._cached_compute_dtype
+        first_param = next(self.network.parameters(), None)
+        self._cached_compute_dtype = (
+            first_param.dtype if first_param is not None else self.hidden_dtype
+        )
+        return self._cached_compute_dtype
+
+    def _amp_ctx(self):
+        """Autocast context for the network forward calls. No-op when disabled
+        or on CPU. Cast happens at the network's compute boundary; tree
+        storage stays at hidden_dtype."""
+        if self.amp_dtype is None:
+            return torch.amp.autocast(
+                device_type=self.device.type, enabled=False
+            )
+        return torch.amp.autocast(
+            device_type=self.device.type,
+            dtype=self.amp_dtype,
+            enabled=True,
+        )
+
+    # ------------------------------------------------------------------ alloc
+
+    def _allocate(self, n: int, num_simulations: int, hidden_shape: tuple[int, int, int]):
+        """Allocate (or reuse) tree tensors. M = num_simulations + 1 (root + sims)."""
+        m = num_simulations + 1
+        if (
+            n == self._allocated_n
+            and m == self._allocated_m
+            and hidden_shape == self._allocated_hidden_shape
+        ):
+            return
+
+        c, h, w = hidden_shape
+        dev = self.device
+        K = self.K
+
+        # Per-node tensors.
+        self.node_count = torch.zeros(n, dtype=torch.int32, device=dev)
+        self.node_visits = torch.zeros(n, m, dtype=torch.int32, device=dev)
+        self.node_value_sum = torch.zeros(n, m, dtype=torch.float32, device=dev)
+        self.node_reward = torch.zeros(n, m, dtype=torch.float32, device=dev)
+        self.node_hidden = torch.zeros(n, m, c, h, w, dtype=self.hidden_dtype, device=dev)
+        self.parent_idx = torch.full((n, m), -1, dtype=torch.int32, device=dev)
+        self.parent_child_slot = torch.full((n, m), -1, dtype=torch.int32, device=dev)
+
+        # Per-(node, slot) tensors. Mirror node-level stats so PUCT can read
+        # them with one [N, K] gather instead of double-indirection through
+        # child_node_idx (which would pull stats from a -1 sentinel for
+        # unmaterialized slots anyway).
+        self.child_actions = torch.full((n, m, K), -1, dtype=torch.int32, device=dev)
+        self.child_priors = torch.zeros(n, m, K, dtype=torch.float32, device=dev)
+        self.child_visits = torch.zeros(n, m, K, dtype=torch.int32, device=dev)
+        self.child_value_sum = torch.zeros(n, m, K, dtype=torch.float32, device=dev)
+        self.child_rewards = torch.zeros(n, m, K, dtype=torch.float32, device=dev)
+        self.child_node_idx = torch.full((n, m, K), -1, dtype=torch.int32, device=dev)
+
+        # MinMaxStats per game. Sentinels: empty range = (+inf, -inf).
+        self.mm_min = torch.full((n,), float("inf"), dtype=torch.float32, device=dev)
+        self.mm_max = torch.full((n,), _NEG_INF, dtype=torch.float32, device=dev)
+
+        # Reusable arange for advanced indexing.
+        self._arange_n = torch.arange(n, device=dev)
+
+        self._allocated_n = n
+        self._allocated_m = m
+        self._allocated_hidden_shape = hidden_shape
+
+        # Compile the hot per-sim methods once shapes are known. dynamic=False
+        # locks the trace to these shapes; re-allocation re-fires compile.
+        # ``mode='default'`` enables inductor fusion (~25 small ops/iter →
+        # ~3-4 fused kernels) without cudagraphs. cudagraphs (reduce-overhead)
+        # is incompatible with our mutation-heavy tree storage — both
+        # in-place index assignment and ``scatter_add_`` on pre-allocated
+        # ``self.child_visits`` get flagged as input mutation and either skip
+        # cudagraphs (defeating the point) or segfault at runtime.
+        if self.compile:
+            self._select = torch.compile(  # type: ignore[method-assign]
+                self.__class__._select.__get__(self),
+                mode="default",
+                dynamic=False,
+                fullgraph=False,
+            )
+            self._backprop = torch.compile(  # type: ignore[method-assign]
+                self.__class__._backprop.__get__(self),
+                mode="default",
+                dynamic=False,
+                fullgraph=False,
+            )
+
+    def _reset(self):
+        """Zero out tree tensors at the start of each MCTS run.
+
+        Lazy reset (only touching slots up to last ply's max(node_count)) is
+        a clear perf win at chess scale and a v1 follow-up; for now we just
+        zero the whole tree on each call. Per-ply MCTS overhead is dominated
+        by the network forward, not the reset.
+        """
+        self.node_count.zero_()
+        self.node_visits.zero_()
+        self.node_value_sum.zero_()
+        self.node_reward.zero_()
+        # node_hidden is overwritten on allocation; no need to zero.
+        self.parent_idx.fill_(-1)
+        self.parent_child_slot.fill_(-1)
+        self.child_actions.fill_(-1)
+        self.child_priors.zero_()
+        self.child_visits.zero_()
+        self.child_value_sum.zero_()
+        self.child_rewards.zero_()
+        self.child_node_idx.fill_(-1)
+        self.mm_min.fill_(float("inf"))
+        self.mm_max.fill_(_NEG_INF)
+
+    # ---------------------------------------------------------------- public
+
+    @torch.no_grad()
+    def run_batch(
+        self,
+        observations: list[torch.Tensor],
+        legal_actions_list: list[list[int]],
+        add_noise: bool = True,
+    ) -> list[MCTSNode]:
+        """Run num_simulations MCTS sims for N games in parallel on GPU.
+
+        Returns N ``MCTSNode`` objects (compat shim) populated with deduped
+        ``child_actions`` / ``child_visits`` / ``child_priors`` so the
+        existing ``select_action`` helpers work unchanged.
+        """
+        n = len(observations)
+        num_sims = int(self.config.num_simulations)
+
+        obs_batch = torch.stack(observations).to(self.device)
+        with self._amp_ctx():
+            hidden_batch, policy_logits_root, value_root = self.network.initial_inference(obs_batch)
+        # hidden_batch: [N, C, H, W]; policy_logits_root: [N, A]; value_root: [N, 1] or [N].
+
+        c, h, w = hidden_batch.shape[1:]
+        self._allocate(n, num_sims, (c, h, w))
+        self._reset()
+
+        self._initialize_root(
+            hidden_batch,
+            policy_logits_root,
+            legal_actions_list,
+            add_noise,
+        )
+
+        for _ in range(num_sims):
+            (
+                path_node_idx,
+                path_slot,
+                leaf_parent_node,
+                leaf_slot,
+                leaf_action,
+                depth,
+            ) = self._select()
+
+            new_node_idx, leaf_value = self._expand(
+                leaf_parent_node,
+                leaf_slot,
+                leaf_action,
+            )
+
+            self._backprop(
+                path_node_idx,
+                path_slot,
+                depth,
+                new_node_idx,
+                leaf_slot,
+                leaf_value,
+            )
+
+        return self._build_compat_roots(n)
+
+    @torch.no_grad()
+    def run_batch_gpu(
+        self,
+        obs_batch: torch.Tensor,
+        legal_mask: torch.Tensor,
+        add_noise: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Sync-free variant of ``run_batch``.
+
+        Args:
+            obs_batch: [N, C, H, W] observation tensor on ``self.device``.
+            legal_mask: [N, action_space] bool mask on ``self.device``.
+
+        Returns a dict of GPU-resident tensors:
+
+            ``child_actions``  : [N, K] int32 — sampled actions at root
+                                 (may contain duplicates under option (b)).
+            ``child_visits``   : [N, K] int32 — visit count per slot.
+            ``child_priors``   : [N, K] float32 — β̂(slot) = 1/K + Dirichlet.
+            ``root_value``     : [N] float32 — root mean Q (= value_sum/visits).
+
+        Caller is responsible for any downstream aggregation (deduping
+        actions, building dense policy, etc.) — kept GPU-side via
+        :func:`select_action_gpu`.
+        """
+        # Compare types only — `cuda` and `cuda:0` are the same logical device
+        # but compare unequal as torch.device objects.
+        assert obs_batch.device.type == self.device.type, (
+            f"obs_batch on {obs_batch.device}, expected {self.device}"
+        )
+        assert legal_mask.device.type == self.device.type, (
+            f"legal_mask on {legal_mask.device}, expected {self.device}"
+        )
+
+        n = obs_batch.shape[0]
+        num_sims = int(self.config.num_simulations)
+
+        with self._amp_ctx():
+            hidden_batch, policy_logits_root, _value_root = self.network.initial_inference(obs_batch)
+        c, h, w = hidden_batch.shape[1:]
+        self._allocate(n, num_sims, (c, h, w))
+        self._reset()
+
+        self._initialize_root_from_mask(
+            hidden_batch, policy_logits_root, legal_mask, add_noise
+        )
+
+        for _ in range(num_sims):
+            (
+                path_node_idx,
+                path_slot,
+                leaf_parent_node,
+                leaf_slot,
+                leaf_action,
+                depth,
+            ) = self._select()
+            new_node_idx, leaf_value = self._expand(
+                leaf_parent_node, leaf_slot, leaf_action
+            )
+            self._backprop(
+                path_node_idx,
+                path_slot,
+                depth,
+                new_node_idx,
+                leaf_slot,
+                leaf_value,
+            )
+
+        root_visits_int = self.node_visits[:, 0]                # [N] int32
+        root_visits_f = root_visits_int.to(torch.float32)
+        root_value = self.node_value_sum[:, 0] / torch.clamp(
+            root_visits_f, min=1.0
+        )                                                        # [N] float32
+        # Clone so the caller can hold these past the next run_batch call,
+        # which would otherwise overwrite the underlying tree storage.
+        return {
+            "child_actions": self.child_actions[:, 0, :].clone(),  # [N, K] int32
+            "child_visits": self.child_visits[:, 0, :].clone(),    # [N, K] int32
+            "child_priors": self.child_priors[:, 0, :].clone(),    # [N, K] float32
+            "root_value": root_value.clone(),                       # [N] float32
+        }
+
+    # ---------------------------------------------------------------- helpers
+
+    def _initialize_root(
+        self,
+        hidden_batch: torch.Tensor,
+        policy_logits_root: torch.Tensor,
+        legal_actions_list: list[list[int]],
+        add_noise: bool,
+    ):
+        """Build root node (slot 0); legal_actions arrives as CPU lists."""
+        n = self._allocated_n
+        action_space = self.action_space_size
+
+        # Build legal mask CPU-side (one small N-loop + one transfer is fine
+        # for the legacy compat path; the GPU-resident path bypasses this).
+        legal_mask_cpu = torch.zeros(n, action_space, dtype=torch.bool)
+        for g, legals in enumerate(legal_actions_list):
+            if legals:
+                legal_mask_cpu[g, legals] = True
+        legal_mask = legal_mask_cpu.to(self.device)
+        self._initialize_root_from_mask(
+            hidden_batch, policy_logits_root, legal_mask, add_noise
+        )
+
+    def _initialize_root_from_mask(
+        self,
+        hidden_batch: torch.Tensor,
+        policy_logits_root: torch.Tensor,
+        legal_mask: torch.Tensor,
+        add_noise: bool,
+    ):
+        """GPU-resident root setup: legal_mask is already a GPU bool tensor."""
+        n = self._allocated_n
+        K = self.K
+        dev = self.device
+
+        masked_logits = policy_logits_root.masked_fill(~legal_mask, _NEG_INF)
+        root_probs = torch.softmax(masked_logits, dim=-1)  # [N, A]
+
+        # Sampled MuZero §5.1: K i.i.d. samples with replacement from β = π.
+        # Option (b): keep duplicates with β̂(slot) = 1/K. Per-action mass
+        # aggregates downstream as count(a)/K.
+        sampled_actions = torch.multinomial(root_probs, K, replacement=True)  # [N, K] int64
+        priors_root = torch.full(
+            (n, K), 1.0 / K, dtype=torch.float32, device=dev
+        )
+
+        if add_noise and self.config.dirichlet_epsilon > 0:
+            alpha = float(self.config.dirichlet_alpha)
+            eps = float(self.config.dirichlet_epsilon)
+            noise = torch.distributions.Dirichlet(
+                torch.full((K,), alpha, device=dev)
+            ).sample((n,))  # [N, K]
+            priors_root = priors_root * (1.0 - eps) + noise.to(torch.float32) * eps
+
+        # Allocate root at index 0 for every game.
+        self.node_count.fill_(1)
+        self.node_hidden[:, 0] = hidden_batch.to(self.hidden_dtype)
+        # Root reward stays 0; root parent_idx / parent_child_slot stay -1.
+        self.child_actions[:, 0, :] = sampled_actions.to(torch.int32)
+        self.child_priors[:, 0, :] = priors_root
+        # child_visits / child_value_sum / child_rewards / child_node_idx
+        # already at sentinel/zero from _reset.
+
+    def _select(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Vectorized PUCT walk from root to first unexpanded slot.
+
+        Returns:
+            path_node_idx: [N, M] int32 — node visited at each depth (root at
+                depth 0); -1 padding past each game's leaf-parent depth.
+            path_slot: [N, M] int32 — slot in parent at each depth (-1 at depth 0).
+            leaf_parent_node: [N] int32 — node at which selection stopped.
+            leaf_slot: [N] int32 — slot in leaf_parent_node selected for the new leaf.
+            leaf_action: [N] int32 — action at that slot (will be the recurrent_inference input).
+            depth: [N] int32 — index of the leaf_parent in path_node_idx.
+        """
+        n = self._allocated_n
+        m = self._allocated_m
+        dev = self.device
+        discount = float(self.config.discount)
+        arange_n = self._arange_n
+
+        path_node_idx = torch.full((n, m), -1, dtype=torch.int32, device=dev)
+        path_slot = torch.full((n, m), -1, dtype=torch.int32, device=dev)
+        path_node_idx[:, 0] = 0  # root
+
+        current_node = torch.zeros(n, dtype=torch.int32, device=dev)
+        still_walking = torch.ones(n, dtype=torch.bool, device=dev)
+        depth = torch.zeros(n, dtype=torch.int32, device=dev)
+        leaf_slot = torch.zeros(n, dtype=torch.int32, device=dev)
+        leaf_action = torch.zeros(n, dtype=torch.int32, device=dev)
+
+        for step in range(m - 1):
+            cur = current_node.long()
+            # Gather current node's child arrays — [N, K] each.
+            priors = self.child_priors[arange_n, cur]
+            visits = self.child_visits[arange_n, cur]
+            value_sums = self.child_value_sum[arange_n, cur]
+            rewards = self.child_rewards[arange_n, cur]
+            actions = self.child_actions[arange_n, cur]
+            node_visits_cur = self.node_visits[arange_n, cur].to(torch.float32)  # [N]
+
+            # PUCT prior score.
+            pb_c = (
+                torch.log((node_visits_cur + self.PB_C_BASE + 1) / self.PB_C_BASE)
+                + self.PB_C_INIT
+            )  # [N]
+            sqrt_n = torch.sqrt(node_visits_cur)  # [N]
+            visits_f = visits.to(torch.float32)  # [N, K]
+            prior_score = (
+                pb_c.unsqueeze(1) * priors * sqrt_n.unsqueeze(1) / (1.0 + visits_f)
+            )
+
+            # Mover-POV Q (matches mcts.py _select_child_loop).
+            child_value = torch.where(
+                visits_f > 0,
+                value_sums / torch.clamp(visits_f, min=1.0),
+                torch.zeros_like(value_sums),
+            )
+            raw_q = rewards - discount * child_value  # [N, K]
+
+            # Per-game min-max normalize.
+            has_range = (self.mm_max > self.mm_min).unsqueeze(1)  # [N, 1]
+            mm_span = (self.mm_max - self.mm_min).clamp(min=1e-12).unsqueeze(1)
+            q_norm = (raw_q - self.mm_min.unsqueeze(1)) / mm_span
+            normalized_q = torch.where(has_range, q_norm, raw_q)
+            value_score = torch.where(visits_f > 0, normalized_q, torch.zeros_like(normalized_q))
+
+            scores = prior_score + value_score
+            # Mask invalid slots so argmax never picks them.
+            scores = torch.where(
+                actions == -1, torch.full_like(scores, _NEG_INF), scores
+            )
+
+            next_slot = scores.argmax(dim=1)  # [N] int64
+            next_slot_i32 = next_slot.to(torch.int32)
+            chosen_action = actions[arange_n, next_slot]  # [N] int32
+            chosen_child = self.child_node_idx[arange_n, cur, next_slot]  # [N] int32
+
+            # A game stops if it was still_walking AND the chosen slot is unexpanded.
+            unexpanded = chosen_child == -1
+            stops_now = still_walking & unexpanded
+            advance = still_walking & ~unexpanded
+
+            # Capture leaf info for games that stop on this step.
+            leaf_slot = torch.where(stops_now, next_slot_i32, leaf_slot)
+            leaf_action = torch.where(stops_now, chosen_action, leaf_action)
+            depth = torch.where(
+                stops_now, torch.full_like(depth, step), depth
+            )
+
+            # Advance path for games still walking.
+            new_step = step + 1
+            path_node_idx[:, new_step] = torch.where(
+                advance, chosen_child, torch.full_like(chosen_child, -1)
+            )
+            path_slot[:, new_step] = torch.where(
+                advance, next_slot_i32, torch.full_like(next_slot_i32, -1)
+            )
+            current_node = torch.where(advance, chosen_child, current_node)
+
+            still_walking = advance
+            # No early-exit `bool(still_walking.any())` here: the per-step sync
+            # forces the GPU to drain the queue, which under torch.compile +
+            # CUDA graphs costs more than just running every sim's loop to the
+            # full M-1 bound. Iterations past a game's actual leaf depth are
+            # masked out via `still_walking` and write nothing.
+
+        leaf_parent_node = current_node
+        return path_node_idx, path_slot, leaf_parent_node, leaf_slot, leaf_action, depth
+
+    def _expand(
+        self,
+        leaf_parent_node: torch.Tensor,
+        leaf_slot: torch.Tensor,
+        leaf_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Allocate one new node per game; sample K children for it.
+
+        Returns ``(new_node_idx, leaf_value)`` — the new node index per game
+        and the leaf network value (used by backprop).
+        """
+        n = self._allocated_n
+        K = self.K
+        dev = self.device
+        arange_n = self._arange_n
+
+        # Gather parent hidden states.
+        parent_l = leaf_parent_node.long()
+        parent_hidden = self.node_hidden[arange_n, parent_l]  # [N, C, H, W]
+
+        # Cast to compute dtype before the network call. If storage is fp16
+        # and the network is fp32, we'd otherwise hand fp16 into recurrent
+        # ops that don't auto-promote. Autocast handles the down-cast inside
+        # the network when AMP is enabled.
+        compute_dtype = self._compute_dtype()
+        with self._amp_ctx():
+            next_hidden, rewards, policy_logits, leaf_values = self.network.recurrent_inference(
+                parent_hidden.to(compute_dtype),
+                leaf_action.long(),
+            )
+
+        # Sample K leaf children. Option (b): keep duplicates, β̂(slot) = 1/K.
+        leaf_probs = torch.softmax(policy_logits, dim=-1)
+        leaf_sampled = torch.multinomial(leaf_probs, K, replacement=True)  # [N, K] int64
+        leaf_priors = torch.full((n, K), 1.0 / K, dtype=torch.float32, device=dev)
+
+        # Allocate new node slots.
+        new_node_idx = self.node_count.clone()  # [N] int32
+        self.node_count = self.node_count + 1
+        new_l = new_node_idx.long()
+        slot_l = leaf_slot.long()
+
+        # Write new node fields.
+        rewards_f32 = rewards.view(-1).to(torch.float32)
+        self.node_hidden[arange_n, new_l] = next_hidden.to(self.hidden_dtype)
+        self.node_reward[arange_n, new_l] = rewards_f32
+        self.parent_idx[arange_n, new_l] = leaf_parent_node
+        self.parent_child_slot[arange_n, new_l] = leaf_slot
+        self.child_actions[arange_n, new_l, :] = leaf_sampled.to(torch.int32)
+        self.child_priors[arange_n, new_l, :] = leaf_priors
+        # child_visits / child_value_sum / child_rewards / child_node_idx for
+        # the new node remain 0/-1 from _reset.
+
+        # Hook up parent's slot.
+        self.child_node_idx[arange_n, parent_l, slot_l] = new_node_idx
+        # Mirror reward into parent's child_rewards so PUCT picks it up.
+        self.child_rewards[arange_n, parent_l, slot_l] = rewards_f32
+
+        return new_node_idx, leaf_values.view(-1).to(torch.float32)
+
+    def _backprop(
+        self,
+        path_node_idx: torch.Tensor,
+        path_slot: torch.Tensor,
+        depth: torch.Tensor,
+        new_node_idx: torch.Tensor,
+        leaf_slot: torch.Tensor,
+        leaf_value: torch.Tensor,
+    ):
+        """Vectorized backprop: closed-form value-per-depth + parallel scatters.
+
+        Replaces the leaf→root for-loop with a single tensor expression for
+        the per-depth values and three scatter_add_'s for the visit/value/
+        mirror updates. No Python loop, no per-sim syncs.
+
+        Sign convention (mover-POV): the value added to node_value_sum at depth
+        ``d`` (in d's POV) is
+
+            v[d] = node_reward[d+1] − γ·v[d+1],   v[L] = V_leaf
+
+        Closed-form (s = −γ):
+
+            v[d] = (−γ)^(L−d) · V_leaf
+                 + Σ_{k=d+1..L} (−γ)^(k−d−1) · node_reward[k]
+
+        Computed via a suffix-cumsum on s^k · node_reward[k] then a prefix
+        scaling by s^(−d−1). Per-game leaf depth L[g] = depth[g] + 1.
+        """
+        n = self._allocated_n
+        m = self._allocated_m
+        K = self.K
+        dev = self.device
+        discount = float(self.config.discount)
+        arange_n = self._arange_n
+
+        # Extend path with the new leaf node at depth+1.
+        new_depth = depth + 1
+        new_depth_l = new_depth.long()
+        path_node_idx[arange_n, new_depth_l] = new_node_idx
+        path_slot[arange_n, new_depth_l] = leaf_slot
+
+        # ---- Path-aligned reward + valid mask --------------------------------
+        valid_mask = path_node_idx != -1                            # [N, M]
+        path_clamped = path_node_idx.clamp(min=0).long()            # [N, M]
+        R_path = torch.gather(self.node_reward, 1, path_clamped)    # [N, M]
+        R_path = torch.where(valid_mask, R_path, torch.zeros_like(R_path))
+
+        # ---- s^d powers (no negative-base power op) --------------------------
+        # gamma^d via cumprod; sign via parity. Avoids torch ** with neg base.
+        arange_d = torch.arange(m, device=dev, dtype=torch.float32)
+        arange_d_long = arange_d.long()
+        gamma_seed = torch.full((m,), discount, device=dev, dtype=torch.float32)
+        gamma_seed[0] = 1.0
+        gamma_pow = gamma_seed.cumprod(dim=0)                       # [M] = γ^d
+        # (−1)^d → +1 for even d, −1 for odd.
+        sign_pow = 1.0 - 2.0 * (arange_d_long % 2).to(torch.float32)  # [M]
+        s_pow = sign_pow * gamma_pow                                # [M] = (−γ)^d
+
+        # ---- v[d] closed form ------------------------------------------------
+        # u[g, k] = s^k · R_path[g, k];  T[g, d] = Σ_{k≥d} u[g, k] (suffix-cumsum).
+        u = s_pow.unsqueeze(0) * R_path                             # [N, M]
+        T = u.flip(dims=(1,)).cumsum(dim=1).flip(dims=(1,))         # [N, M]
+        # T_shift[g, d] = T[g, d+1] (last col → 0).
+        T_shift = torch.cat(
+            [T[:, 1:], torch.zeros(n, 1, device=dev, dtype=T.dtype)],
+            dim=1,
+        )
+        # inv_pow[d] = s^(−d−1) = sign_inv * γ^(−d−1).
+        # γ^(−d−1) = (1/γ)^(d+1) for γ>0; for γ=1 just 1.
+        inv_gamma = (1.0 / discount) if discount != 0.0 else 0.0
+        inv_gamma_seed = torch.full((m,), inv_gamma, device=dev, dtype=torch.float32)
+        inv_gamma_pow = inv_gamma_seed.cumprod(dim=0)               # [M] = (1/γ)^(d+1)
+        sign_inv = -sign_pow                                         # (−1)^(d+1)
+        inv_pow = sign_inv * inv_gamma_pow                          # [M]
+        first_sum = inv_pow.unsqueeze(0) * T_shift                  # [N, M]
+
+        # leaf_term[g, d] = s^(L[g]−d) · V_leaf for d ≤ L[g], else 0.
+        # L[g] = new_depth[g]; only d ≤ L is meaningful (rest masked away).
+        L_per_game = new_depth.float().unsqueeze(1)                 # [N, 1]
+        leaf_exp = (L_per_game - arange_d.unsqueeze(0)).clamp(min=0)  # [N, M]
+        leaf_gamma_pow = discount ** leaf_exp                       # [N, M]
+        leaf_sign = 1.0 - 2.0 * (leaf_exp.long() % 2).to(torch.float32)
+        leaf_s_pow = leaf_sign * leaf_gamma_pow
+        leaf_mask = (arange_d.unsqueeze(0) <= L_per_game).to(torch.float32)
+        leaf_term = leaf_s_pow * leaf_value.unsqueeze(1) * leaf_mask  # [N, M]
+
+        value_at_d = first_sum + leaf_term                          # [N, M]
+        value_at_d = torch.where(valid_mask, value_at_d, torch.zeros_like(value_at_d))
+
+        # ---- node_visits / node_value_sum scatters ---------------------------
+        # path indices within a single game are unique (tree path), so
+        # scatter_add along dim=1 has no intra-game duplicates. Invalid entries
+        # contribute 0 deltas and harmlessly land on index 0.
+        visit_delta = valid_mask.to(self.node_visits.dtype)         # [N, M]
+        self.node_visits.scatter_add_(1, path_clamped, visit_delta)
+        self.node_value_sum.scatter_add_(1, path_clamped, value_at_d)
+
+        # ---- Mirror to child_visits / child_value_sum ------------------------
+        # parent_for_d[g, d] = path[g, d-1] (path's parent node at depth d).
+        # Sentinel: parent_for_d[g, 0] = 0; mirror_mask masks d=0 out anyway.
+        parent_for_d = torch.cat(
+            [
+                torch.zeros((n, 1), device=dev, dtype=path_node_idx.dtype),
+                path_node_idx[:, :-1],
+            ],
+            dim=1,
+        )
+        parent_clamped = parent_for_d.clamp(min=0).long()           # [N, M]
+        slots_clamped = path_slot.clamp(min=0).long()               # [N, M]
+
+        d_gt_0 = arange_d_long.unsqueeze(0) > 0                     # [1, M]
+        mirror_mask = valid_mask & d_gt_0                           # [N, M]
+
+        # child_visits / child_value_sum mirror node_visits / node_value_sum
+        # at child positions. We can apply the SAME deltas to both because the
+        # mirror is incremented in lock-step (initial child_visits[*, *, *] = 0
+        # at allocation, so the running totals stay in sync).
+        child_visit_delta = mirror_mask.to(self.child_visits.dtype)
+        child_value_delta = torch.where(
+            mirror_mask, value_at_d, torch.zeros_like(value_at_d)
+        )
+
+        # Flatten the (M, K) axis to (M*K) so a single dim=1 scatter_add covers
+        # the (parent_idx, slot) combination. For invalid d the delta is 0;
+        # the destination index is 0 (parent=0, slot=0), so the no-op write
+        # accumulates harmlessly with whatever d=1 wrote (additive identity).
+        flat_child_idx = parent_clamped * K + slots_clamped         # [N, M]
+        self.child_visits.view(n, m * K).scatter_add_(
+            1, flat_child_idx, child_visit_delta
+        )
+        self.child_value_sum.view(n, m * K).scatter_add_(
+            1, flat_child_idx, child_value_delta
+        )
+
+        # ---- MinMaxStats update ----------------------------------------------
+        # q[d] = node.reward − γ · (post_visits_value / post_visit_count).
+        # Reduce min/max per game over the path; mask invalid with ±inf so
+        # they don't shift the range.
+        new_visits_at_d = torch.gather(self.node_visits, 1, path_clamped).to(torch.float32)
+        new_value_sum_at_d = torch.gather(self.node_value_sum, 1, path_clamped)
+        node_value_at_d = new_value_sum_at_d / torch.clamp(new_visits_at_d, min=1.0)
+        q_at_d = R_path - discount * node_value_at_d                # [N, M]
+
+        q_for_min = torch.where(valid_mask, q_at_d, torch.full_like(q_at_d, float("inf")))
+        q_for_max = torch.where(valid_mask, q_at_d, torch.full_like(q_at_d, _NEG_INF))
+        self.mm_min = torch.minimum(self.mm_min, q_for_min.min(dim=1).values)
+        self.mm_max = torch.maximum(self.mm_max, q_for_max.max(dim=1).values)
+
+    # ----------------------------------------------------------- compat shim
+
+    def _build_compat_roots(self, n: int) -> list[MCTSNode]:
+        """Copy root data to CPU and build MCTSNode-equivalent objects.
+
+        Aggregates duplicate slots (option (b)) into per-action totals so the
+        existing ``select_action`` / ``select_action_gumbel`` / replay-buffer
+        plumbing sees one entry per unique sampled action. This is the only
+        sync per ply for the MCTS tree.
+        """
+        # Pack all root-row reads into ONE fp32 tensor for a single .cpu()
+        # transfer. Int32 fields (visit_count, child_actions, child_visits)
+        # cast to fp32 losslessly because every reachable value is < 2^23
+        # (action_space ≤ 4672, max visits ≤ num_simulations).
+        K = self.K
+        packed = torch.cat(
+            [
+                self.node_visits[:, 0:1].to(torch.float32),     # [N, 1]
+                self.node_value_sum[:, 0:1],                     # [N, 1]
+                self.child_actions[:, 0, :].to(torch.float32),   # [N, K]
+                self.child_visits[:, 0, :].to(torch.float32),    # [N, K]
+                self.child_priors[:, 0, :],                       # [N, K]
+                self.child_value_sum[:, 0, :],                    # [N, K]
+                self.child_rewards[:, 0, :],                      # [N, K]
+            ],
+            dim=1,
+        )
+        cpu = packed.cpu().numpy()                               # ONE sync
+        root_visit_count = cpu[:, 0]
+        root_value_sum = cpu[:, 1]
+        root_actions = cpu[:, 2 : 2 + K]
+        root_visits = cpu[:, 2 + K : 2 + 2 * K]
+        root_priors = cpu[:, 2 + 2 * K : 2 + 3 * K]
+        root_value_sums_per_slot = cpu[:, 2 + 3 * K : 2 + 4 * K]
+        root_rewards_per_slot = cpu[:, 2 + 4 * K : 2 + 5 * K]
+
+        roots: list[MCTSNode] = []
+        for g in range(n):
+            actions_row = root_actions[g]
+            valid = actions_row != -1
+            actions_v = actions_row[valid]
+            visits_v = root_visits[g][valid].astype(np.float64)
+            priors_v = root_priors[g][valid].astype(np.float64)
+            value_sums_v = root_value_sums_per_slot[g][valid].astype(np.float64)
+            rewards_v = root_rewards_per_slot[g][valid].astype(np.float64)
+
+            # Aggregate by unique action (collapse option-(b) duplicates).
+            if actions_v.size == 0:
+                # Pathological — terminal state at root. Caller shouldn't hit this.
+                node = MCTSNode(visit_count=0, value_sum=0.0)
+                node.child_actions = np.zeros(0, dtype=np.int64)
+                node.child_visits = np.zeros(0, dtype=np.float64)
+                node.child_priors = np.zeros(0, dtype=np.float64)
+                node.child_value_sums = np.zeros(0, dtype=np.float64)
+                node.child_rewards = np.zeros(0, dtype=np.float64)
+                node.children = []
+                roots.append(node)
+                continue
+
+            unique, inverse = np.unique(actions_v, return_inverse=True)
+            agg_visits = np.zeros(len(unique), dtype=np.float64)
+            agg_priors = np.zeros(len(unique), dtype=np.float64)
+            agg_value_sums = np.zeros(len(unique), dtype=np.float64)
+            agg_rewards = np.zeros(len(unique), dtype=np.float64)
+            count_per_action = np.zeros(len(unique), dtype=np.float64)
+            np.add.at(agg_visits, inverse, visits_v)
+            np.add.at(agg_priors, inverse, priors_v)
+            np.add.at(agg_value_sums, inverse, value_sums_v)
+            np.add.at(count_per_action, inverse, np.ones_like(visits_v))
+            # child_rewards is constant per action (deterministic dynamics);
+            # take the mean over duplicate slots.
+            np.add.at(agg_rewards, inverse, rewards_v)
+            agg_rewards = agg_rewards / np.clip(count_per_action, 1.0, None)
+
+            node = MCTSNode(
+                visit_count=int(root_visit_count[g]),
+                value_sum=float(root_value_sum[g]),
+            )
+            node.child_actions = unique.astype(np.int64)
+            node.child_visits = agg_visits
+            node.child_priors = agg_priors
+            node.child_value_sums = agg_value_sums
+            node.child_rewards = agg_rewards
+            # Lazy children list — present so .expanded() returns True.
+            node.children = [None] * len(unique)
+            roots.append(node)
+
+        return roots

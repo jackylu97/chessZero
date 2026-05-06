@@ -357,6 +357,222 @@ def play_games_parallel_gpu(
     return histories
 
 
+def play_games_parallel_gpu_resident(
+    network,
+    config,
+    num_games: int,
+    device: str = "cuda",
+    training_step: int = 0,
+) -> list[GameHistory]:
+    """Fully GPU-resident batched self-play.
+
+    All per-ply state lives on the GPU: observations, legal masks, MCTS
+    output (action_probs, root_value), env state, sticky-done mask, game
+    outcome, per-game move count. The CPU sees the data exactly once at
+    end-of-batch, when we transfer the accumulated tensors and build the
+    Python ``GameHistory`` records the rest of the pipeline expects.
+
+    Sync count per ply: **0**. Sync count per batch: ~10 (the end-of-batch
+    bulk transfer of stacked history + outcome + length).
+
+    Requires ``config.use_tensor_mcts=True`` (only TensorMCTS exposes the
+    GPU-resident ``run_batch_gpu`` entry point) and the chess GPU env.
+    Random opening plies, per-game temperature schedule, and Sampled MuZero
+    are all handled GPU-side.
+    """
+    from ..games.chess import ChessGame
+    from ..games.chess_gpu import GpuChessGame
+    from ..mcts.tensor_mcts import TensorMCTS, select_action_gpu
+
+    if not getattr(config, "use_tensor_mcts", False):
+        raise ValueError(
+            "play_games_parallel_gpu_resident requires use_tensor_mcts=True."
+        )
+    if getattr(config, "use_gumbel", False):
+        raise NotImplementedError(
+            "Gumbel root not supported in the GPU-resident path."
+        )
+
+    network.eval()
+    chess_game = ChessGame()
+    gpu_game = GpuChessGame()
+
+    dtype_str = getattr(config, "tensor_mcts_hidden_dtype", "float32")
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    hidden_dtype = dtype_map[dtype_str]
+    mcts = TensorMCTS(
+        network, chess_game, config, device=device, hidden_dtype=hidden_dtype
+    )
+
+    action_space_size = chess_game.action_space_size
+    n_frames = int(getattr(config, "history_frames", 1))
+    n_random = int(getattr(config, "random_opening_plies", 0))
+    temp_init = get_temperature(training_step, config)
+    temp_final = float(config.temperature_final)
+    temp_drop = int(config.temperature_drop_step)
+
+    # Cap loop length so we always have a static upper bound; ChessGame.max_plies
+    # does the in-engine termination, alive_mask handles per-game stopping.
+    max_plies_cap = int(getattr(ChessGame, "max_plies", 400))
+
+    state = gpu_game.reset_batch(num_games, device=device)
+
+    # Single-frame observation history for AlphaZero-style stacking. Newest
+    # frame at slot 0; rolled forward each ply. Initial all-zero (matches
+    # stack_with_history's "missing past frames are zero-padded" behavior).
+    sample_obs = gpu_game.to_tensor_batch(state)                   # [N, C, H, W]
+    c, h, w = sample_obs.shape[1:]
+    obs_window = torch.zeros(
+        num_games, n_frames, c, h, w, device=device, dtype=sample_obs.dtype
+    )
+
+    # Per-batch GPU history accumulators. Stack at end; one transfer.
+    obs_per_ply: list[torch.Tensor] = []           # [T] of [N, C, H, W]
+    actions_per_ply: list[torch.Tensor] = []       # [T] of [N] int64
+    policies_per_ply: list[torch.Tensor] = []      # [T] of [N, A] float32
+    values_per_ply: list[torch.Tensor] = []        # [T] of [N] float32
+    rewards_per_ply: list[torch.Tensor] = []       # [T] of [N] float32
+    legal_masks_per_ply: list[torch.Tensor] = []   # [T] of [N, A] bool
+
+    alive_mask = torch.ones(num_games, dtype=torch.bool, device=device)
+    game_outcome = torch.zeros(num_games, dtype=torch.int32, device=device)
+    game_length = torch.zeros(num_games, dtype=torch.int32, device=device)
+    move_count = torch.zeros(num_games, dtype=torch.int32, device=device)
+
+    iteration = 0
+    log_every = 20
+
+    # Pre-allocate the all-False sentinel mask for terminal-row safety.
+    # For terminal games, legal_mask is all-zero (no legal moves) and
+    # softmax/multinomial would NaN out. We mark action 0 as legal so MCTS
+    # picks something; step_batch keeps state.done sticky so the choice is
+    # discarded by the alive_mask gating below.
+    sentinel_legal = torch.zeros(num_games, action_space_size, dtype=torch.bool, device=device)
+    sentinel_legal[:, 0] = True
+
+    for ply in range(max_plies_cap):
+        # 1. Build batched obs + legal mask GPU-side. No transfer.
+        single_obs = gpu_game.to_tensor_batch(state)                  # [N, C, H, W]
+        legal_mask = gpu_game.legal_mask(state)                       # [N, A] bool
+        # Sentinel any all-zero rows (terminal states) so MCTS multinomial
+        # doesn't NaN.
+        any_legal = legal_mask.any(dim=1, keepdim=True)               # [N, 1] bool
+        legal_mask = torch.where(any_legal, legal_mask, sentinel_legal)
+
+        # 2. Update rolling history window (newest frame at slot 0).
+        obs_window = torch.roll(obs_window, shifts=1, dims=1)
+        obs_window[:, 0] = single_obs
+        # Stack along channel dim → [N, n_frames * C, H, W] (matches stack_with_history).
+        stacked_obs = obs_window.reshape(num_games, n_frames * c, h, w)
+
+        # 3. MCTS — but skip for the random-opening plies (all alive games
+        # have move_count == ply during the opening because move_count
+        # increments by alive_mask each ply and starts at 0). For ply >=
+        # n_random, every alive game is out of opening.
+        if ply < n_random:
+            # Pure-random opening: uniform sample from legal_mask, no MCTS.
+            uniform_logits = legal_mask.to(torch.float32)
+            action = torch.multinomial(uniform_logits, 1).squeeze(1).long()
+            policy = torch.zeros(
+                num_games, action_space_size, device=device, dtype=torch.float32
+            )
+            policy.scatter_(1, action.unsqueeze(1), 1.0)
+            value = torch.zeros(num_games, device=device, dtype=torch.float32)
+        else:
+            root_data = mcts.run_batch_gpu(stacked_obs, legal_mask, add_noise=True)
+
+            # 4. Per-game temperature for sampling (AlphaZero schedule).
+            is_post_drop = move_count >= temp_drop
+            temperature = torch.where(
+                is_post_drop,
+                torch.full_like(move_count, fill_value=int(temp_final * 1000)).to(torch.float32) / 1000.0,
+                torch.full_like(move_count, fill_value=int(temp_init * 1000)).to(torch.float32) / 1000.0,
+            )
+            action, policy = select_action_gpu(
+                root_data["child_actions"],
+                root_data["child_visits"],
+                temperature,
+                action_space_size,
+            )
+            value = root_data["root_value"]
+
+        # 6. Step env.
+        state, rewards, _ = gpu_game.step_batch(state, action)
+
+        # 7. Append to GPU accumulators (no transfer).
+        obs_per_ply.append(single_obs)
+        actions_per_ply.append(action)
+        policies_per_ply.append(policy)
+        values_per_ply.append(value)
+        rewards_per_ply.append(rewards.to(torch.float32))
+        legal_masks_per_ply.append(legal_mask)
+
+        # 8. Update accounting (sticky-done semantics).
+        newly_done = state.done & alive_mask
+        game_outcome = torch.where(newly_done, state.winner.to(torch.int32), game_outcome)
+        game_length = torch.where(alive_mask, game_length + 1, game_length)
+        move_count = move_count + alive_mask.to(torch.int32)
+        alive_mask = alive_mask & ~state.done
+
+        iteration += 1
+        if iteration % log_every == 0:
+            # Best-effort progress log — one sync per 20 plies (negligible).
+            n_done = int((~alive_mask).sum().item())
+            tqdm.write(
+                f"  self-play (gpu-resident) batch: move {iteration}, "
+                f"{num_games - n_done}/{num_games} active, {n_done} done"
+            )
+
+        # Optional early-exit (one sync per ply if checked every iter).
+        # Amortize by checking every 16 plies — much cheaper than per-ply sync.
+        if (ply & 15) == 15 and not bool(alive_mask.any()):
+            break
+
+    # 9. Capture final terminal observation.
+    final_obs = gpu_game.to_tensor_batch(state)                      # [N, C, H, W]
+
+    # 10. Stack and bulk-transfer to CPU. ONE pass.
+    obs_stack = torch.stack(obs_per_ply, dim=1)                       # [N, T, C, H, W]
+    actions_stack = torch.stack(actions_per_ply, dim=1)               # [N, T]
+    policies_stack = torch.stack(policies_per_ply, dim=1)             # [N, T, A]
+    values_stack = torch.stack(values_per_ply, dim=1)                 # [N, T]
+    rewards_stack = torch.stack(rewards_per_ply, dim=1)               # [N, T]
+    legal_masks_stack = torch.stack(legal_masks_per_ply, dim=1)       # [N, T, A]
+
+    obs_cpu = obs_stack.cpu().numpy()
+    actions_cpu = actions_stack.cpu().numpy()
+    policies_cpu = policies_stack.cpu().numpy()
+    values_cpu = values_stack.cpu().numpy()
+    rewards_cpu = rewards_stack.cpu().numpy()
+    legal_masks_cpu = legal_masks_stack.cpu().numpy()
+    final_obs_cpu = final_obs.cpu().numpy()
+    game_length_cpu = game_length.cpu().numpy()
+    game_outcome_cpu = game_outcome.cpu().numpy()
+
+    # 11. Build GameHistory objects.
+    histories: list[GameHistory] = []
+    for g in range(num_games):
+        L = int(game_length_cpu[g])
+        h_g = GameHistory(game_name=config.game)
+        for t in range(L):
+            h_g.observations.append(torch.from_numpy(obs_cpu[g, t]))
+            h_g.actions.append(int(actions_cpu[g, t]))
+            h_g.policies.append(policies_cpu[g, t])
+            h_g.root_values.append(float(values_cpu[g, t]))
+            legal_idx = legal_masks_cpu[g, t].nonzero()[0].tolist()
+            h_g.legal_actions_list.append(legal_idx)
+            h_g.rewards.append(float(rewards_cpu[g, t]))
+        h_g.game_outcome = int(game_outcome_cpu[g])
+        h_g.observations.append(torch.from_numpy(final_obs_cpu[g]))
+        histories.append(h_g)
+
+    return histories
+
+
 def run_self_play(
     network,
     game: Game,
@@ -378,15 +594,26 @@ def run_self_play(
         and n_parallel > 1
     )
     if use_gpu_chess:
+        # Pick fully GPU-resident loop (zero per-ply syncs) when both
+        # use_tensor_mcts and use_gpu_resident_self_play are set.
+        use_resident = (
+            bool(getattr(config, "use_gpu_resident_self_play", False))
+            and bool(getattr(config, "use_tensor_mcts", False))
+        )
+        play_fn = (
+            play_games_parallel_gpu_resident if use_resident else play_games_parallel_gpu
+        )
+        desc = "Self-play (gpu-resident)" if use_resident else "Self-play (gpu)"
+
         histories = []
         remaining = num_games
         iterator = range(0, num_games, n_parallel)
         if show_progress:
-            iterator = tqdm(iterator, desc="Self-play (gpu)", leave=False)
+            iterator = tqdm(iterator, desc=desc, leave=False)
         for _ in iterator:
             batch = min(n_parallel, remaining)
             histories.extend(
-                play_games_parallel_gpu(network, config, batch, device, training_step)
+                play_fn(network, config, batch, device, training_step)
             )
             remaining -= batch
         return histories

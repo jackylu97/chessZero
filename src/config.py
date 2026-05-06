@@ -237,6 +237,12 @@ class MuZeroConfig:
     # MuZero §5.1 Proposed Modification only; Gumbel root is not yet
     # implemented in the tensor path. See plan_tensor_mcts_implementation.md.
     use_tensor_mcts: bool = False
+    # Fully GPU-resident self-play loop. Requires use_tensor_mcts + use_gpu_chess.
+    # Eliminates per-ply CPU↔GPU syncs at the env/MCTS boundary (currently ~12
+    # per ply); the entire batch's history lives on the GPU until ONE bulk
+    # transfer at end-of-batch. Available for chess only (only game with a GPU
+    # batched env). Implementation: src/training/self_play.py::play_games_parallel_gpu_resident.
+    use_gpu_resident_self_play: bool = False
     # Storage dtype for the per-node hidden states in TensorMCTS. The
     # node_hidden tensor is by far the dominant memory ([N, M, C, H, W]); at
     # chess preset (N=256, M=401, C=256, H=W=8) it's ~6.7 GB at fp32 and
