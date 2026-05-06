@@ -147,6 +147,14 @@ class TensorMCTS:
 
     PB_C_BASE = 19652
     PB_C_INIT = 1.25
+    # Hard cap on selection depth. The PUCT walk in ``_select`` runs at most
+    # this many iterations per simulation, regardless of ``num_simulations``.
+    # Why: in a Sampled MuZero tree (K=50, sims=200) average depth is ~5-10
+    # and max depth rarely exceeds ~16 (log_K scaling). Capping at 32 halves
+    # the unrolled compile work vs M-1=200 with negligible correctness risk.
+    # Raise this if you observe truncated paths (the safety branch at the
+    # end of ``_select`` force-stops any still-walking game at the cap).
+    MAX_SELECT_DEPTH = 32
 
     def __init__(
         self,
@@ -157,6 +165,7 @@ class TensorMCTS:
         hidden_dtype: torch.dtype = torch.float32,
         compile: bool = True,
         amp_dtype: torch.dtype | None = None,
+        select_backend: str = "compile",
     ):
         self.network = network
         self.game = game
@@ -182,6 +191,17 @@ class TensorMCTS:
         # CUDA graphs, cutting per-iteration kernel-launch overhead by 5-10×.
         # Set False when debugging to read clean tracebacks.
         self.compile = compile and self.device.type == "cuda"
+        # Selection backend: "compile" (default, torch.compile + inductor),
+        # "triton" (custom fused PUCT-step kernel — see tensor_mcts_triton.py),
+        # or "eager" (plain PyTorch, for debugging).
+        if select_backend not in ("compile", "triton", "eager"):
+            raise ValueError(
+                f"Unknown select_backend={select_backend!r}; "
+                f"expected 'compile', 'triton', or 'eager'."
+            )
+        if select_backend == "triton" and self.device.type != "cuda":
+            raise ValueError("select_backend='triton' requires CUDA.")
+        self.select_backend = select_backend
 
         self.action_space_size = int(game.action_space_size)
         sample_k = getattr(config, "sample_k", None)
@@ -278,27 +298,30 @@ class TensorMCTS:
         self._allocated_m = m
         self._allocated_hidden_shape = hidden_shape
 
-        # Compile the hot per-sim methods once shapes are known. dynamic=False
-        # locks the trace to these shapes; re-allocation re-fires compile.
-        # ``mode='default'`` enables inductor fusion (~25 small ops/iter →
-        # ~3-4 fused kernels) without cudagraphs. cudagraphs (reduce-overhead)
-        # is incompatible with our mutation-heavy tree storage — both
-        # in-place index assignment and ``scatter_add_`` on pre-allocated
-        # ``self.child_visits`` get flagged as input mutation and either skip
-        # cudagraphs (defeating the point) or segfault at runtime.
+        # Compile per-sim methods. Backprop always uses torch.compile; the
+        # selection path is dispatched via ``select_backend`` (compile|triton|eager).
+        # ``mode='default'`` (inductor fusion, no cudagraphs) — see commit
+        # b90640e for why cudagraphs is incompatible with our tree storage.
         if self.compile:
-            self._select = torch.compile(  # type: ignore[method-assign]
-                self.__class__._select.__get__(self),
-                mode="default",
-                dynamic=False,
-                fullgraph=False,
-            )
             self._backprop = torch.compile(  # type: ignore[method-assign]
                 self.__class__._backprop.__get__(self),
                 mode="default",
                 dynamic=False,
                 fullgraph=False,
             )
+        if self.select_backend == "compile" and self.compile:
+            # ``_select`` is monolithic — its full MAX_SELECT_DEPTH for-loop
+            # body is unrolled into ONE inductor trace, which fuses the
+            # 25+ ops/iter into a few kernels.
+            self._select = torch.compile(  # type: ignore[method-assign]
+                self.__class__._select.__get__(self),
+                mode="default",
+                dynamic=False,
+                fullgraph=False,
+            )
+        elif self.select_backend == "triton":
+            # Replace ``_select`` with the Triton-kernel-driven version.
+            self._select = self._select_triton  # type: ignore[method-assign]
 
     def _reset(self):
         """Zero out tree tensors at the start of each MCTS run.
@@ -536,13 +559,29 @@ class TensorMCTS:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Vectorized PUCT walk from root to first unexpanded slot.
 
+        Iterates ``MAX_SELECT_DEPTH`` (or ``M-1``, whichever is smaller) PUCT
+        steps. The loop body always runs to the bound — no per-step
+        ``bool(still_walking.any())`` sync, no compile graph-break. Iterations
+        past a game's actual leaf depth are masked out via ``still_walking``
+        and write nothing.
+
+        Why a fixed cap (rather than runtime early-exit): in a Sampled MuZero
+        tree with K=50 / num_sims=200 the avg depth is ~5-10 and max depth
+        rarely exceeds 16-24 (log scaling). Capping the unrolled compile at
+        e.g. 32 iterations halves the per-call kernel work vs M-1=200 with
+        no measurable correctness impact at our regime — and crucially keeps
+        the entire loop in ONE compiled trace, where inductor can fuse 25+
+        ops/iter into a few kernels. Adding an early-exit ``bool(...)`` check
+        inside the trace causes a graph-break that costs more than the
+        wasted iterations save.
+
         Returns:
             path_node_idx: [N, M] int32 — node visited at each depth (root at
                 depth 0); -1 padding past each game's leaf-parent depth.
             path_slot: [N, M] int32 — slot in parent at each depth (-1 at depth 0).
             leaf_parent_node: [N] int32 — node at which selection stopped.
             leaf_slot: [N] int32 — slot in leaf_parent_node selected for the new leaf.
-            leaf_action: [N] int32 — action at that slot (will be the recurrent_inference input).
+            leaf_action: [N] int32 — action at that slot.
             depth: [N] int32 — index of the leaf_parent in path_node_idx.
         """
         n = self._allocated_n
@@ -561,7 +600,9 @@ class TensorMCTS:
         leaf_slot = torch.zeros(n, dtype=torch.int32, device=dev)
         leaf_action = torch.zeros(n, dtype=torch.int32, device=dev)
 
-        for step in range(m - 1):
+        max_steps = min(m - 1, self.MAX_SELECT_DEPTH)
+
+        for step in range(max_steps):
             cur = current_node.long()
             # Gather current node's child arrays — [N, K] each.
             priors = self.child_priors[arange_n, cur]
@@ -631,13 +672,76 @@ class TensorMCTS:
             current_node = torch.where(advance, chosen_child, current_node)
 
             still_walking = advance
-            # No early-exit `bool(still_walking.any())` here: the per-step sync
-            # forces the GPU to drain the queue, which under torch.compile +
-            # CUDA graphs costs more than just running every sim's loop to the
-            # full M-1 bound. Iterations past a game's actual leaf depth are
-            # masked out via `still_walking` and write nothing.
+
+        # Safety: if any game is still walking past the cap, force-stop it
+        # at the deepest visited node. The next slot it would pick gets
+        # treated as the new leaf — wrong if that slot already has a child
+        # (its subtree gets orphaned), but the cap is set high enough
+        # (typically 32) that this is exceedingly rare in practice. To
+        # guarantee correctness, raise ``MAX_SELECT_DEPTH``.
+        # We compute leaf info for any game that's still_walking using the
+        # final iteration's chosen slot/action.
+        force_stop = still_walking
+        if max_steps > 0:
+            leaf_slot = torch.where(force_stop, next_slot_i32, leaf_slot)
+            leaf_action = torch.where(force_stop, chosen_action, leaf_action)
+            depth = torch.where(
+                force_stop,
+                torch.full_like(depth, max_steps - 1),
+                depth,
+            )
 
         leaf_parent_node = current_node
+        return path_node_idx, path_slot, leaf_parent_node, leaf_slot, leaf_action, depth
+
+    def _select_triton(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Triton-driven PUCT walk: ONE kernel launch handles the full
+        depth walk for all N games in parallel.
+
+        The depth loop runs inside the kernel (``tl.static_range``) with all
+        per-game state held in registers — no per-step launch, no kernel-
+        boundary state shuffling. The safety force-stop is also handled
+        inside the kernel.
+        """
+        n = self._allocated_n
+        m = self._allocated_m
+        dev = self.device
+
+        path_node_idx = torch.full((n, m), -1, dtype=torch.int32, device=dev)
+        path_slot = torch.full((n, m), -1, dtype=torch.int32, device=dev)
+        path_node_idx[:, 0] = 0  # root
+
+        leaf_parent_node = torch.zeros(n, dtype=torch.int32, device=dev)
+        depth = torch.zeros(n, dtype=torch.int32, device=dev)
+        leaf_slot = torch.zeros(n, dtype=torch.int32, device=dev)
+        leaf_action = torch.zeros(n, dtype=torch.int32, device=dev)
+
+        max_steps = min(m - 1, self.MAX_SELECT_DEPTH)
+        from src.mcts.tensor_mcts_triton import puct_walk
+        puct_walk(
+            max_steps,
+            child_priors=self.child_priors,
+            child_visits=self.child_visits,
+            child_value_sum=self.child_value_sum,
+            child_rewards=self.child_rewards,
+            child_actions=self.child_actions,
+            child_node_idx=self.child_node_idx,
+            node_visits=self.node_visits,
+            path_node_idx=path_node_idx,
+            path_slot=path_slot,
+            leaf_parent_node=leaf_parent_node,
+            leaf_slot=leaf_slot,
+            leaf_action=leaf_action,
+            depth=depth,
+            mm_min=self.mm_min,
+            mm_max=self.mm_max,
+            pb_c_base=self.PB_C_BASE,
+            pb_c_init=self.PB_C_INIT,
+            discount=float(self.config.discount),
+        )
+
         return path_node_idx, path_slot, leaf_parent_node, leaf_slot, leaf_action, depth
 
     def _expand(

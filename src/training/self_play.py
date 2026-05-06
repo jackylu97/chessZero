@@ -42,6 +42,7 @@ def _make_batched_mcts(network, game, config, device):
             network, game, config,
             device=device,
             hidden_dtype=dtype_map[dtype_str],
+            select_backend=getattr(config, "tensor_mcts_select_backend", "compile"),
         )
     return BatchedMCTS(network, game, config, device)
 
@@ -405,7 +406,8 @@ def play_games_parallel_gpu_resident(
     }
     hidden_dtype = dtype_map[dtype_str]
     mcts = TensorMCTS(
-        network, chess_game, config, device=device, hidden_dtype=hidden_dtype
+        network, chess_game, config, device=device, hidden_dtype=hidden_dtype,
+        select_backend=getattr(config, "tensor_mcts_select_backend", "compile"),
     )
 
     action_space_size = chess_game.action_space_size

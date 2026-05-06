@@ -445,17 +445,70 @@ def _slider_attacks_one_seed(seed_per_sq: torch.Tensor, empty: torch.Tensor,
     """Per-from-sq slider attacks: `seed_per_sq[N, 64]` int64 bitboards
     (one bit per from-sq) → `(N, 64)` int64 attack bitboards in `direction`.
 
-    Calls `_slider_attacks` for each of the 64 source squares. Each call's
-    seed is a single-bit bb; the fill stops at first blocker per-square.
+    Vectorized across the 64-source-square axis: a single Kogge-Stone fill
+    on `[N, 64]` int64 broadcasts the shared `empty[N, 1]` mask while each
+    column carries its own per-square seed. PyTorch's bitwise shift acts
+    elementwise on int64, so the same shift instruction handles all 64
+    source squares at once. Replaces what used to be a Python `for s in
+    range(64)` loop firing 64 separate per-direction GPU launches —
+    eliminates ~63 of every 64 launches in the slider-attack hot path.
     """
-    N = seed_per_sq.shape[0]
-    out = torch.zeros_like(seed_per_sq)
-    # Process one from-sq at a time. Each iteration is a batched (N,) op.
-    for s in range(64):
-        seed = seed_per_sq[:, s]                                 # (N,)
-        out_s = _slider_attacks(seed, empty, direction)          # (N,)
-        out[:, s] = out_s
-    return out
+    g = seed_per_sq                                           # (N, 64)
+    e = empty.unsqueeze(-1)                                   # (N, 1) broadcast
+
+    if direction == DIR_N:
+        g = g | (e & (g << 8));  e = e & (e << 8)
+        g = g | (e & (g << 16)); e = e & (e << 16)
+        g = g | (e & (g << 32))
+        return g << 8
+    if direction == DIR_S:
+        g = g | (e & _lsr(g, 8));  e = e & _lsr(e, 8)
+        g = g | (e & _lsr(g, 16)); e = e & _lsr(e, 16)
+        g = g | (e & _lsr(g, 32))
+        return _lsr(g, 8)
+    if direction == DIR_E:
+        m = NOT_FILE_A
+        e = e & m
+        g = g | (e & (g << 1)); e = e & (e << 1)
+        g = g | (e & (g << 2)); e = e & (e << 2)
+        g = g | (e & (g << 4))
+        return (g << 1) & m
+    if direction == DIR_W:
+        m = NOT_FILE_H
+        e = e & m
+        g = g | (e & _lsr(g, 1)); e = e & _lsr(e, 1)
+        g = g | (e & _lsr(g, 2)); e = e & _lsr(e, 2)
+        g = g | (e & _lsr(g, 4))
+        return _lsr(g, 1) & m
+    if direction == DIR_NE:
+        m = NOT_FILE_A
+        e = e & m
+        g = g | (e & (g << 9));  e = e & (e << 9)
+        g = g | (e & (g << 18)); e = e & (e << 18)
+        g = g | (e & (g << 36))
+        return (g << 9) & m
+    if direction == DIR_NW:
+        m = NOT_FILE_H
+        e = e & m
+        g = g | (e & (g << 7));  e = e & (e << 7)
+        g = g | (e & (g << 14)); e = e & (e << 14)
+        g = g | (e & (g << 28))
+        return (g << 7) & m
+    if direction == DIR_SE:
+        m = NOT_FILE_A
+        e = e & m
+        g = g | (e & _lsr(g, 7));  e = e & _lsr(e, 7)
+        g = g | (e & _lsr(g, 14)); e = e & _lsr(e, 14)
+        g = g | (e & _lsr(g, 28))
+        return _lsr(g, 7) & m
+    if direction == DIR_SW:
+        m = NOT_FILE_H
+        e = e & m
+        g = g | (e & _lsr(g, 9));  e = e & _lsr(e, 9)
+        g = g | (e & _lsr(g, 18)); e = e & _lsr(e, 18)
+        g = g | (e & _lsr(g, 36))
+        return _lsr(g, 9) & m
+    raise ValueError(f"unknown direction {direction}")
 
 
 def _bishop_attacks_per_sq(seeds: torch.Tensor, empty: torch.Tensor) -> torch.Tensor:

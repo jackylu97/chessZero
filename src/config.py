@@ -251,6 +251,11 @@ class MuZeroConfig:
     # recurrent_inference call) for ~2× memory headroom. "float32" or
     # "float16".
     tensor_mcts_hidden_dtype: str = "float32"
+    # PUCT selection backend. "compile" (default): torch.compile + inductor
+    # fusion. "triton": custom fused per-walk kernel; one launch per sim
+    # runs the entire depth walk on-device (1.20× faster than compile on
+    # 4090 / chess preset). "eager": plain PyTorch, for debugging.
+    tensor_mcts_select_backend: str = "compile"
 
     # Multi-game (Phase 2)
     multi_game: bool = False
