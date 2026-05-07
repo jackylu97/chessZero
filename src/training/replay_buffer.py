@@ -701,3 +701,39 @@ class ReplayBuffer:
 
     def __len__(self) -> int:
         return len(self.buffer)
+
+    def nbytes(self) -> dict[str, int]:
+        """Return per-component byte counts for the live buffer.
+
+        Helps diagnose whether RSS growth tracks logical buffer size or
+        something else (view aliasing, fragmentation, retained accumulators).
+
+        Returns dict with keys ``observations``, ``policies``, ``legal_actions``,
+        ``scalars`` (actions/rewards/values/etc.), ``total``, plus a
+        ``view_parents`` field that sums the size of unique numpy ``.base``
+        arrays referenced by ``policies`` slices — if non-zero, slices are
+        pinning their parent buffers (the self_play.py:585/587 leak signature).
+        """
+        obs_b = pol_b = legal_b = scalar_b = 0
+        seen_parents: dict[int, int] = {}
+        for g in self.buffer:
+            for o in g.observations:
+                obs_b += o.element_size() * o.numel()
+            for p in g.policies:
+                if p is not None and p.size:
+                    pol_b += p.nbytes
+                    base = p.base
+                    if base is not None:
+                        seen_parents.setdefault(id(base), base.nbytes)
+            for l in g.legal_actions_list:
+                legal_b += 28 * len(l)  # python int overhead
+            scalar_b += 8 * (len(g.actions) + len(g.rewards) + len(g.root_values))
+        view_parents_b = sum(seen_parents.values())
+        return {
+            "observations": obs_b,
+            "policies": pol_b,
+            "legal_actions": legal_b,
+            "scalars": scalar_b,
+            "total": obs_b + pol_b + legal_b + scalar_b,
+            "view_parents": view_parents_b,
+        }

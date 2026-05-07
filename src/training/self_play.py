@@ -38,11 +38,14 @@ def _make_batched_mcts(network, game, config, device):
                 f"Unknown tensor_mcts_hidden_dtype={dtype_str!r}; "
                 f"must be one of {list(dtype_map)}."
             )
+        amp_str = getattr(config, "tensor_mcts_amp_dtype", None)
+        amp_dtype = dtype_map[amp_str] if amp_str else None
         return TensorMCTS(
             network, game, config,
             device=device,
             hidden_dtype=dtype_map[dtype_str],
             select_backend=getattr(config, "tensor_mcts_select_backend", "compile"),
+            amp_dtype=amp_dtype,
         )
     return BatchedMCTS(network, game, config, device)
 
@@ -410,10 +413,13 @@ def play_games_parallel_gpu_resident(
         "bfloat16": torch.bfloat16,
     }
     hidden_dtype = dtype_map[dtype_str]
+    amp_str = getattr(config, "tensor_mcts_amp_dtype", None)
+    amp_dtype = dtype_map[amp_str] if amp_str else None
     mcts = TensorMCTS(
         network, chess_game, config, device=device, hidden_dtype=hidden_dtype,
         select_backend=getattr(config, "tensor_mcts_select_backend", "compile"),
         use_subtree_reuse=getattr(config, "tensor_mcts_subtree_reuse", False),
+        amp_dtype=amp_dtype,
     )
 
     action_space_size = chess_game.action_space_size
@@ -582,15 +588,20 @@ def play_games_parallel_gpu_resident(
         L = int(game_length_cpu[g])
         h_g = GameHistory(game_name=config.game)
         for t in range(L):
-            h_g.observations.append(torch.from_numpy(obs_cpu[g, t]))
+            # .copy() / torch.from_numpy(...).clone() materializes per-ply slices.
+            # Without this, each appended view pins the entire [N, T, ...] parent
+            # array via numpy's `.base` reference — every GameHistory in the buffer
+            # held the whole batch's policies (~1.9 GB) and obs (~0.5 GB) parents
+            # alive, leaking ~1.5 GB per self-play batch.
+            h_g.observations.append(torch.from_numpy(obs_cpu[g, t]).clone())
             h_g.actions.append(int(actions_cpu[g, t]))
-            h_g.policies.append(policies_cpu[g, t])
+            h_g.policies.append(policies_cpu[g, t].copy())
             h_g.root_values.append(float(values_cpu[g, t]))
             legal_idx = legal_masks_cpu[g, t].nonzero()[0].tolist()
             h_g.legal_actions_list.append(legal_idx)
             h_g.rewards.append(float(rewards_cpu[g, t]))
         h_g.game_outcome = int(game_outcome_cpu[g])
-        h_g.observations.append(torch.from_numpy(final_obs_cpu[g]))
+        h_g.observations.append(torch.from_numpy(final_obs_cpu[g]).clone())
         histories.append(h_g)
 
     return histories

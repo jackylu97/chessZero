@@ -50,6 +50,44 @@ class MuZeroTrainer:
         self.game = game
         self.network = network.to(device)
         self.device = device
+
+        # CUDA inference perf knobs. cudnn.benchmark auto-tunes conv algorithms
+        # for the network's static shapes (one-time cost first call). TF32 lets
+        # Ampere/Ada use tensor cores even without explicit fp16 autocast.
+        # Both are no-ops on CPU; idempotent on repeated calls.
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        # torch.compile the MCTS-side inference methods only. MCTS uses the
+        # scalar variants (initial_inference / recurrent_inference) under
+        # network.eval() with no autograd — this is the high-frequency path
+        # (hundreds of forwards per ply during self-play) and the only one
+        # where compile is clearly safe.
+        #
+        # We deliberately DO NOT compile initial_inference_logits /
+        # recurrent_inference_logits — those are the trainer's path and run
+        # under fp16 autocast WITH autograd active. The autocast +
+        # autograd + inductor combo SIGSEGV'd at production-net depth (16
+        # blocks) on 2026-05-07 run; eager mode is fine, and training still
+        # gets autocast's tensor-core speedup at the op level.
+        #
+        # Bound-method compile: instance attributes hold the compiled
+        # callables; underlying parameters are unchanged so save/load
+        # state_dict work without translation. mode='default' = inductor
+        # fusion only, no CUDA graphs.
+        if (
+            getattr(self.config, "compile_network", False)
+            and device.startswith("cuda")
+            and torch.cuda.is_available()
+        ):
+            self.network.initial_inference = torch.compile(
+                self.network.initial_inference, mode="default"
+            )
+            self.network.recurrent_inference = torch.compile(
+                self.network.recurrent_inference, mode="default"
+            )
         self.run_id = run_id
         self.checkpoint_dir = Path(checkpoints_dir) / config.game / run_id
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -187,13 +225,86 @@ class MuZeroTrainer:
         self.writer.close()
         print("Training complete!")
 
+    def _memory_snapshot(self, stage: str) -> None:
+        """Log granular memory metrics under memory/* tag at current global_step.
+
+        ``stage`` is appended to each tag (e.g. ``memory/rss_gb_after_selfplay``).
+        Captures process-level RSS/USS/PSS, torch GPU allocator stats, replay
+        buffer logical bytes (with view-parent pinning detection), and optimizer
+        state size. Used at self-play boundaries; cheap enough to call
+        per-step but currently only fires around self-play.
+        """
+        proc = psutil.Process()
+        try:
+            mfi = proc.memory_full_info()
+            rss = mfi.rss / 1e9
+            uss = getattr(mfi, "uss", 0) / 1e9
+            pss = getattr(mfi, "pss", 0) / 1e9
+            shared = getattr(mfi, "shared", 0) / 1e9
+        except Exception:
+            mfi = proc.memory_info()
+            rss = mfi.rss / 1e9
+            uss = pss = shared = 0.0
+
+        step = self.global_step
+        self.writer.add_scalar(f"memory/rss_gb_{stage}", rss, step)
+        self.writer.add_scalar(f"memory/uss_gb_{stage}", uss, step)
+        self.writer.add_scalar(f"memory/pss_gb_{stage}", pss, step)
+        self.writer.add_scalar(f"memory/shared_gb_{stage}", shared, step)
+
+        # GPU allocator detail.
+        if self.device == "cuda":
+            self.writer.add_scalar(f"memory/gpu_alloc_gb_{stage}",
+                                   torch.cuda.memory_allocated() / 1e9, step)
+            self.writer.add_scalar(f"memory/gpu_reserved_gb_{stage}",
+                                   torch.cuda.memory_reserved() / 1e9, step)
+            try:
+                stats = torch.cuda.memory_stats()
+                host_alloc = stats.get("host_alloc_bytes.all.current", 0) / 1e9
+                self.writer.add_scalar(f"memory/gpu_host_alloc_gb_{stage}", host_alloc, step)
+            except Exception:
+                pass
+
+        # Replay buffer breakdown (cheap — iterates lists, no copies).
+        try:
+            nb = self.replay_buffer.nbytes()
+            self.writer.add_scalar(f"memory/buffer_total_gb_{stage}", nb["total"] / 1e9, step)
+            self.writer.add_scalar(f"memory/buffer_obs_gb_{stage}", nb["observations"] / 1e9, step)
+            self.writer.add_scalar(f"memory/buffer_policies_gb_{stage}", nb["policies"] / 1e9, step)
+            self.writer.add_scalar(f"memory/buffer_view_parents_gb_{stage}",
+                                   nb["view_parents"] / 1e9, step)
+        except Exception:
+            pass
+
+        # Optimizer state (Adam: 2 moments per param).
+        try:
+            opt_bytes = sum(
+                t.numel() * t.element_size()
+                for s in self.optimizer.state.values()
+                for t in s.values() if torch.is_tensor(t)
+            )
+            self.writer.add_scalar(f"memory/optimizer_state_gb_{stage}", opt_bytes / 1e9, step)
+        except Exception:
+            pass
+
     def _run_self_play(self):
         """Generate self-play games and add to replay buffer."""
         proc = psutil.Process()
         rss_before = proc.memory_info().rss / 1e9
         if self.device == "cuda":
+            # Release fragmented allocator reservations before self-play.
+            # Training-step autograd + reanalyze leave the CUDA caching
+            # allocator with high reserved-vs-active ratios; without an
+            # empty_cache(), self-play's tree allocations may force
+            # cudaFree-cycling syncs (observed: 3× per-ply slowdown after
+            # the first reanalyze co-fire on 2026-05-06 run). One call
+            # before self-play resets the reservation pool cheaply (the
+            # cache is rebuilt from new allocations as needed).
+            torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             gpu_before = torch.cuda.memory_allocated() / 1e9
+
+        self._memory_snapshot("before_selfplay")
 
         games = run_self_play(
             self.network, self.game, self.config,
@@ -227,6 +338,9 @@ class MuZeroTrainer:
         if self.device == "cuda":
             self.writer.add_scalar("memory/gpu_alloc_gb_after_selfplay", gpu_after, self.global_step)
             self.writer.add_scalar("memory/gpu_peak_gb_selfplay", gpu_peak, self.global_step)
+
+        # Granular post-selfplay snapshot — buffer detail, USS/PSS, GPU host alloc.
+        self._memory_snapshot("after_selfplay")
 
         gpu_msg = f" | GPU alloc {gpu_after:.2f} GB (peak {gpu_peak:.2f})" if self.device == "cuda" else ""
         ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
@@ -747,6 +861,17 @@ class MuZeroTrainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "injection_loaded": self._injection_loaded,
         }, self.checkpoint_dir / f"checkpoint_{step}.pt")
+
+        # save_buffer=False short-circuits the .buf write entirely. Used when
+        # the compact format is unstable (chess preset 2026-05-07 onward).
+        # Resume falls through to empty-buffer cold-start — see
+        # load_checkpoint's "No saved buffer found" path.
+        if not getattr(self.config, "save_buffer", True):
+            tqdm.write(
+                f"Step {step}: skipped buffer pickle "
+                f"(save_buffer=False; resume will cold-start buffer)"
+            )
+            return
 
         # Only pickle self-play games. Warmstart games are on disk as Stockfish
         # shards and can be reloaded via --warmstart-path on resume; including

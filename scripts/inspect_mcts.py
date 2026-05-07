@@ -63,6 +63,7 @@ def load_checkpoint(checkpoint_path: str, config, game, device: str = "cuda"):
         fc_hidden=config.fc_hidden,
         value_support_size=config.value_support_size,
         reward_support_size=config.reward_support_size,
+        action_embed_dim=getattr(config, "action_embed_dim", 16),
         use_consistency_loss=config.use_consistency_loss,
         proj_hid=config.proj_hid,
         proj_out=config.proj_out,

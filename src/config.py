@@ -18,6 +18,19 @@ class MuZeroConfig:
     fc_hidden: int = 64
     value_support_size: int = 10  # half-width of categorical support for value
     reward_support_size: int = 1  # half-width of categorical support for reward
+    # Dimension of the per-action learned embedding fed to the dynamics network.
+    # Replaces the prior scalar broadcast (action_index / action_space_size, 1 channel),
+    # which had only one weight slice in dynamics.conv_in for the action input —
+    # architecturally incapable of producing qualitatively different transformations
+    # per action. Probed on the 2026_05_07_small_cold step-1000 checkpoint, that
+    # collapsed to cos(dynamics(h, a_i), dynamics(h, a_j)) = 0.9999 across 20 distinct
+    # chess actions. With ``nn.Embedding(action_space_size, action_embed_dim)``,
+    # conv_in gets ``action_embed_dim × hidden_planes × 9`` parameters dedicated to
+    # encoding "what does action a do."
+    # 16 is the default. Setting ``action_embed_dim = action_space_size`` recovers
+    # (un-trained) one-hot — LightZero's default. If 16 under-discriminates after a
+    # sanity run, bump toward one-hot. See design.md § Action encoding.
+    action_embed_dim: int = 16
 
     # MCTS
     num_simulations: int = 25
@@ -264,6 +277,28 @@ class MuZeroConfig:
     # Falls back to a fresh search whenever the chosen action wasn't
     # materialized or the subtree+new-sims would overflow M.
     tensor_mcts_subtree_reuse: bool = False
+    # Inference autocast dtype for TensorMCTS network forward calls. None
+    # disables; "float16" enables fp16 autocast on cuda (Ampere/Ada tensor
+    # cores). At production net (256×16) this is the single largest network-
+    # forward speedup available — ~1.3-1.5× vs fp32. Tree storage is unaffected
+    # (controlled separately by tensor_mcts_hidden_dtype).
+    tensor_mcts_amp_dtype: str | None = None
+    # Whether to save the replay buffer (.buf) alongside the network
+    # checkpoint (.pt) at each save interval. When False, only .pt is
+    # saved; resume always cold-starts the buffer via self-play. Useful
+    # when buffer save/load is unstable (e.g., compact-format encoding bug
+    # observed 2026-05-07 — illegal moves in stored actions due to a
+    # chess_gpu pin-detection mismatch). Costs ~30 min cold-start self-play
+    # per resume in exchange for skipping buffer corruption.
+    save_buffer: bool = True
+    # torch.compile the network's inference methods (initial_inference_logits,
+    # recurrent_inference_logits, initial_inference, recurrent_inference).
+    # Uses mode='default' — pure inductor fusion, no CUDA graphs (cudagraphs
+    # mode crashed with TensorMCTS internal compile in earlier benches). Wins
+    # come from kernel fusion across conv/norm/relu boundaries; ~1.3× speedup
+    # at production net. Compile happens after the network is on-device but
+    # the underlying nn.Module is unchanged, so checkpoints save/load cleanly.
+    compile_network: bool = False
 
     # Multi-game (Phase 2)
     multi_game: bool = False
@@ -311,35 +346,40 @@ def get_config(game: str) -> MuZeroConfig:
         ),
         "chess": MuZeroConfig(
             game="chess",
-            hidden_planes=256,
-            num_residual_blocks=16,
+            # Iteration-sized net (2026-05-07). Halved from the production preset
+            # (256×16, fc=256) to ~128×8, fc=128 for ~4× faster network forward
+            # (half channels × half depth). Trades final strength for turnaround
+            # time during config/loss/data-pipeline iteration. Bump back up once
+            # the recipe is dialed in.
+            hidden_planes=128,
+            num_residual_blocks=8,
             latent_h=8, latent_w=8,
-            fc_hidden=256,
-            num_simulations=400,     # 400 to give Q-backups room to dominate the diffuse prior
-                                     # at our policy strength. Doubled from 200 for the WDL+history
-                                     # bundle (2026-04-25); production AlphaZero used 800. Trade:
-                                     # ~2× self-play wall-time per batch.
+            fc_hidden=128,
+            num_simulations=200,     # 200 paired with the smaller net for fast iteration.
+                                     # Production setpoint was 400 (AlphaZero used 800).
+                                     # Halve self-play wall-time vs the production preset.
             batch_size=256,
             training_steps=150000,
             checkpoint_interval=1000,
             lr_decay_milestones=[0.5, 0.75],  # decay 10× at 50k and 75k
             lr_warmup_steps=500,               # ramp up to lr over first 500 steps;
                                                # AMP scale is still stabilizing there.
-            replay_buffer_size=2500,    # memory-capped, not game-capped: self-play games
-                                        # avg 277 plies × ~25 KB/ply ≈ 6.7 MB/game, so
-                                        # 2500 slots peaks at ~17 GB RAM — safe on a
-                                        # 32 GB host (was 5000 → ~34 GB peak, OOM'd
-                                        # around step 36k of 2026_04_22_0002 as self-play
-                                        # games displaced shorter stockfish ones).
-                                        # Revert to 5000 once compact GameHistory
-                                        # encoding lands (see plan_compact_gamehistory_encoding.md).
-            warmstart_buffer_size=1000, # Reserve 1000/2500 slots for the warmstart pool;
-                                        # the remaining 1500 hold self-play games. Each
-                                        # pool evicts FIFO within its own cap, so the
-                                        # warmstart anchor for `warmstart_sample_frac=0.4`
-                                        # survives past pool exhaustion. With ~80 plies/game,
-                                        # 1000 distinct Stockfish games provides ~80k
-                                        # positions to draw from, plenty for 102 batch slots.
+            replay_buffer_size=1500,    # memory-capped, not game-capped. Live measurement
+                                        # 2026-05-07 (cold-start, smaller net): ~9 MB/game in
+                                        # RSS (vs the 6.7 MB stale comment that assumed mixed
+                                        # warmstart+self-play). Pure self-play under the 400-
+                                        # ply cap is heavier per-game. 1500 slots peaks at
+                                        # ~15.5 GB total RSS (incl. ~2 GB overhead), safely
+                                        # under the 24 GB WSL cap (~8 GB headroom for ply-
+                                        # count drift). Was 2500 → projected ~24.5 GB right
+                                        # at the wall. The compact GameHistory encoding
+                                        # (plan_compact_gamehistory_encoding.md) only fixes
+                                        # disk; in-memory buffer expands back to dense on
+                                        # load, so the cap is the only RAM lever.
+            warmstart_buffer_size=None, # Cold-start mode (2026-05-07): no warmstart pool,
+                                        # all 2500 slots available for self-play games.
+                                        # Pair with stockfish_injection_games=0 and
+                                        # warmstart_sample_frac=0.0 below.
             min_buffer_size=500,
             num_self_play_games=256,   # one num_parallel_games sweep per round
             self_play_interval=512,   # 2:1 train:selfplay ratio
@@ -348,7 +388,11 @@ def get_config(game: str) -> MuZeroConfig:
                                         # warmup (below). See design.md § Deferred: Double
                                         # Base Learning Rate for Chess.
             value_loss_weight_warmstart=1.0,  # clean Stockfish targets: strong supervision
-            value_loss_weight_selfplay=0.25,  # noisy MCTS bootstraps: paper-standard damp
+            value_loss_weight_selfplay=1.0,   # MC returns (td_steps=-1) → no bootstrap noise; WDL
+                                               # cross-entropy is naturally small (max ln(3)≈1.1).
+                                               # Bumped from 0.25: AlphaZero/Lc0 reference setpoint;
+                                               # value head was stuck in constant-prediction local
+                                               # min at 0.25 (pred_std/target_std ≈ 0.03 at step 1k).
             value_head_type="wdl",      # Lc0-style 3-output W/D/L classifier; replaces
                                         # the 5-bin scalar head. Targets game outcome z directly,
                                         # eliminating the predict-zero collapse failure mode where
@@ -359,10 +403,8 @@ def get_config(game: str) -> MuZeroConfig:
                                         # encouraging decisive moves over solid draws. Doesn't
                                         # affect training targets.
             q_ratio=0.0,                # Lc0 default; pure z target.
-            warmstart_sample_frac=0.4,  # 40% of every training batch comes from warmstart games
-                                        # (external_values populated). Permanent Stockfish anchor —
-                                        # prevents catastrophic forgetting during self-play handoff
-                                        # that drove the basin collapse in runs 0001/0002.
+            warmstart_sample_frac=0.0,  # Cold-start mode (2026-05-07): no warmstart anchor.
+                                        # Bump back to 0.4 when re-enabling the Stockfish pool.
             history_frames=8,           # AlphaZero canonical: 8 ply frames stacked. Lets the
                                         # network perceive threefold repetition + 50-move-rule
                                         # progress (a stateless encoder cannot). Reconstructed
@@ -388,10 +430,8 @@ def get_config(game: str) -> MuZeroConfig:
             sample_k=50,               # Sampled MuZero: sample K distinct actions per node (Hubert 2021 Proposed Modification)
             eval_interval=5000,
             use_consistency_loss=True, # EfficientZero SimSiam consistency loss on dynamics rollouts
-            stockfish_injection_games=256,     # 256 games every 240 steps ≈ 1.07 g/step
-            stockfish_injection_interval=240,  # ~3 center-touches per position (×6 unroll = ~18 loss terms);
-                                               # with a 32k-game pool this runs ~30k steps before exhaustion,
-                                               # at which point self-play + reanalyze flip on automatically
+            stockfish_injection_games=0,       # Cold-start mode (2026-05-07): no Stockfish injection.
+            stockfish_injection_interval=0,    # Self-play and reanalyze run from step 0.
             per_alpha=0.0,               # DeepMind uses uniform sampling (not PER) for board games.
                                         # PER adds IS-weight noise with no benefit when TD errors
                                         # cluster near zero (draw basin). Matches paper Appendix.
@@ -416,8 +456,37 @@ def get_config(game: str) -> MuZeroConfig:
             use_tensor_mcts=True,
             use_gpu_resident_self_play=True,
             tensor_mcts_select_backend="triton",
-            tensor_mcts_subtree_reuse=True,
+            #   tensor_mcts_subtree_reuse=False: disabled 2026-05-07 after
+            #     buffer-corruption investigation. _refresh_reused_root's
+            #     legal-mask filter on carried-over slots passed code review
+            #     but empirically illegal actions (pinned-bishop moves)
+            #     ended up with high visit weight in MCTS root at ply 185 of
+            #     game 3 in checkpoint_3000.buf. Defensive disable until the
+            #     mismatch between code-review and observed behavior is
+            #     understood. Costs perf-neutral ~0% (the carried-over speedup
+            #     was already marginal — see plan_tensor_mcts.md).
+            tensor_mcts_subtree_reuse=False,
             tensor_mcts_hidden_dtype="float16",
+            #   tensor_mcts_amp_dtype="float16": fp16 autocast on the network
+            #     forward (initial + recurrent inference). At production net
+            #     (256 planes × 16 blocks) this dominates per-ply time;
+            #     ~1.3-1.5× speedup over fp32 on Ampere/Ada tensor cores.
+            #   compile_network=False: torch.compile disabled. Originally turned
+            #     on for ~1.3-1.7× on inference path, but observed reproducible
+            #     SIGILL crash on 2026-05-07 during reanalyze — BatchedMCTS calls
+            #     into the compiled bound methods from a different context (no_grad
+            #     decorator + different invocation pattern than self-play), forcing
+            #     dynamo recompilation and tripping a fault. Disabled until we
+            #     have a clean compile-and-skip-on-recompile gate. AMP autocast
+            #     still gives ~1.3-1.5×.
+            tensor_mcts_amp_dtype="float16",
+            compile_network=False,
+            #   save_buffer=False: don't pickle the replay buffer to disk.
+            #     v3 compact format hit reproducible "illegal move on load"
+            #     errors (chess_gpu pin-detection edge case — bishop pinned
+            #     to king along rank). Resume cold-starts buffer via self-
+            #     play; ~30 min cost is cheaper than debugging buffer corruption.
+            save_buffer=False,
         ),
         "checkers": MuZeroConfig(
             game="checkers",

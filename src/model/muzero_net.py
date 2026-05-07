@@ -58,8 +58,31 @@ class RepresentationNetwork(nn.Module):
 class DynamicsNetwork(nn.Module):
     """g(hidden_state, action) -> (next_hidden_state, reward)
 
-    Action is encoded as a normalized scalar plane broadcast over latent dims.
-    Includes a residual skip connection from input hidden state.
+    Action is encoded as a learned ``nn.Embedding`` of dimension ``action_embed_dim``,
+    broadcast spatially as that many channels and concatenated with the hidden state.
+    Includes a residual skip from the input hidden state matching LightZero's
+    DynamicsNetwork (lzero/model/muzero_model.py:519-525, "the residual link").
+
+    Why a learned embedding over the prior scalar broadcast (action / action_space_size,
+    1 channel)?
+    The conv_in input channel for the action gets a single weight slice in
+    ``conv_in.weight``, so the dynamics output across different actions can only
+    differ by a scalar magnitude — architecturally incapable of producing
+    qualitatively different transformations per action. Probed on the
+    2026_05_07_small_cold checkpoint (step 1000), this manifested as
+    ``cos(dynamics(h, a_i), dynamics(h, a_j)) = 0.9999`` across 20 distinct chess
+    moves: action-blind dynamics, flat Q values across MCTS, policy collapses to
+    "do-nothing" attractors (king shuffles → 3-fold repetition).
+    A learned ``nn.Embedding(action_space_size, embed_dim)`` gives ``conv_in`` a
+    full ``embed_dim`` × hidden_planes × 9 weight block to encode per-action
+    transformations — closer to LightZero's one-hot (4672 channels for chess) but
+    without paying the full one-hot cost. ``embed_dim=16`` is the configurable
+    default; ``embed_dim=action_space_size`` recovers (un-trained) one-hot.
+
+    Fallback: if learned embedding still under-discriminates after a sanity-check
+    run, switch to LightZero-style one-hot by setting ``action_embed_dim`` to
+    ``action_space_size`` in the config (or implement the one-hot path explicitly
+    if the lookup-table init becomes a bottleneck).
     """
 
     def __init__(
@@ -70,16 +93,23 @@ class DynamicsNetwork(nn.Module):
         latent_h: int,
         latent_w: int,
         fc_hidden: int,
+        action_embed_dim: int = 16,
         reward_support_size: int = 1,
     ):
         super().__init__()
         self.action_space_size = action_space_size
+        self.action_embed_dim = action_embed_dim
         self.latent_h = latent_h
         self.latent_w = latent_w
         self.reward_support_size = reward_support_size
 
-        # Conv to reduce channels after concatenating action plane
-        self.conv_in = nn.Conv2d(hidden_planes + 1, hidden_planes, 3, padding=1, bias=False)
+        # Learned per-action embedding broadcast spatially. Default N(0, 1) init.
+        self.action_embedding = nn.Embedding(action_space_size, action_embed_dim)
+
+        # Conv consumes hidden_state + action embedding (embed_dim channels).
+        self.conv_in = nn.Conv2d(
+            hidden_planes + action_embed_dim, hidden_planes, 3, padding=1, bias=False
+        )
         self.bn_in = norm_layer(hidden_planes, (latent_h, latent_w))
 
         self.blocks = nn.Sequential(
@@ -105,14 +135,15 @@ class DynamicsNetwork(nn.Module):
             reward_logits: (B, 2*support_size+1)
         """
         b = hidden_state.shape[0]
-        # Encode action as a normalized scalar broadcast over spatial dims
-        action_plane = action.float() / self.action_space_size
-        action_plane = action_plane.view(b, 1, 1, 1).expand(b, 1, self.latent_h, self.latent_w)
+        # Lookup learned per-action embedding, then broadcast spatially.
+        action_embed = self.action_embedding(action.long())              # (B, embed_dim)
+        action_plane = action_embed.view(b, self.action_embed_dim, 1, 1)
+        action_plane = action_plane.expand(b, self.action_embed_dim, self.latent_h, self.latent_w)
 
         x = torch.cat([hidden_state, action_plane], dim=1)
         x = self.conv_in(x)
         x = self.bn_in(x)
-        # Residual skip connection from input hidden state
+        # Residual skip connection from input hidden state (matches LightZero).
         x = F.relu(x + hidden_state)
         x = self.blocks(x)
         x = _min_max_normalize(x)
@@ -251,6 +282,7 @@ class MuZeroNetwork(nn.Module):
         fc_hidden: int = 128,
         value_support_size: int = 10,
         reward_support_size: int = 1,
+        action_embed_dim: int = 16,
         use_consistency_loss: bool = False,
         proj_hid: int = 1024,
         proj_out: int = 1024,
@@ -277,7 +309,9 @@ class MuZeroNetwork(nn.Module):
         )
         self.dynamics = DynamicsNetwork(
             hidden_planes, num_blocks, action_space_size,
-            latent_h, latent_w, fc_hidden, reward_support_size,
+            latent_h, latent_w, fc_hidden,
+            action_embed_dim=action_embed_dim,
+            reward_support_size=reward_support_size,
         )
         self.prediction = PredictionNetwork(
             hidden_planes, action_space_size,
@@ -476,6 +510,11 @@ class MultiGameMuZeroNetwork(nn.Module):
     def recurrent_inference(
         self, hidden_state: torch.Tensor, action: torch.Tensor, game_name: str
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # TODO(2026-05-07, multi-game): port the per-game ``nn.Embedding`` action
+        # encoding from DynamicsNetwork. The scalar broadcast below has the same
+        # action-blindness pathology that motivated the DynamicsNetwork rewrite
+        # (cos(dynamics(h, a_i), dynamics(h, a_j))≈1.0). Multi-game training is
+        # currently dormant so the bug is not blocking; fix before re-enabling.
         b = hidden_state.shape[0]
         max_action = max(1, action.max().item() + 1)
         action_plane = action.float() / max_action
