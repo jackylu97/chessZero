@@ -403,6 +403,21 @@ def get_config(game: str) -> MuZeroConfig:
                                          # undertrained policy (avg 30-40 legal chess moves in middlegame), and
                                          # Gumbel's advantages were validated on Go where priors are sharper.
                                          # Code path stays flag-gated. See design.md § Deferred: Drop Gumbel.
+            # Self-play fast path (default ON for chess). 18× over the legacy
+            # BatchedMCTS+python-chess path on a 4090 at our preset.
+            #   use_gpu_chess: GpuChessGame batched env (replaces python-chess).
+            #   use_tensor_mcts: GPU tensor MCTS (TensorMCTS) instead of BatchedMCTS.
+            #   use_gpu_resident_self_play: 0-sync self-play loop, end-of-batch transfer.
+            #   tensor_mcts_select_backend='triton': fused PUCT-walk Triton kernel.
+            #   tensor_mcts_subtree_reuse: carry chosen child's subtree across plies
+            #     (search-quality boost; M doubled to fit carry-over + new sims).
+            #   tensor_mcts_hidden_dtype='float16': halves node_hidden memory.
+            use_gpu_chess=True,
+            use_tensor_mcts=True,
+            use_gpu_resident_self_play=True,
+            tensor_mcts_select_backend="triton",
+            tensor_mcts_subtree_reuse=True,
+            tensor_mcts_hidden_dtype="float16",
         ),
         "checkers": MuZeroConfig(
             game="checkers",
