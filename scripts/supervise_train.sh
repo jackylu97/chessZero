@@ -139,7 +139,11 @@ while true; do
   } | tee -a "$TRAIN_LOG"
 
   start_ts=$(date +%s)
-  .venv/bin/python scripts/_faulthandler_bootstrap.py scripts/train.py \
+  # ``python -u``: unbuffered stdout/stderr. Without it, stdout is fully-
+  # buffered when piped through tee (4 KB buffer), so ``tqdm.write`` from
+  # the inner self-play loops doesn't appear for many minutes. The tqdm
+  # progress bar itself uses stderr (line-buffered) and shows up fine.
+  .venv/bin/python -u scripts/_faulthandler_bootstrap.py scripts/train.py \
     "${PASSTHROUGH[@]}" "${resume_args[@]}" 2>&1 | tee -a "$TRAIN_LOG"
   rc=${PIPESTATUS[0]}
   elapsed=$(($(date +%s) - start_ts))
