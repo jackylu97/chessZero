@@ -332,8 +332,21 @@ def attacks_by_color(state: "ChessBatchedState", color: int,
     pawn_a = _from_sq_attacks(pawns, pawn_table)
     knight_a = _from_sq_attacks(knights, knight_table)
     king_a = _from_sq_attacks(king, king_table)
-    bishop_a = _bishop_attacks(bishops | queens, empty)
-    rook_a = _rook_attacks(rooks | queens, empty)
+    # Slider attacks via fused 8-direction Triton kernel: one launch covers
+    # all 8 ray directions for both bishop+queen (diagonal subset) and
+    # rook+queen (orthogonal subset). Replaces 8 separate _slider_attacks
+    # calls with one — see chess_gpu_triton.py.
+    if state.device.type == "cuda":
+        from src.games.chess_gpu_triton import slider_attacks_8way
+        bq_attacks = slider_attacks_8way((bishops | queens), empty)   # (N, 8)
+        rq_attacks = slider_attacks_8way((rooks | queens), empty)     # (N, 8)
+        # Bishops use diagonals: NE, SE, SW, NW (= cols 1, 3, 5, 7).
+        # Rooks use orthogonals: N, E, S, W (= cols 0, 2, 4, 6).
+        bishop_a = bq_attacks[:, 1] | bq_attacks[:, 3] | bq_attacks[:, 5] | bq_attacks[:, 7]
+        rook_a = rq_attacks[:, 0] | rq_attacks[:, 2] | rq_attacks[:, 4] | rq_attacks[:, 6]
+    else:
+        bishop_a = _bishop_attacks(bishops | queens, empty)
+        rook_a = _rook_attacks(rooks | queens, empty)
     return pawn_a | knight_a | king_a | bishop_a | rook_a
 
 
@@ -745,31 +758,46 @@ def _compute_pin_filter(king_bb: torch.Tensor, our_occ: torch.Tensor,
     pin_filter = torch.full((N, 64), -1, dtype=torch.int64, device=device)  # all-bits-set initially
     empty = ~occupancy
 
+    if device.type == "cuda":
+        from src.games.chess_gpu_triton import (
+            slider_attacks_8way,
+            slider_attacks_8way_per_dir_empty,
+        )
+        # First pass: 8 directions sharing ``empty``.
+        first_all = slider_attacks_8way(king_bb, empty)              # (N, 8)
+        first_blocker_all = first_all & occupancy.unsqueeze(-1)       # (N, 8)
+        # X-ray empties per direction: ~ (occupancy ^ first_blocker[d]).
+        # = empty | first_blocker_all[d] (since first_blocker is in occupancy).
+        empties_x = empty.unsqueeze(-1) | first_blocker_all            # (N, 8)
+        # Second pass: 8 directions with per-direction empty mask.
+        second_all = slider_attacks_8way_per_dir_empty(king_bb, empties_x)  # (N, 8)
+    else:
+        first_all = None
+
     for d in range(8):
         is_orthogonal = d in (DIR_N, DIR_S, DIR_E, DIR_W)
         opp_slider = opp_rq if is_orthogonal else opp_bq
 
-        # First-blocker ray: cast from king as a slider in dir d.
-        first_attacks = _slider_attacks(king_bb, empty, d)         # (N,)
-        first_blocker = first_attacks & occupancy                    # (N,) — single-bit bb of nearest piece on this ray
-        first_is_ours = (first_blocker & our_occ) != 0               # (N,) bool
+        if first_all is not None:
+            first_attacks = first_all[:, d]                          # (N,)
+            first_blocker = first_blocker_all[:, d]                  # (N,)
+            second_attacks = second_all[:, d]                        # (N,)
+        else:
+            first_attacks = _slider_attacks(king_bb, empty, d)
+            first_blocker = first_attacks & occupancy
+            occ_x = occupancy & ~first_blocker
+            empty_x = ~occ_x
+            second_attacks = _slider_attacks(king_bb, empty_x, d)
 
-        # X-ray: remove first blocker from occupancy, recast.
-        occ_x = occupancy & ~first_blocker
-        empty_x = ~occ_x
-        second_attacks = _slider_attacks(king_bb, empty_x, d)        # (N,)
-        second_blocker = second_attacks & occ_x
+        first_is_ours = (first_blocker & our_occ) != 0               # (N,) bool
+        occ_x_d = occupancy & ~first_blocker
+        second_blocker = second_attacks & occ_x_d
         second_is_pinner = (second_blocker & opp_slider) != 0        # (N,) bool
 
         is_pin = first_is_ours & second_is_pinner                    # (N,) bool
 
-        # Pin ray: the bitboard the pinned piece can move to without breaking the pin —
-        # squares between king and pinner, plus the pinner's square itself. That's
-        # `first_attacks | second_attacks` (first up to first blocker; second extends
-        # to pinner via the x-ray).
         pin_ray = first_attacks | second_attacks                     # (N,)
 
-        # Scatter `pin_ray` into pin_filter at the pinned-piece's square.
         pinned_at_sq = _bb_to_per_sq_bool(first_blocker)             # (N, 64) — True at the pinned sq
         pin_filter = torch.where(
             pinned_at_sq & is_pin.unsqueeze(-1),
@@ -819,15 +847,28 @@ def _compute_check_resolve(king_bb: torch.Tensor, our_occ: torch.Tensor,
     knight_checkers = _from_sq_attacks(king_bb, KNIGHT_ATTACKS.to(device)) & opp_pieces[:, P_KNIGHT]
 
     # Slider checkers: cast bishop/rook attacks from king_bb through actual
-    # occupancy; intersect with opp sliders.
-    bishop_attacks_from_king = (
-        _slider_attacks(king_bb, empty, DIR_NE) | _slider_attacks(king_bb, empty, DIR_NW)
-        | _slider_attacks(king_bb, empty, DIR_SE) | _slider_attacks(king_bb, empty, DIR_SW)
-    )
-    rook_attacks_from_king = (
-        _slider_attacks(king_bb, empty, DIR_N) | _slider_attacks(king_bb, empty, DIR_S)
-        | _slider_attacks(king_bb, empty, DIR_E) | _slider_attacks(king_bb, empty, DIR_W)
-    )
+    # occupancy; intersect with opp sliders. Use the fused 8-direction
+    # Triton kernel — one launch covers both diagonals and orthogonals.
+    if king_bb.device.type == "cuda":
+        from src.games.chess_gpu_triton import slider_attacks_8way
+        king_attacks = slider_attacks_8way(king_bb, empty)             # (N, 8)
+        bishop_attacks_from_king = (
+            king_attacks[:, DIR_NE] | king_attacks[:, DIR_SE]
+            | king_attacks[:, DIR_SW] | king_attacks[:, DIR_NW]
+        )
+        rook_attacks_from_king = (
+            king_attacks[:, DIR_N] | king_attacks[:, DIR_S]
+            | king_attacks[:, DIR_E] | king_attacks[:, DIR_W]
+        )
+    else:
+        bishop_attacks_from_king = (
+            _slider_attacks(king_bb, empty, DIR_NE) | _slider_attacks(king_bb, empty, DIR_NW)
+            | _slider_attacks(king_bb, empty, DIR_SE) | _slider_attacks(king_bb, empty, DIR_SW)
+        )
+        rook_attacks_from_king = (
+            _slider_attacks(king_bb, empty, DIR_N) | _slider_attacks(king_bb, empty, DIR_S)
+            | _slider_attacks(king_bb, empty, DIR_E) | _slider_attacks(king_bb, empty, DIR_W)
+        )
     bishop_checkers = bishop_attacks_from_king & (opp_pieces[:, P_BISHOP] | opp_pieces[:, P_QUEEN])
     rook_checkers = rook_attacks_from_king & (opp_pieces[:, P_ROOK] | opp_pieces[:, P_QUEEN])
 
