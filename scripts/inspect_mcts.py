@@ -222,6 +222,10 @@ def main():
                    help="Mix Dirichlet exploration noise into root prior. "
                         "Off by default: cleaner snapshot of the network's "
                         "policy at the root.")
+    p.add_argument("--pv", type=int, default=0, metavar="DEPTH",
+                   help="After dumping the tree, also print the principal "
+                        "variation: the most-visited line walked DEPTH plies "
+                        "deep. Pass e.g. --pv 8 for an 8-ply PV. 0 disables.")
     args = p.parse_args()
 
     config = get_config("chess")
@@ -282,6 +286,55 @@ def main():
         draw_score=getattr(config, "draw_score", 0.0),
         show_network=args.show_network,
     )
+
+    if args.pv > 0:
+        print()
+        print(f"=== Principal variation (most-visited line, ≤ {args.pv} plies) ===")
+        pv_moves: list[str] = []
+        node = root
+        board = state.board.copy()
+        for _ in range(args.pv):
+            if node.child_actions is None or len(node.child_actions) == 0:
+                break
+            visits = np.asarray(node.child_visits)
+            if visits.sum() == 0:
+                break
+            slot = int(np.argmax(visits))
+            action = int(node.child_actions[slot])
+            move = _action_to_move(action, board)
+            if move is None or move not in board.legal_moves:
+                pv_moves.append(f"<illegal {action}>")
+                break
+            try:
+                pv_moves.append(board.san(move))
+            except Exception:
+                pv_moves.append(move.uci())
+            board.push(move)
+            child = node.children[slot] if slot < len(node.children) else None
+            if child is None or not child.expanded():
+                break
+            node = child
+        # Render with move numbers, classical chess notation.
+        rendered: list[str] = []
+        side_at_root = state.board.turn  # WHITE / BLACK
+        ply = 0
+        for san in pv_moves:
+            if side_at_root == chess.WHITE:
+                # White moves at even plies (0, 2, ...).
+                if ply % 2 == 0:
+                    rendered.append(f"{state.board.fullmove_number + ply // 2}.{san}")
+                else:
+                    rendered.append(san)
+            else:
+                # Black moves first; fullmove number unchanged on black-then-white.
+                if ply == 0:
+                    rendered.append(f"{state.board.fullmove_number}...{san}")
+                elif ply % 2 == 1:
+                    rendered.append(f"{state.board.fullmove_number + (ply + 1) // 2}.{san}")
+                else:
+                    rendered.append(san)
+            ply += 1
+        print("  " + " ".join(rendered))
 
 
 if __name__ == "__main__":
