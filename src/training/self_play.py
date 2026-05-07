@@ -261,10 +261,14 @@ def play_games_parallel_gpu(
     iteration = 0
     log_every = 20
 
+    # legal_mask for ply 0 is computed once here; subsequent plies reuse the
+    # mask returned by step_batch_with_legal (it computed the new state's
+    # legal_mask internally for terminal detection — saves ~16 ms/ply).
+    legal_mask_batch = gpu_game.legal_mask(state)
+
     while active:
         # One batched call each — replaces N per-game python-chess calls.
         obs_batch = gpu_game.to_tensor_batch(state)        # (N, 19, 8, 8)
-        legal_mask_batch = gpu_game.legal_mask(state)      # (N, 4672) bool
 
         # One bulk transfer to CPU; per-game Python iteration after.
         obs_cpu = obs_batch.cpu()
@@ -318,9 +322,10 @@ def play_games_parallel_gpu(
 
         # Step all games (done ones get sentinel action 0 — they're filtered
         # below). step_batch keeps `state.done` sticky so re-stepping a
-        # finished game doesn't corrupt its outcome.
+        # finished game doesn't corrupt its outcome. Also returns the new
+        # state's legal_mask (carried into the next iteration).
         actions_tensor = torch.tensor(actions_per_game, dtype=torch.int64, device=state.device)
-        state, rewards, _ = gpu_game.step_batch(state, actions_tensor)
+        state, rewards, _, legal_mask_batch = gpu_game.step_batch_with_legal(state, actions_tensor)
         rewards_cpu = rewards.cpu().tolist()
         done_cpu = state.done.cpu().tolist()
         winner_cpu = state.winner.cpu().tolist()
@@ -432,6 +437,13 @@ def play_games_parallel_gpu_resident(
     obs_window = torch.zeros(
         num_games, n_frames, c, h, w, device=device, dtype=sample_obs.dtype
     )
+    # Pre-compute legal_mask once for the initial state. Subsequent plies
+    # reuse the legal_mask returned by ``step_batch_with_legal`` instead of
+    # recomputing — saves ~16 ms/ply (a duplicate _legal_mask_impl call).
+    next_legal_mask = gpu_game.legal_mask(state)
+    # Pre-cache temperature tensors (avoid per-ply tensor construction).
+    temp_init_tensor = torch.full((num_games,), float(temp_init), dtype=torch.float32, device=device)
+    temp_final_tensor = torch.full((num_games,), float(temp_final), dtype=torch.float32, device=device)
 
     # Per-batch GPU history accumulators. Stack at end; one transfer.
     obs_per_ply: list[torch.Tensor] = []           # [T] of [N, C, H, W]
@@ -458,9 +470,11 @@ def play_games_parallel_gpu_resident(
     sentinel_legal[:, 0] = True
 
     for ply in range(max_plies_cap):
-        # 1. Build batched obs + legal mask GPU-side. No transfer.
+        # 1. Build batched obs GPU-side. The legal_mask was already computed
+        #    by the previous ply's step_batch_with_legal (or once up-front
+        #    for ply 0) — ~16 ms/ply saved vs recomputing.
         single_obs = gpu_game.to_tensor_batch(state)                  # [N, C, H, W]
-        legal_mask = gpu_game.legal_mask(state)                       # [N, A] bool
+        legal_mask = next_legal_mask                                   # carried over
         # Sentinel any all-zero rows (terminal states) so MCTS multinomial
         # doesn't NaN.
         any_legal = legal_mask.any(dim=1, keepdim=True)               # [N, 1] bool
@@ -489,12 +503,9 @@ def play_games_parallel_gpu_resident(
             root_data = mcts.run_batch_gpu(stacked_obs, legal_mask, add_noise=True)
 
             # 4. Per-game temperature for sampling (AlphaZero schedule).
+            #    Picks from pre-cached tensors to avoid per-ply construction.
             is_post_drop = move_count >= temp_drop
-            temperature = torch.where(
-                is_post_drop,
-                torch.full_like(move_count, fill_value=int(temp_final * 1000)).to(torch.float32) / 1000.0,
-                torch.full_like(move_count, fill_value=int(temp_init * 1000)).to(torch.float32) / 1000.0,
-            )
+            temperature = torch.where(is_post_drop, temp_final_tensor, temp_init_tensor)
             action, policy = select_action_gpu(
                 root_data["child_actions"],
                 root_data["child_visits"],
@@ -503,8 +514,10 @@ def play_games_parallel_gpu_resident(
             )
             value = root_data["root_value"]
 
-        # 6. Step env.
-        state, rewards, _ = gpu_game.step_batch(state, action)
+        # 6. Step env. ``step_batch_with_legal`` returns the new state's
+        #    legal_mask alongside (already computed inside for terminal
+        #    detection); reuse on next ply rather than recomputing.
+        state, rewards, _, next_legal_mask = gpu_game.step_batch_with_legal(state, action)
 
         # 7. Append to GPU accumulators (no transfer).
         obs_per_ply.append(single_obs)

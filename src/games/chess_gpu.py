@@ -981,7 +981,7 @@ def _add_castling_targets(king_targets: torch.Tensor, state: "ChessBatchedState"
     return king_targets
 
 
-def _legal_mask_impl(state: "ChessBatchedState") -> torch.Tensor:
+def _legal_mask_impl(state: "ChessBatchedState") -> tuple[torch.Tensor, torch.Tensor]:
     """Internal entry point. See GpuChessGame.legal_mask for docstring."""
     N = state.n
     device = state.device
@@ -1160,7 +1160,7 @@ def _legal_mask_impl(state: "ChessBatchedState") -> torch.Tensor:
     # Combine: underpromo idxs use pawn-specific check; others use general.
     legal_mask = torch.where(is_underpromo.unsqueeze(0), legal_pawn_specific, legal_general)
 
-    return legal_mask
+    return legal_mask, in_check
 
 
 def _lsr_tensor(g: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
@@ -1368,7 +1368,8 @@ class GpuChessGame(BatchedGame):
         `ChessGame.legal_actions` on a corpus of random positions
         (see `tests/test_chess_gpu_legal.py`).
         """
-        return _legal_mask_impl(state)
+        legal, _in_check = _legal_mask_impl(state)
+        return legal
 
     def step_batch(
         self,
@@ -1380,6 +1381,19 @@ class GpuChessGame(BatchedGame):
         Reward is mover-POV (+1 for delivering checkmate, 0 otherwise) to
         match `Game.step`'s convention. Terminals: mate / stalemate /
         50-move / threefold (Zobrist-hash) / ply cap (`max_plies`).
+        """
+        new_state, reward, done, _ = _step_batch_impl(state, actions, self.max_plies)
+        return new_state, reward, done
+
+    def step_batch_with_legal(
+        self,
+        state: ChessBatchedState,
+        actions: torch.Tensor,
+    ) -> tuple[ChessBatchedState, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Like ``step_batch`` but also returns the new state's legal-action
+        mask. ``_step_batch_impl`` already computes it internally for
+        terminal detection — exposing it here lets callers (self-play
+        loop) skip a duplicate ~16 ms ``legal_mask`` call at the next ply.
         """
         return _step_batch_impl(state, actions, self.max_plies)
 
@@ -1676,24 +1690,12 @@ def _step_batch_impl(
     new_state.rep_hashes = new_rep_hashes
     new_state.rep_count = new_rep_count
 
-    # Terminal detection: compute legal_mask of new_state.
-    new_legal = _legal_mask_impl(new_state)
+    # Terminal detection: compute legal_mask of new_state. The legal-mask
+    # impl computes ``in_check`` internally (via _compute_check_resolve),
+    # so we get it for free — saves a duplicate ~8 ms attacks_by_color × 2
+    # that the previous version did separately.
+    new_legal, in_check_new = _legal_mask_impl(new_state)
     no_legal = new_legal.sum(dim=-1) == 0
-
-    # Is the new side-to-move in check?
-    new_pieces_2x6 = new_state.pieces.view(N, 2, 6)
-    new_us_idx = new_state.side.to(torch.int64).view(N, 1, 1).expand(N, 1, 6)
-    new_our_pieces = new_pieces_2x6.gather(1, new_us_idx).squeeze(1)
-    new_king_bb = new_our_pieces[:, P_KING]
-    occ_new = torch.zeros_like(new_king_bb)
-    for p in range(12):
-        occ_new = occ_new | new_state.pieces[:, p]
-    occ_no_king_new = occ_new & ~new_king_bb
-    attacks_w_new = attacks_by_color(new_state, 0, occ_no_king_new)
-    attacks_b_new = attacks_by_color(new_state, 1, occ_no_king_new)
-    in_check_new = (
-        torch.where(new_state.side == 0, attacks_b_new, attacks_w_new) & new_king_bb
-    ) != 0
 
     mate = no_legal & in_check_new
     stalemate = no_legal & ~in_check_new
@@ -1719,4 +1721,8 @@ def _step_batch_impl(
     new_state.done = state.done | done  # sticky once a game is done
     new_state.winner = torch.where(state.done, state.winner, winner)
 
-    return new_state, reward, done
+    # Return new_legal alongside — step_batch's terminal detection just
+    # computed it, and the caller (self-play loop) needs it again at the
+    # next ply for MCTS root masking. Returning it here avoids a duplicate
+    # ~16 ms _legal_mask_impl call per ply.
+    return new_state, reward, done, new_legal

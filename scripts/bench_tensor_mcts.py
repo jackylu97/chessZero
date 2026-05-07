@@ -29,6 +29,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import json
+import os
+
 from src.config import get_config
 from src.games.chess import ChessGame
 from src.games.chess_gpu import GpuChessGame
@@ -120,6 +123,24 @@ def main() -> None:
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--repeat", type=int, default=3,
                    help="Timed runs per backend (median reported).")
+    p.add_argument(
+        "--paths",
+        default="all",
+        help=(
+            "Comma-separated list of bench paths to run. Options: "
+            "batched, tensor, gpures, triton, reuse. Or 'all' (default). "
+            "Other paths' baselines come from --baseline-file when not in --paths."
+        ),
+    )
+    p.add_argument(
+        "--baseline-file",
+        default="bench_baseline.json",
+        help=(
+            "JSON file used to cache + reuse baseline plies/sec across runs. "
+            "Paths in --paths are re-measured and saved; paths NOT in --paths "
+            "are loaded from this file (if present) for speedup comparison."
+        ),
+    )
     args = p.parse_args()
 
     print(
@@ -174,16 +195,49 @@ def main() -> None:
             network, cfg, args.num_games, args.device, training_step=0,
         )
 
-    # Warm all paths — first call always pays cudnn/cublas/multinomial init costs.
+    # Path registry: short_name → (display label, run_fn).
+    PATHS = {
+        "batched": ("BatchedMCTS",                     run_batched),
+        "tensor":  ("TensorMCTS (compile)",            run_tensor),
+        "gpures":  ("TensorMCTS+GPU-resident",         run_tensor_resident),
+        "triton":  ("TensorMCTS+Triton+GPU-res",       run_tensor_triton),
+        "reuse":   ("TensorMCTS+Triton+Reuse+GPU-res", run_tensor_triton_reuse),
+    }
+
+    if args.paths.strip().lower() == "all":
+        paths_to_run = list(PATHS.keys())
+    else:
+        paths_to_run = [p.strip() for p in args.paths.split(",") if p.strip()]
+        unknown = set(paths_to_run) - set(PATHS.keys())
+        if unknown:
+            raise SystemExit(f"unknown path(s): {unknown}; valid: {list(PATHS)}")
+
+    # Cache key: capture the bench config so a saved entry only applies when
+    # rerun under the same shape. Code-version changes invalidate manually
+    # (delete the file).
+    cache_key = (
+        f"N={args.num_games}_sims={args.sims}_max_plies={args.max_plies}"
+        f"_h={args.hidden_planes}x{args.num_blocks}_dt={args.hidden_dtype}"
+        f"_dev={args.device}"
+    )
+    cache: dict[str, dict[str, dict[str, float]]] = {}
+    if os.path.exists(args.baseline_file):
+        try:
+            with open(args.baseline_file) as fh:
+                cache = json.load(fh)
+        except json.JSONDecodeError:
+            cache = {}
+    cache_for_key = cache.setdefault(cache_key, {})
+
+    # Warm only the paths we're actually running.
     print("warmup:")
-    torch.manual_seed(0); time_run("BatchedMCTS warmup", run_batched, args.device)
-    torch.manual_seed(0); time_run("TensorMCTS warmup",  run_tensor,  args.device)
-    torch.manual_seed(0); time_run("TensorMCTS+GPU-resident warmup", run_tensor_resident, args.device)
-    torch.manual_seed(0); time_run("TensorMCTS+Triton warmup", run_tensor_triton, args.device)
-    torch.manual_seed(0); time_run("TensorMCTS+Triton+Reuse warmup", run_tensor_triton_reuse, args.device)
+    for short in paths_to_run:
+        label, fn = PATHS[short]
+        torch.manual_seed(0)
+        time_run(f"{label} warmup", fn, args.device)
 
     print()
-    print(f"timed (median over {args.repeat} runs):")
+    print(f"timed (best over {args.repeat} runs):")
 
     def repeat(label, fn):
         # Pick the FASTEST run rather than median — recompiles / first-touch
@@ -198,29 +252,43 @@ def main() -> None:
         best_dt, best_plies = results[0]
         return best_dt, best_plies
 
-    bmcts_dt, bmcts_plies = repeat("BatchedMCTS", run_batched)
-    tmcts_dt, tmcts_plies = repeat("TensorMCTS",  run_tensor)
-    res_dt, res_plies = repeat("TensorMCTS+GPU-resident", run_tensor_resident)
-    tri_dt, tri_plies = repeat("TensorMCTS+Triton", run_tensor_triton)
-    reu_dt, reu_plies = repeat("TensorMCTS+Triton+Reuse", run_tensor_triton_reuse)
+    pps: dict[str, float] = {}
+    for short in paths_to_run:
+        label, fn = PATHS[short]
+        dt, plies = repeat(label, fn)
+        path_pps = plies / dt
+        pps[short] = path_pps
+        cache_for_key[short] = {"plies_per_sec": path_pps, "dt": dt, "plies": plies}
+
+    # Pull baselines from cache for paths we didn't run this time.
+    for short in PATHS:
+        if short not in pps:
+            entry = cache_for_key.get(short)
+            if entry is not None:
+                pps[short] = float(entry["plies_per_sec"])
+
+    # Persist updated cache.
+    try:
+        with open(args.baseline_file, "w") as fh:
+            json.dump(cache, fh, indent=2, sort_keys=True)
+    except OSError as e:
+        print(f"  warning: failed to write {args.baseline_file}: {e}")
 
     print()
-    bmcts_pps = bmcts_plies / bmcts_dt
-    tmcts_pps = tmcts_plies / tmcts_dt
-    res_pps = res_plies / res_dt
-    tri_pps = tri_plies / tri_dt
-    reu_pps = reu_plies / reu_dt
-    print(
-        f"summary: BatchedMCTS                       {bmcts_pps:7.1f} plies/s  (1.00× baseline)\n"
-        f"         TensorMCTS (compile)              {tmcts_pps:7.1f} plies/s  ({tmcts_pps/bmcts_pps:.2f}×)\n"
-        f"         TensorMCTS+GPU-resident           {res_pps:7.1f} plies/s  ({res_pps/bmcts_pps:.2f}×)\n"
-        f"         TensorMCTS+Triton+GPU-res         {tri_pps:7.1f} plies/s  ({tri_pps/bmcts_pps:.2f}×)\n"
-        f"         TensorMCTS+Triton+Reuse+GPU-res   {reu_pps:7.1f} plies/s  ({reu_pps/bmcts_pps:.2f}×)"
-    )
+    base_pps = pps.get("batched")
+    if base_pps is None:
+        # No baseline available — use the slowest path we have as reference.
+        base_pps = min(pps.values()) if pps else 1.0
+    print("summary:")
+    for short in PATHS:
+        label = PATHS[short][0]
+        if short in pps:
+            measured = "MEASURED" if short in paths_to_run else "cached"
+            ratio = pps[short] / base_pps
+            print(f"  {label:<36s} {pps[short]:8.1f} plies/s  ({ratio:5.2f}× baseline) [{measured}]")
+        else:
+            print(f"  {label:<36s}        --  (no measurement, no cache)")
 
-    # Approximate sync counts (assumes one batch of N games, each with `plies`
-    # plies and `sims` simulations per ply).
-    bmcts_syncs = 3 * args.sims * bmcts_plies / bmcts_plies  # per-ply: 3·sims
     print()
     print(f"approx syncs/ply: BatchedMCTS = {3*args.sims} (3·sims for rewards/values/probs)")
     print(f"                  TensorMCTS  ≈ avg_depth + 1 (selection any-walk + compat shim)")
