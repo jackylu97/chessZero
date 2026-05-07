@@ -94,6 +94,11 @@ def main():
                         help="Override config.num_simulations.")
     parser.add_argument("--num-parallel-games", type=int, default=None,
                         help="Override config.num_parallel_games.")
+    parser.add_argument("--warmstart-sample-frac", type=float, default=None,
+                        help="Override config.warmstart_sample_frac. Set to 0.0 "
+                             "for a pure-self-play run with no warmstart anchor "
+                             "(also pass --stockfish-injection-games 0 + "
+                             "--stockfish-injection-interval 0 to disable injection).")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -126,6 +131,8 @@ def main():
         config.num_simulations = args.num_simulations
     if args.num_parallel_games is not None:
         config.num_parallel_games = args.num_parallel_games
+    if args.warmstart_sample_frac is not None:
+        config.warmstart_sample_frac = args.warmstart_sample_frac
 
     # Use CPU AMP settings appropriately
     if device == "cpu":
