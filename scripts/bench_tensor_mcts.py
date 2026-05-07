@@ -161,6 +161,15 @@ def main() -> None:
     def run_tensor_triton():
         cfg.use_tensor_mcts = True
         cfg.tensor_mcts_select_backend = "triton"
+        cfg.tensor_mcts_subtree_reuse = False
+        return play_games_parallel_gpu_resident(
+            network, cfg, args.num_games, args.device, training_step=0,
+        )
+
+    def run_tensor_triton_reuse():
+        cfg.use_tensor_mcts = True
+        cfg.tensor_mcts_select_backend = "triton"
+        cfg.tensor_mcts_subtree_reuse = True
         return play_games_parallel_gpu_resident(
             network, cfg, args.num_games, args.device, training_step=0,
         )
@@ -171,6 +180,7 @@ def main() -> None:
     torch.manual_seed(0); time_run("TensorMCTS warmup",  run_tensor,  args.device)
     torch.manual_seed(0); time_run("TensorMCTS+GPU-resident warmup", run_tensor_resident, args.device)
     torch.manual_seed(0); time_run("TensorMCTS+Triton warmup", run_tensor_triton, args.device)
+    torch.manual_seed(0); time_run("TensorMCTS+Triton+Reuse warmup", run_tensor_triton_reuse, args.device)
 
     print()
     print(f"timed (median over {args.repeat} runs):")
@@ -192,17 +202,20 @@ def main() -> None:
     tmcts_dt, tmcts_plies = repeat("TensorMCTS",  run_tensor)
     res_dt, res_plies = repeat("TensorMCTS+GPU-resident", run_tensor_resident)
     tri_dt, tri_plies = repeat("TensorMCTS+Triton", run_tensor_triton)
+    reu_dt, reu_plies = repeat("TensorMCTS+Triton+Reuse", run_tensor_triton_reuse)
 
     print()
     bmcts_pps = bmcts_plies / bmcts_dt
     tmcts_pps = tmcts_plies / tmcts_dt
     res_pps = res_plies / res_dt
     tri_pps = tri_plies / tri_dt
+    reu_pps = reu_plies / reu_dt
     print(
-        f"summary: BatchedMCTS                   {bmcts_pps:7.1f} plies/s  (1.00× baseline)\n"
-        f"         TensorMCTS (compile)          {tmcts_pps:7.1f} plies/s  ({tmcts_pps/bmcts_pps:.2f}×)\n"
-        f"         TensorMCTS+GPU-resident       {res_pps:7.1f} plies/s  ({res_pps/bmcts_pps:.2f}×)\n"
-        f"         TensorMCTS+Triton+GPU-res     {tri_pps:7.1f} plies/s  ({tri_pps/bmcts_pps:.2f}×)"
+        f"summary: BatchedMCTS                       {bmcts_pps:7.1f} plies/s  (1.00× baseline)\n"
+        f"         TensorMCTS (compile)              {tmcts_pps:7.1f} plies/s  ({tmcts_pps/bmcts_pps:.2f}×)\n"
+        f"         TensorMCTS+GPU-resident           {res_pps:7.1f} plies/s  ({res_pps/bmcts_pps:.2f}×)\n"
+        f"         TensorMCTS+Triton+GPU-res         {tri_pps:7.1f} plies/s  ({tri_pps/bmcts_pps:.2f}×)\n"
+        f"         TensorMCTS+Triton+Reuse+GPU-res   {reu_pps:7.1f} plies/s  ({reu_pps/bmcts_pps:.2f}×)"
     )
 
     # Approximate sync counts (assumes one batch of N games, each with `plies`

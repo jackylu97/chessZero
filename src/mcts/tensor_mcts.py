@@ -166,6 +166,7 @@ class TensorMCTS:
         compile: bool = True,
         amp_dtype: torch.dtype | None = None,
         select_backend: str = "compile",
+        use_subtree_reuse: bool = False,
     ):
         self.network = network
         self.game = game
@@ -222,6 +223,15 @@ class TensorMCTS:
         # static shapes in tracing).
         self._select_step_compiled = None
         self._backprop_compiled = None
+        # Subtree reuse: when True, the tree storage is sized to fit the
+        # carried-over subtree PLUS one ply of fresh sims. Without this, the
+        # post-advance + new-sims node count overflows M = num_sims + 1.
+        self.use_subtree_reuse = bool(use_subtree_reuse)
+        # ``has_prior_search``: when True, ``run_batch_gpu`` skips
+        # ``_initialize_root`` and assumes slot 0 already holds the new root
+        # (set by a prior ``advance_root``). Reset by ``reset_search`` or by
+        # ``advance_root`` itself when reuse fails.
+        self.has_prior_search = False
 
     def _compute_dtype(self) -> torch.dtype:
         """Network's parameter dtype — used to cast inputs before recurrent_inference.
@@ -254,8 +264,16 @@ class TensorMCTS:
     # ------------------------------------------------------------------ alloc
 
     def _allocate(self, n: int, num_simulations: int, hidden_shape: tuple[int, int, int]):
-        """Allocate (or reuse) tree tensors. M = num_simulations + 1 (root + sims)."""
-        m = num_simulations + 1
+        """Allocate (or reuse) tree tensors.
+
+        M = num_simulations + 1 (root + sims) without subtree reuse;
+        M = 2*num_simulations + 1 when ``use_subtree_reuse`` is on, so the
+        carried-over subtree (≤ num_simulations nodes from prior search)
+        plus a fresh ply's num_simulations new nodes both fit. If the
+        carry-over plus new sims would still exceed M, ``advance_root``
+        falls back to a fresh search for safety.
+        """
+        m = (2 * num_simulations + 1) if self.use_subtree_reuse else (num_simulations + 1)
         if (
             n == self._allocated_n
             and m == self._allocated_m
@@ -445,15 +463,35 @@ class TensorMCTS:
         n = obs_batch.shape[0]
         num_sims = int(self.config.num_simulations)
 
-        with self._amp_ctx():
-            hidden_batch, policy_logits_root, _value_root = self.network.initial_inference(obs_batch)
-        c, h, w = hidden_batch.shape[1:]
-        self._allocate(n, num_sims, (c, h, w))
-        self._reset()
+        # Decide reuse viability up front. The carried-over root has K sampled
+        # actions from the prior search's network-policy sample; some may be
+        # illegal at the new state. If ANY game has zero legal sampled
+        # actions, fall back to a fresh search (otherwise multinomial in
+        # select_action_gpu hits all-zero probs).
+        can_reuse = self.has_prior_search
+        if can_reuse:
+            root_actions = self.child_actions[:, 0, :]
+            valid_slot = root_actions != -1
+            action_long = root_actions.clamp(min=0).long()
+            slot_legal = torch.gather(legal_mask, 1, action_long) & valid_slot
+            any_legal = slot_legal.any(dim=1)
+            if not bool(any_legal.all()):
+                can_reuse = False
 
-        self._initialize_root_from_mask(
-            hidden_batch, policy_logits_root, legal_mask, add_noise
-        )
+        if can_reuse:
+            # Tree state holds the new root at slot 0 (compacted by prior
+            # ``advance_root``). Skip initial_inference; refresh for the new ply.
+            self._refresh_reused_root(legal_mask, add_noise)
+        else:
+            with self._amp_ctx():
+                hidden_batch, policy_logits_root, _value_root = self.network.initial_inference(obs_batch)
+            c, h, w = hidden_batch.shape[1:]
+            self._allocate(n, num_sims, (c, h, w))
+            self._reset()
+            self._initialize_root_from_mask(
+                hidden_batch, policy_logits_root, legal_mask, add_noise
+            )
+            self.has_prior_search = False
 
         for _ in range(num_sims):
             (
@@ -553,6 +591,244 @@ class TensorMCTS:
         self.child_priors[:, 0, :] = priors_root
         # child_visits / child_value_sum / child_rewards / child_node_idx
         # already at sentinel/zero from _reset.
+
+    # -------------------------------------------------------- subtree reuse
+
+    def reset_search(self):
+        """Drop any preserved tree state — next ``run_batch_gpu`` does a fresh
+        initial_inference and rebuilds the root from scratch."""
+        self.has_prior_search = False
+
+    def _refresh_reused_root(self, legal_mask: torch.Tensor, add_noise: bool):
+        """Prepare the post-``advance_root`` tree for a new search.
+
+        The new root sits at slot 0 with its sampled children carried over
+        from the prior search. Most of those children's actions are legal at
+        the new state (they were sampled from the network policy at the time
+        the new root was a leaf), but some may be illegal — when the new root
+        was previously a non-root leaf, its children were sampled WITHOUT the
+        legal-mask filter that's only applied at root expansion. Mask the
+        illegal slots out (set ``child_actions = -1``); PUCT skips them. Also
+        mix in fresh Dirichlet noise to preserve exploration diversity.
+        """
+        n = self._allocated_n
+        K = self.K
+        dev = self.device
+
+        # Mask illegal sampled actions to -1 so PUCT scores them as -inf.
+        root_actions = self.child_actions[:, 0, :]                  # [N, K] int32
+        valid = root_actions != -1
+        # Index legal_mask[g, action]; clamp to safe index for invalid slots.
+        action_long = root_actions.clamp(min=0).long()              # [N, K]
+        action_legal = torch.gather(legal_mask, 1, action_long) & valid
+        self.child_actions[:, 0, :] = torch.where(
+            action_legal, root_actions, torch.full_like(root_actions, -1)
+        )
+
+        # Mix Dirichlet noise into existing priors. Skip slots we just marked
+        # illegal so all noise mass goes to legal slots (re-normalized).
+        if add_noise and self.config.dirichlet_epsilon > 0:
+            eps = float(self.config.dirichlet_epsilon)
+            alpha = float(self.config.dirichlet_alpha)
+            noise = torch.distributions.Dirichlet(
+                torch.full((K,), alpha, device=dev)
+            ).sample((n,)).to(torch.float32)                        # [N, K]
+            # Zero noise on illegal slots; renormalize legal noise to sum to 1.
+            noise = torch.where(action_legal, noise, torch.zeros_like(noise))
+            noise_sum = noise.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            noise = noise / noise_sum
+            existing = self.child_priors[:, 0, :]
+            # Same blend as fresh root: π = (1-ε)·existing + ε·noise.
+            self.child_priors[:, 0, :] = existing * (1.0 - eps) + noise * eps
+
+        # MinMaxStats are stale (carry over the prior search's Q range, which
+        # may not match the new search's range as it explores). Reset.
+        self.mm_min.fill_(float("inf"))
+        self.mm_max.fill_(_NEG_INF)
+
+    @torch.no_grad()
+    def advance_root(
+        self,
+        chosen_action: torch.Tensor,
+        legal_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Promote each game's chosen-action subtree to slot 0 of the tree
+        storage. Compacts the tree so subsequent searches start with the
+        already-explored subtree as the new root.
+
+        Args:
+            chosen_action: [N] int — the action picked at the previous root.
+            legal_mask: optional [N, A] bool mask. Currently unused here
+                (legal-mask filtering happens in ``_refresh_reused_root``);
+                accepted for API symmetry with ``run_batch_gpu``.
+
+        Returns:
+            success: [N] bool — True for games where the chosen action's
+                child was materialized in the prior search and reuse was
+                applied. False games will fall back to a fresh search next
+                ply (caller can call ``reset_search`` if any False — but the
+                per-game flag is also tracked internally).
+        """
+        if not (self._allocated_n > 0 and self._allocated_m > 1):
+            raise RuntimeError(
+                "advance_root called before any run_batch_gpu — no tree state."
+            )
+
+        n = self._allocated_n
+        m = self._allocated_m
+        K = self.K
+        dev = self.device
+        arange_n = self._arange_n
+        arange_m = torch.arange(m, device=dev, dtype=torch.long)
+
+        # 1. Find the slot at root with the chosen action AND a materialized child.
+        chosen_i32 = chosen_action.to(torch.int32)
+        root_actions = self.child_actions[:, 0, :]                  # [N, K]
+        root_child_idx = self.child_node_idx[:, 0, :]               # [N, K]
+        match = (root_actions == chosen_i32.unsqueeze(1)) & (root_child_idx != -1)
+        # Pick first match per game (argmax of bool → first True or 0 if all False).
+        chosen_slot = match.float().argmax(dim=1)                   # [N] int64
+        success = match.any(dim=1)                                  # [N] bool
+
+        # 2. New root's old index (per game).
+        new_root_old = root_child_idx[arange_n, chosen_slot]        # [N] int32
+
+        # 3. BFS to identify each game's chosen subtree.
+        #    in_subtree[g, n] = True iff node n is reachable from new_root_old[g]
+        #    via parent pointers (i.e., n is descendant of new_root_old[g]).
+        in_subtree = torch.zeros(n, m, dtype=torch.bool, device=dev)
+        new_root_l = new_root_old.long().clamp(min=0)
+        in_subtree[arange_n, new_root_l] = True
+        # Propagate: a node is in_subtree iff its parent is. Tree depth is
+        # bounded by MAX_SELECT_DEPTH (search step cap), so that many
+        # iterations always converge — no need for a sync-y per-step
+        # ``torch.equal`` convergence check.
+        parent_l = self.parent_idx.clamp(min=0).long()              # [N, M]
+        parent_valid = self.parent_idx != -1
+        for _ in range(self.MAX_SELECT_DEPTH + 1):
+            parent_in_subtree = in_subtree.gather(1, parent_l)
+            in_subtree = in_subtree | (parent_in_subtree & parent_valid)
+
+        # Games where success=False shouldn't reuse. Mark their subtree as
+        # empty and we'll handle by setting has_prior_search=False after.
+        in_subtree = in_subtree & success.unsqueeze(1)
+
+        # Overflow safety: if any game's subtree + a fresh ply of sims would
+        # exceed M, fall back to fresh search. M was sized with the typical
+        # case in mind (chosen_subtree ≤ num_sims, fits in 2*num_sims+1).
+        # Many consecutive plies of reuse can grow the subtree past num_sims;
+        # detect and bail.
+        max_subtree_size = int(in_subtree.sum(dim=1).max().item())
+        num_sims = int(self.config.num_simulations)
+        if max_subtree_size + num_sims > m - 1:
+            # Can't fit one more ply of search — drop reuse for this ply.
+            self.has_prior_search = False
+            return torch.zeros(n, dtype=torch.bool, device=dev)
+
+        # 4. Build permutation [N, M]: for each game, sort node indices so
+        #    that (a) new_root_old goes to position 0, then (b) other
+        #    in_subtree nodes follow in original order, then (c) out-of-
+        #    subtree nodes fill the rest. Sort key:
+        #       priority = 0 if n == new_root_old
+        #                  1 if in_subtree else 2
+        #       tiebreak = original index n
+        is_root = arange_m.unsqueeze(0) == new_root_old.long().unsqueeze(1)  # [N, M]
+        priority = torch.where(
+            is_root,
+            torch.zeros_like(arange_m).unsqueeze(0).expand(n, m),
+            torch.where(
+                in_subtree,
+                torch.ones_like(arange_m).unsqueeze(0).expand(n, m),
+                torch.full_like(arange_m, 2).unsqueeze(0).expand(n, m),
+            ),
+        )
+        sort_key = priority * m + arange_m.unsqueeze(0)             # [N, M]
+        permutation = sort_key.argsort(dim=1)                       # [N, M] int64
+
+        # 5. Inverse permutation: inverse_perm[g, old_idx] = new_idx.
+        inverse_perm = torch.empty_like(permutation)
+        inverse_perm.scatter_(
+            1, permutation, arange_m.unsqueeze(0).expand(n, m).contiguous(),
+        )
+
+        # 6. Apply permutation to all per-node tensors via gather along dim 1.
+        self.node_visits = torch.gather(self.node_visits, 1, permutation.to(torch.int32).long())
+        self.node_value_sum = torch.gather(self.node_value_sum, 1, permutation)
+        self.node_reward = torch.gather(self.node_reward, 1, permutation)
+
+        # node_hidden: [N, M, C, H, W]. Broadcast permutation index.
+        c, h, w = self._allocated_hidden_shape
+        perm_5d = permutation.view(n, m, 1, 1, 1).expand(n, m, c, h, w)
+        self.node_hidden = torch.gather(self.node_hidden, 1, perm_5d)
+
+        self.parent_idx = torch.gather(self.parent_idx, 1, permutation.to(torch.int32).long())
+        self.parent_child_slot = torch.gather(self.parent_child_slot, 1, permutation.to(torch.int32).long())
+
+        perm_3d = permutation.view(n, m, 1).expand(n, m, K)
+        self.child_actions = torch.gather(self.child_actions, 1, perm_3d)
+        self.child_priors = torch.gather(self.child_priors, 1, perm_3d)
+        self.child_visits = torch.gather(self.child_visits, 1, perm_3d)
+        self.child_value_sum = torch.gather(self.child_value_sum, 1, perm_3d)
+        self.child_rewards = torch.gather(self.child_rewards, 1, perm_3d)
+        child_node_idx_perm = torch.gather(self.child_node_idx, 1, perm_3d)
+
+        # 7. Remap child_node_idx VALUES through inverse_perm. Out-of-subtree
+        #    targets (or -1 sentinels) become -1.
+        old_idx = child_node_idx_perm                                # [N, M, K] int32
+        valid_target = old_idx != -1
+        old_idx_safe = old_idx.clamp(min=0).long()                   # [N, M, K]
+        new_idx = inverse_perm.gather(1, old_idx_safe.view(n, m * K)).view(n, m, K)
+        # Only keep references to nodes that are in the chosen subtree.
+        target_in_subtree = in_subtree.gather(1, old_idx_safe.view(n, m * K)).view(n, m, K)
+        keep = valid_target & target_in_subtree
+        self.child_node_idx = torch.where(
+            keep, new_idx.to(torch.int32), torch.full_like(old_idx, -1)
+        )
+
+        # 8. Remap parent_idx VALUES. New root (now at slot 0) has parent=-1.
+        valid_parent = self.parent_idx != -1
+        parent_safe = self.parent_idx.clamp(min=0).long()
+        new_parent = inverse_perm.gather(1, parent_safe)
+        is_new_root_slot = arange_m.unsqueeze(0) == 0                # [1, M]
+        self.parent_idx = torch.where(
+            is_new_root_slot,
+            torch.full_like(self.parent_idx, -1),
+            torch.where(
+                valid_parent, new_parent.to(torch.int32),
+                torch.full_like(self.parent_idx, -1),
+            ),
+        )
+
+        # 9. Update node_count to subtree size per game.
+        self.node_count = in_subtree.sum(dim=1).to(torch.int32)
+
+        # 10. Clear out-of-subtree slots (positions ≥ subtree size). Reset
+        #     child_actions to -1 there so future expansions allocate fresh.
+        # The compaction left these slots holding gathered junk from the
+        # original positions; stale child_node_idx values pointing to
+        # already-remapped positions could mislead future select calls.
+        beyond_subtree = arange_m.unsqueeze(0) >= self.node_count.long().unsqueeze(1)  # [N, M]
+        beyond_3d = beyond_subtree.unsqueeze(-1)                     # [N, M, 1]
+        self.child_actions = torch.where(beyond_3d, torch.full_like(self.child_actions, -1), self.child_actions)
+        self.child_priors = torch.where(beyond_3d, torch.zeros_like(self.child_priors), self.child_priors)
+        self.child_visits = torch.where(beyond_3d, torch.zeros_like(self.child_visits), self.child_visits)
+        self.child_value_sum = torch.where(beyond_3d, torch.zeros_like(self.child_value_sum), self.child_value_sum)
+        self.child_rewards = torch.where(beyond_3d, torch.zeros_like(self.child_rewards), self.child_rewards)
+        self.child_node_idx = torch.where(beyond_3d, torch.full_like(self.child_node_idx, -1), self.child_node_idx)
+        self.node_visits = torch.where(beyond_subtree, torch.zeros_like(self.node_visits), self.node_visits)
+        self.node_value_sum = torch.where(beyond_subtree, torch.zeros_like(self.node_value_sum), self.node_value_sum)
+        self.node_reward = torch.where(beyond_subtree, torch.zeros_like(self.node_reward), self.node_reward)
+        self.parent_idx = torch.where(beyond_subtree, torch.full_like(self.parent_idx, -1), self.parent_idx)
+        self.parent_child_slot = torch.where(beyond_subtree, torch.full_like(self.parent_child_slot, -1), self.parent_child_slot)
+
+        # If ANY game's chosen action wasn't materialized, we can't safely
+        # reuse — those games would search a stale tree. Take the conservative
+        # path: bail out of reuse for the whole batch.
+        if not bool(success.all()):
+            self.has_prior_search = False
+        else:
+            self.has_prior_search = True
+        return success
 
     def _select(
         self,

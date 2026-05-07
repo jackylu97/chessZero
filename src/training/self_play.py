@@ -408,6 +408,7 @@ def play_games_parallel_gpu_resident(
     mcts = TensorMCTS(
         network, chess_game, config, device=device, hidden_dtype=hidden_dtype,
         select_backend=getattr(config, "tensor_mcts_select_backend", "compile"),
+        use_subtree_reuse=getattr(config, "tensor_mcts_subtree_reuse", False),
     )
 
     action_space_size = chess_game.action_space_size
@@ -513,7 +514,14 @@ def play_games_parallel_gpu_resident(
         rewards_per_ply.append(rewards.to(torch.float32))
         legal_masks_per_ply.append(legal_mask)
 
-        # 8. Update accounting (sticky-done semantics).
+        # 8. Subtree reuse: advance the MCTS root to the chosen action's
+        # subtree, in preparation for the next ply. Only when the prior
+        # search actually ran (skip during random openings — those don't
+        # populate a tree).
+        if getattr(config, "tensor_mcts_subtree_reuse", False) and ply >= n_random:
+            mcts.advance_root(action, legal_mask)
+
+        # 9. Update accounting (sticky-done semantics).
         newly_done = state.done & alive_mask
         game_outcome = torch.where(newly_done, state.winner.to(torch.int32), game_outcome)
         game_length = torch.where(alive_mask, game_length + 1, game_length)

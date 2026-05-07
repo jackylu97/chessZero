@@ -256,6 +256,14 @@ class MuZeroConfig:
     # runs the entire depth walk on-device (1.20× faster than compile on
     # 4090 / chess preset). "eager": plain PyTorch, for debugging.
     tensor_mcts_select_backend: str = "compile"
+    # MCTS subtree reuse across plies. When True, after each move the chosen
+    # child's subtree is compacted to slot 0 and carried into the next ply's
+    # search — preserving its visit counts + value estimates so PUCT starts
+    # from an already-developed tree. Doubles the per-game tree storage
+    # (M = 2*num_simulations+1) to fit the carry-over plus a fresh ply.
+    # Falls back to a fresh search whenever the chosen action wasn't
+    # materialized or the subtree+new-sims would overflow M.
+    tensor_mcts_subtree_reuse: bool = False
 
     # Multi-game (Phase 2)
     multi_game: bool = False
