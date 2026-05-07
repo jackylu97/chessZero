@@ -490,6 +490,9 @@ class MuZeroTrainer:
         # mean. CE loss hits a floor once targets are concentrated, so MAE-vs-std
         # is the more honest "is the value head learning?" signal.
         with torch.no_grad():
+            # Histograms are expensive (one tensor copy per add_histogram per step
+            # — many MB at batch=256). Throttle to once every N steps.
+            log_hist = (self.global_step % max(1, getattr(self.config, "histogram_interval", 100)) == 0)
             if getattr(self.config, "value_head_type", "support") == "wdl":
                 # WDL diagnostics: predicted scalar V = P(W) - P(L); target
                 # scalar V = z[W] - z[L] (one-hot, so just +1/0/-1). MAE in
@@ -505,6 +508,17 @@ class MuZeroTrainer:
                 td_errors = (pred_v_scalar - true_v_scalar).abs().cpu().numpy()
                 value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
                 value_target_std = true_v_scalar.std(unbiased=False).item()
+                # Histograms: predicted V scalar + each WDL component. A
+                # collapsed value head shows pred_v_scalar histogram tightly
+                # peaked at 0 with little spread; P_D >> P_W ≈ P_L is the
+                # smoking-gun WDL distribution for draw bias.
+                if log_hist:
+                    pred_wdl = F.softmax(value_logits_k0.detach().float(), dim=-1)
+                    self.writer.add_histogram("value/pred_v_scalar", pred_v_scalar, self.global_step)
+                    self.writer.add_histogram("value/pred_p_w", pred_wdl[:, 0], self.global_step)
+                    self.writer.add_histogram("value/pred_p_d", pred_wdl[:, 1], self.global_step)
+                    self.writer.add_histogram("value/pred_p_l", pred_wdl[:, 2], self.global_step)
+                    self.writer.add_histogram("value/target_v_scalar", true_v_scalar, self.global_step)
             else:
                 pred_v_trans = support_to_scalar(value_logits_k0.detach().float(), self.network.value_support_size).squeeze(-1)
                 true_v_scalar = target_values[:, 0]

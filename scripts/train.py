@@ -99,6 +99,22 @@ def main():
                              "for a pure-self-play run with no warmstart anchor "
                              "(also pass --stockfish-injection-games 0 + "
                              "--stockfish-injection-interval 0 to disable injection).")
+    parser.add_argument("--use-gpu-chess", action="store_true",
+                        help="Use the GPU-resident chess env (GpuChessGame) for self-play.")
+    parser.add_argument("--use-tensor-mcts", action="store_true",
+                        help="Use the GPU tensor-native MCTS (TensorMCTS) instead of BatchedMCTS.")
+    parser.add_argument("--use-gpu-resident-self-play", action="store_true",
+                        help="Use the fully GPU-resident self-play loop (0 syncs/ply). "
+                             "Requires --use-tensor-mcts and --use-gpu-chess.")
+    parser.add_argument("--tensor-mcts-select-backend", default=None,
+                        choices=["compile", "triton", "eager"],
+                        help="MCTS PUCT backend. 'triton' is fastest (~1.2× over compile).")
+    parser.add_argument("--tensor-mcts-subtree-reuse", action="store_true",
+                        help="Enable subtree reuse across plies (carry chosen child's "
+                             "subtree into next ply's search; doubles tree storage).")
+    parser.add_argument("--tensor-mcts-hidden-dtype", default=None,
+                        choices=["float32", "float16", "bfloat16"],
+                        help="Storage dtype for MCTS node_hidden. fp16 halves memory.")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -133,6 +149,18 @@ def main():
         config.num_parallel_games = args.num_parallel_games
     if args.warmstart_sample_frac is not None:
         config.warmstart_sample_frac = args.warmstart_sample_frac
+    if args.use_gpu_chess:
+        config.use_gpu_chess = True
+    if args.use_tensor_mcts:
+        config.use_tensor_mcts = True
+    if args.use_gpu_resident_self_play:
+        config.use_gpu_resident_self_play = True
+    if args.tensor_mcts_select_backend is not None:
+        config.tensor_mcts_select_backend = args.tensor_mcts_select_backend
+    if args.tensor_mcts_subtree_reuse:
+        config.tensor_mcts_subtree_reuse = True
+    if args.tensor_mcts_hidden_dtype is not None:
+        config.tensor_mcts_hidden_dtype = args.tensor_mcts_hidden_dtype
 
     # Use CPU AMP settings appropriately
     if device == "cpu":
