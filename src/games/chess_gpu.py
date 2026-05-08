@@ -1234,7 +1234,7 @@ class GpuChessGame(BatchedGame):
     board_size = (8, 8)
     action_space_size = ACTION_SPACE
     num_planes = NUM_PLANES
-    max_plies = 400  # mirror ChessGame.max_plies — same draw-cutoff semantics.
+    max_plies = 1024  # mirror ChessGame.max_plies — same draw-cutoff semantics. Bumped 400→1024 (2026-05-08) — see ChessGame.max_plies comment for rationale.
 
     def reset_batch(
         self, n: int, *, device: str | torch.device = "cpu",

@@ -133,7 +133,7 @@ class ChessGame(Game):
     board_size = (8, 8)
     action_space_size = ACTION_SPACE  # 4672
     num_planes = 19  # 6 piece types × 2 colors + castling (4) + en passant (1) + turn (1) + move count (1)
-    max_plies = 400  # force draw after 400 plies (200 fullmoves); 200 was too tight — untrained models can't resolve in that horizon, starves value head of real terminal labels
+    max_plies = 1024  # force draw after 1024 plies (512 fullmoves). Was 400 — bumped 2026-05-08 after observing avg game length=347 plies (87% of cap) in cold-start self-play, meaning the cap was forcing artificial draws on games that would otherwise hit a real terminal (50-move rule, 3-fold rep, mate). The buffer was filling with cap-hit pseudo-draws masking the true natural termination distribution. Real chess never goes 1024 plies in practice; if a game reaches it, both sides are pathological.
 
     def reset(self) -> GameState:
         return GameState(

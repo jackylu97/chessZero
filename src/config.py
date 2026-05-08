@@ -371,18 +371,16 @@ def get_config(game: str) -> MuZeroConfig:
             lr_decay_milestones=[0.5, 0.75],  # decay 10× at 50k and 75k
             lr_warmup_steps=500,               # ramp up to lr over first 500 steps;
                                                # AMP scale is still stabilizing there.
-            replay_buffer_size=1500,    # memory-capped, not game-capped. Live measurement
-                                        # 2026-05-07 (cold-start, smaller net): ~9 MB/game in
-                                        # RSS (vs the 6.7 MB stale comment that assumed mixed
-                                        # warmstart+self-play). Pure self-play under the 400-
-                                        # ply cap is heavier per-game. 1500 slots peaks at
-                                        # ~15.5 GB total RSS (incl. ~2 GB overhead), safely
-                                        # under the 24 GB WSL cap (~8 GB headroom for ply-
-                                        # count drift). Was 2500 → projected ~24.5 GB right
-                                        # at the wall. The compact GameHistory encoding
-                                        # (plan_compact_gamehistory_encoding.md) only fixes
-                                        # disk; in-memory buffer expands back to dense on
-                                        # load, so the cap is the only RAM lever.
+            replay_buffer_size=750,     # memory-capped. Halved from 1500 on 2026-05-08 alongside
+                                        # the max_plies bump 400→1024. Per-game memory is
+                                        # roughly proportional to ply count (each ply stores
+                                        # ~50 KB observation + sparse policy + bookkeeping),
+                                        # so a 2× ply cap with constant buffer-size would
+                                        # blow past the 24 GB WSL ceiling. 750 games × an
+                                        # estimated ~700-ply avg × ~50 KB/ply ≈ 26 GB peak;
+                                        # may need to drop further if avg game length exceeds
+                                        # ~700 plies under the new cap. Watch RSS during the
+                                        # first self-play batch.
             warmstart_buffer_size=None, # Cold-start mode (2026-05-07): no warmstart pool,
                                         # all 2500 slots available for self-play games.
                                         # Pair with stockfish_injection_games=0 and
