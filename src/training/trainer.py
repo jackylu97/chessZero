@@ -745,7 +745,33 @@ class MuZeroTrainer:
             return
 
         self.network.eval()
-        batched_mcts = BatchedMCTS(self.network, self.game, self.config, self.device)
+        # MCTS backend dispatch. Default: numpy BatchedMCTS (same path the
+        # codebase shipped with). Opt-in: GPU TensorMCTS via the same factory
+        # self-play uses — significantly faster per position. Gumbel root not
+        # supported in TensorMCTS yet, so we hard-fail if the user combines flags.
+        if getattr(self.config, "reanalyze_use_tensor_mcts", False):
+            if use_gumbel:
+                raise NotImplementedError(
+                    "reanalyze_use_tensor_mcts=True is not compatible with "
+                    "use_gumbel=True (TensorMCTS lacks Gumbel root)."
+                )
+            from ..mcts.tensor_mcts import TensorMCTS
+            _dtype_map = {
+                "float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16,
+            }
+            hidden_dtype = _dtype_map[getattr(self.config, "tensor_mcts_hidden_dtype", "float32")]
+            amp_str = getattr(self.config, "tensor_mcts_amp_dtype", None)
+            amp_dtype = _dtype_map[amp_str] if amp_str else None
+            batched_mcts = TensorMCTS(
+                self.network, self.game, self.config,
+                device=self.device,
+                hidden_dtype=hidden_dtype,
+                amp_dtype=amp_dtype,
+                select_backend=getattr(self.config, "tensor_mcts_select_backend", "compile"),
+                use_subtree_reuse=False,  # N/A: each reanalyze position is independent.
+            )
+        else:
+            batched_mcts = BatchedMCTS(self.network, self.game, self.config, self.device)
         chunk = max(1, getattr(self.config, "num_parallel_games", 1))
         action_space_size = self.game.action_space_size
 

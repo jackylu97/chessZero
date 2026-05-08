@@ -115,6 +115,13 @@ class MuZeroConfig:
     # Reanalyze — re-run MCTS on stored positions with the current network
     reanalyze_interval: int = 0   # training steps between reanalyze calls; 0 = disabled
     reanalyze_batch_size: int = 20  # number of games to reanalyze per call
+    # Use the GPU-resident TensorMCTS path for reanalyze (default: BatchedMCTS).
+    # Self-play already uses TensorMCTS via ``use_tensor_mcts``; reanalyze stayed
+    # on BatchedMCTS for ~10× slower per-position throughput. Flipping this on
+    # routes reanalyze through the same fast path. Independent of
+    # ``use_tensor_mcts`` so self-play and reanalyze can be A/B'd separately.
+    # Subtree reuse is N/A for reanalyze (each position is independent).
+    reanalyze_use_tensor_mcts: bool = False
 
     # Stockfish injection — inject pre-generated Stockfish games into the buffer
     # as if they were self-play rounds. Pool (shards of list[GameHistory] with
@@ -432,9 +439,13 @@ def get_config(game: str) -> MuZeroConfig:
             use_consistency_loss=True, # EfficientZero SimSiam consistency loss on dynamics rollouts
             stockfish_injection_games=0,       # Cold-start mode (2026-05-07): no Stockfish injection.
             stockfish_injection_interval=0,    # Self-play and reanalyze run from step 0.
-            per_alpha=0.0,               # DeepMind uses uniform sampling (not PER) for board games.
-                                        # PER adds IS-weight noise with no benefit when TD errors
-                                        # cluster near zero (draw basin). Matches paper Appendix.
+            per_alpha=0.6,               # 2026-05-07: re-enabling PER for cold-start.
+                                        # Prior reasoning ("DeepMind uses uniform sampling, TD errors
+                                        # cluster near zero in draw basin") was backwards — TD errors
+                                        # cluster near zero ON DRAWN samples, but decisive samples
+                                        # the network mis-predicts have TD ≈ 1.0. PER oversamples
+                                        # exactly those, providing the data rebalance we'd otherwise
+                                        # need warmstart for. Standard PER paper default α=0.6.
             use_scalar_transform=False,  # chess values live in [-1,+1]; h(x) would collapse them onto bin 0
             value_support_size=2,        # 5 bins at {-2,-1,0,+1,+2}; paired with value_target_scale=2.0 gives {-1,-0.5,0,+0.5,+1} in raw space
             value_target_scale=2.0,      # spread raw [-1,+1] targets across the full 5-bin support
