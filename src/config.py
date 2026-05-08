@@ -115,13 +115,15 @@ class MuZeroConfig:
     # Reanalyze — re-run MCTS on stored positions with the current network
     reanalyze_interval: int = 0   # training steps between reanalyze calls; 0 = disabled
     reanalyze_batch_size: int = 20  # number of games to reanalyze per call
-    # Use the GPU-resident TensorMCTS path for reanalyze (default: BatchedMCTS).
-    # Self-play already uses TensorMCTS via ``use_tensor_mcts``; reanalyze stayed
-    # on BatchedMCTS for ~10× slower per-position throughput. Flipping this on
-    # routes reanalyze through the same fast path. Independent of
-    # ``use_tensor_mcts`` so self-play and reanalyze can be A/B'd separately.
+    # Use the GPU-resident TensorMCTS path for reanalyze. Default flipped from
+    # False → True on 2026-05-08 after observing reanalyze take ~22 min/call
+    # (113K positions / numpy BatchedMCTS @ ~12 ms/position) vs the GPU path's
+    # estimated ~2 min/call. Tests in tests/test_reanalyze_tensor_mcts.py
+    # cover both paths; falls back gracefully (raises NotImplementedError on
+    # use_gumbel=True). Independent of ``use_tensor_mcts`` so self-play and
+    # reanalyze can be A/B'd separately by flipping either knob.
     # Subtree reuse is N/A for reanalyze (each position is independent).
-    reanalyze_use_tensor_mcts: bool = False
+    reanalyze_use_tensor_mcts: bool = True
 
     # Stockfish injection — inject pre-generated Stockfish games into the buffer
     # as if they were self-play rounds. Pool (shards of list[GameHistory] with

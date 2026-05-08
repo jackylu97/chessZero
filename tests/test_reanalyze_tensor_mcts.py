@@ -107,10 +107,10 @@ def _run_reanalyze_and_capture(cfg, game, net, buf, device="cpu"):
     ]
 
 
-def test_default_uses_batched_mcts(monkeypatch):
-    """Default flag (off) → BatchedMCTS code path."""
+def test_flag_off_uses_batched_mcts(monkeypatch):
+    """``reanalyze_use_tensor_mcts=False`` → BatchedMCTS code path (legacy/fallback)."""
     game = TicTacToe()
-    cfg = _tiny_config()
+    cfg = _tiny_config(reanalyze_use_tensor_mcts=False)
     net = _make_net(cfg, game)
     buf = ReplayBuffer(max_size=cfg.replay_buffer_size)
     _populate_buffer(buf, game, num_games=2)
@@ -128,10 +128,11 @@ def test_default_uses_batched_mcts(monkeypatch):
     assert constructed == ["BatchedMCTS"], f"expected BatchedMCTS, got {constructed!r}"
 
 
-def test_flag_on_uses_tensor_mcts(monkeypatch):
-    """Flag on → TensorMCTS code path."""
+def test_default_uses_tensor_mcts(monkeypatch):
+    """Default flag (now True since 2026-05-08) → TensorMCTS code path."""
     game = TicTacToe()
-    cfg = _tiny_config(reanalyze_use_tensor_mcts=True)
+    cfg = _tiny_config()  # uses default reanalyze_use_tensor_mcts (True)
+    assert cfg.reanalyze_use_tensor_mcts is True, "default should be True"
     net = _make_net(cfg, game)
     buf = ReplayBuffer(max_size=cfg.replay_buffer_size)
     _populate_buffer(buf, game, num_games=2)
