@@ -139,9 +139,20 @@ def slider_attacks_8way(seed: torch.Tensor, empty: torch.Tensor) -> torch.Tensor
 
     All 8 directions share ``empty[N]``. Replaces 8 separate calls to the
     PyTorch ``_slider_attacks`` (one per direction) with one Triton launch.
+
+    Inputs are forced contiguous: the kernel uses ``tl.load(ptr + offs)``
+    which assumes element-stride-1 layout. Callers that pass column slices
+    of wider tensors (e.g. ``state.pieces[:, P_KING]`` has stride 6) would
+    otherwise read interleaved memory and silently produce wrong attack
+    bitboards for batch indices > 0 (idx 0 reads correctly because offset 0
+    is stride-invariant; idx 1+ get garbage). Bug found 2026-05-08;
+    materialized as ~50% of self-play games training on chess-illegal
+    positions during the 2026_05_07 runs.
     """
     assert seed.dtype == torch.int64 and empty.dtype == torch.int64
     assert seed.is_cuda and empty.is_cuda
+    seed = seed.contiguous()
+    empty = empty.contiguous()
     n = seed.shape[0]
     out = torch.empty((n, 8), dtype=torch.int64, device=seed.device)
     BLOCK_N = 64
@@ -265,17 +276,26 @@ def slider_attacks_8way_per_dir_empty(
     seed: torch.Tensor, empties: torch.Tensor
 ) -> torch.Tensor:
     """Return [N, 8] int64 — slider attacks per direction with per-direction
-    ``empties[N, 8]``. Used by pin-filter x-ray pass."""
+    ``empties[N, 8]``. Used by pin-filter x-ray pass.
+
+    Both inputs are forced contiguous — see ``slider_attacks_8way`` docstring
+    for the rationale. The previous version called ``.contiguous()`` on
+    ``empties`` only; ``seed`` was missing the same guard, so column-sliced
+    seeds (the king bitboard is sliced from the (N, 12) pieces tensor with
+    stride 12) produced wrong output for batch indices > 0.
+    """
     assert seed.dtype == torch.int64 and empties.dtype == torch.int64
     assert seed.is_cuda and empties.is_cuda
     assert empties.shape[1] == 8
+    seed = seed.contiguous()
+    empties = empties.contiguous()
     n = seed.shape[0]
     out = torch.empty((n, 8), dtype=torch.int64, device=seed.device)
     BLOCK_N = 64
     grid = (triton.cdiv(n, BLOCK_N),)
     _slider_8way_per_dir_empty_kernel[grid](
         seed,
-        empties.contiguous(),
+        empties,
         out,
         n,
         NOT_FILE_A=_NOT_FILE_A,
