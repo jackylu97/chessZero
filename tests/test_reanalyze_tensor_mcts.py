@@ -190,3 +190,27 @@ def test_flag_rejects_use_gumbel():
     _populate_buffer(buf, game, num_games=2)
     with pytest.raises(NotImplementedError, match="Gumbel"):
         _run_reanalyze_and_capture(cfg, game, net, buf, device="cpu")
+
+
+def test_flag_on_with_amp_dtype_set():
+    """Cover the truthy ``amp_str`` branch of the dtype dispatch.
+
+    The chess production preset has ``tensor_mcts_amp_dtype='float16'``;
+    without this test the truthy ternary branch of
+    ``amp_dtype = _dtype_map[amp_str] if amp_str else None`` is uncovered.
+    On CPU, TensorMCTS internally nullifies the amp_dtype (no autocast
+    available), but the dispatch code still runs.
+    """
+    game = TicTacToe()
+    cfg = _tiny_config(
+        reanalyze_use_tensor_mcts=True,
+        tensor_mcts_amp_dtype="float16",
+    )
+    net = _make_net(cfg, game)
+    buf = ReplayBuffer(max_size=cfg.replay_buffer_size)
+    _populate_buffer(buf, game, num_games=2)
+    # Must run without raising; produces valid policies + values.
+    snaps = _run_reanalyze_and_capture(cfg, game, net, buf, device="cpu")
+    for policy, root_v in snaps:
+        assert abs(float(policy.sum()) - 1.0) < 1e-3
+        assert -1.0 <= root_v <= 1.0
