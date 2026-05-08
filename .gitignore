@@ -15,6 +15,20 @@ checkpoints/
 data/
 logs/
 *.pt
+*.log
+*.log.*
+
+# Debug / profiling dumps
+py-spy-dumps/
+
+# Test / coverage outputs
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# Editor / agent metadata
+.claude/
 
 # IDE
 .vscode/
