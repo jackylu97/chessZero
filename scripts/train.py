@@ -115,6 +115,28 @@ def main():
     parser.add_argument("--tensor-mcts-hidden-dtype", default=None,
                         choices=["float32", "float16", "bfloat16"],
                         help="Storage dtype for MCTS node_hidden. fp16 halves memory.")
+    parser.add_argument("--no-consistency-loss", action="store_true",
+                        help="Disable EfficientZero SimSiam consistency loss for this run "
+                             "(falsifier for the action-blind dynamics collapse hypothesis).")
+    parser.add_argument("--consistency-single-frame-target", dest="consistency_single_frame_target",
+                        action="store_true", default=None,
+                        help="Use single-frame (newest-ply, zero-padded) consistency target "
+                             "instead of the full T-frame stack. De-trivializes the SimSiam target.")
+    parser.add_argument("--no-consistency-single-frame-target", dest="consistency_single_frame_target",
+                        action="store_false",
+                        help="Force the legacy full-stack consistency target.")
+    parser.add_argument("--use-inverse-dynamics-loss", dest="use_inverse_dynamics_loss",
+                        action="store_true", default=None,
+                        help="Enable the ICM inverse-dynamics aux loss (predict a_k from "
+                             "h_k,h_{k+1}). Validated fix for action-blind dynamics.")
+    parser.add_argument("--no-inverse-dynamics-loss", dest="use_inverse_dynamics_loss",
+                        action="store_false",
+                        help="Disable the inverse-dynamics aux loss (e.g. to A/B against it).")
+    parser.add_argument("--inverse-dynamics-loss-weight", type=float, default=None,
+                        help="Weight on the inverse-dynamics aux loss. Overrides config.")
+    parser.add_argument("--value-head-init-std", type=float, default=None,
+                        help="Std for small-normal init of the value head's last linear "
+                             "(0.0 = zero-init default). >0 lets body gradient flow at cold start.")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -161,6 +183,16 @@ def main():
         config.tensor_mcts_subtree_reuse = True
     if args.tensor_mcts_hidden_dtype is not None:
         config.tensor_mcts_hidden_dtype = args.tensor_mcts_hidden_dtype
+    if args.no_consistency_loss:
+        config.use_consistency_loss = False
+    if args.consistency_single_frame_target is not None:
+        config.consistency_single_frame_target = args.consistency_single_frame_target
+    if args.use_inverse_dynamics_loss is not None:
+        config.use_inverse_dynamics_loss = args.use_inverse_dynamics_loss
+    if args.inverse_dynamics_loss_weight is not None:
+        config.inverse_dynamics_loss_weight = args.inverse_dynamics_loss_weight
+    if args.value_head_init_std is not None:
+        config.value_head_init_std = args.value_head_init_std
 
     # Use CPU AMP settings appropriately
     if device == "cpu":
@@ -198,6 +230,9 @@ def main():
         value_target_scale=config.value_target_scale,
         value_head_type=getattr(config, "value_head_type", "support"),
         draw_score=getattr(config, "draw_score", 0.0),
+        value_head_init_std=getattr(config, "value_head_init_std", 0.0),
+        use_inverse_dynamics_loss=getattr(config, "use_inverse_dynamics_loss", False),
+        inverse_dynamics_hidden=getattr(config, "inverse_dynamics_hidden", 256),
     )
 
     trainer = MuZeroTrainer(

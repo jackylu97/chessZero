@@ -245,6 +245,34 @@ class MuZeroConfig:
     proj_out: int = 1024
     pred_hid: int = 512
     pred_out: int = 1024
+    # Consistency target: use a single-frame (newest-ply-only, zero-padded to the
+    # full history-channel count) observation for the SimSiam target instead of the
+    # full T-frame stack. With history_frames=8 the full-stack target shares 7/8
+    # frames between adjacent unroll steps (~88% trivial), letting an identity
+    # dynamics satisfy consistency. NOTE (2026-06-02): de-risking probes show this
+    # alone does NOT fix action-blindness (the dynamics still memorizes h→next and
+    # ignores the action); it only de-trivializes the target / grounds the world
+    # model. The action-awareness fix is use_inverse_dynamics_loss below. See
+    # dynamics_gradient_starvation memory note.
+    consistency_single_frame_target: bool = False
+
+    # Inverse-dynamics auxiliary loss (ICM/Pathak 2017). A small head predicts the
+    # action a_k from (h_k, h_{k+1}=dynamics(h_k,a_k)); CE against the true action.
+    # The action is only recoverable if the dynamics output depends on it, so this
+    # is a non-bypassable pressure forcing action-conditioned dynamics — the
+    # validated fix for the action-blind collapse (cos(dyn_a,dyn_b)≈1.0). Probe:
+    # drives cross-action cos 1.0→0.61 where every consistency variant stayed ~1.0.
+    # Training-only head; unused by MCTS. See scripts/probe_fix_candidates.py.
+    use_inverse_dynamics_loss: bool = False
+    inverse_dynamics_loss_weight: float = 1.0
+    inverse_dynamics_hidden: int = 256
+
+    # Value-head output-layer init std. 0.0 = zero-init (MuZero/LightZero default;
+    # blocks gradient to the body at cold start because Wᵀ·grad_out = 0). A small
+    # positive std (e.g. 0.01) lets value-head gradient reach the representation/
+    # dynamics body from step 0 without destabilizing early MCTS. Mitigation for the
+    # cold-start gradient block; not a substitute for a body-direct signal.
+    value_head_init_std: float = 0.0
 
     # GPU-resident chess env. When True (chess only), self-play env ops
     # (to_tensor / legal_actions / step) run as batched torch ops via
@@ -437,6 +465,15 @@ def get_config(game: str) -> MuZeroConfig:
             sample_k=50,               # Sampled MuZero: sample K distinct actions per node (Hubert 2021 Proposed Modification)
             eval_interval=5000,
             use_consistency_loss=True, # EfficientZero SimSiam consistency loss on dynamics rollouts
+            consistency_single_frame_target=True,  # corrected default: 8-frame stack target was
+                                                    # ~88% action-invariant (collapse-prone). Grounds
+                                                    # the world model; NOT the action-awareness fix.
+            use_inverse_dynamics_loss=True,  # ICM inverse model — the validated fix for action-blind
+                                             # dynamics (probe: cross-action cos 1.0→0.61). Predicts
+                                             # a_k from (h_k, h_{k+1}); forces action-conditioned dynamics.
+            inverse_dynamics_loss_weight=1.0,
+            value_head_init_std=0.0,    # #4 cold-start gradient-block mitigation; off by default,
+                                        # enable via --value-head-init-std 0.01 to A/B.
             stockfish_injection_games=0,       # Cold-start mode (2026-05-07): no Stockfish injection.
             stockfish_injection_interval=0,    # Self-play and reanalyze run from step 0.
             per_alpha=0.6,               # 2026-05-07: re-enabling PER for cold-start.

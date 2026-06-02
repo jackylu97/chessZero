@@ -3,6 +3,7 @@
 import ctypes
 import os
 import pickle
+import time
 from pathlib import Path
 
 import numpy as np
@@ -130,6 +131,9 @@ class MuZeroTrainer:
 
         self.writer = SummaryWriter(log_dir=os.path.join(log_dir, config.game, run_id))
         self.global_step = 0
+        # Throughput tracking for train/steps_per_sec (computed across log windows).
+        self._last_log_t: float | None = None
+        self._last_log_step: int | None = None
 
         # Stockfish injection state. Populated by scripts/train.py via
         # set_injection_shards(paths) when --stockfish-injection-path is passed.
@@ -306,11 +310,13 @@ class MuZeroTrainer:
 
         self._memory_snapshot("before_selfplay")
 
+        sp_t0 = time.monotonic()
         games = run_self_play(
             self.network, self.game, self.config,
             self.config.num_self_play_games, self.device,
             training_step=self.global_step,
         )
+        sp_secs = time.monotonic() - sp_t0
         for g in games:
             self.replay_buffer.save_game(g)
 
@@ -327,11 +333,17 @@ class MuZeroTrainer:
         p2_wins = sum(1 for o in outcomes if o == -1)
         draws = sum(1 for o in outcomes if o == 0)
 
+        total_plies = sum(len(g) - 1 for g in games)
         self.writer.add_scalar("self_play/avg_game_length", avg_length, self.global_step)
         self.writer.add_scalar("self_play/p1_win_rate", p1_wins / len(games), self.global_step)
         self.writer.add_scalar("self_play/p2_win_rate", p2_wins / len(games), self.global_step)
         self.writer.add_scalar("self_play/draw_rate", draws / len(games), self.global_step)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
+        # Throughput — self-play is the wall-clock bottleneck; track it explicitly.
+        self.writer.add_scalar("self_play/seconds", sp_secs, self.global_step)
+        if sp_secs > 0:
+            self.writer.add_scalar("self_play/games_per_sec", len(games) / sp_secs, self.global_step)
+            self.writer.add_scalar("self_play/plies_per_sec", total_plies / sp_secs, self.global_step)
         self.writer.add_scalar("memory/rss_gb_before_selfplay", rss_before, self.global_step)
         self.writer.add_scalar("memory/rss_gb_after_selfplay", rss_after, self.global_step)
         self.writer.add_scalar("memory/rss_delta_gb_selfplay", rss_delta, self.global_step)
@@ -460,6 +472,46 @@ class MuZeroTrainer:
             return self.config.value_loss_weight
         return w_warm if self._injection_shards else w_self
 
+    # Parameter-name prefixes per sub-network, for splitting the total grad norm.
+    _GRAD_GROUPS = {
+        "repr": ("representation.",),
+        "dyn_action_embed": ("dynamics.action_embedding.",),
+        "dyn_body": ("dynamics.conv_in.", "dynamics.bn_in.", "dynamics.blocks."),
+        "dyn_reward_head": ("dynamics.reward_head.",),
+        "pred_policy_head": ("prediction.policy_head.",),
+        "pred_value_head": ("prediction.value_head.",),
+        "ssl_projection": ("projection.", "prediction_head."),
+        "inverse_head": ("inverse_dynamics_head.",),
+    }
+
+    def _subnetwork_grad_norms(self) -> dict:
+        """Per-sub-network pre-clip gradient L2 norms (call between unscale_ and clip)."""
+        acc = {k: 0.0 for k in self._GRAD_GROUPS}
+        for name, p in self.network.named_parameters():
+            if p.grad is None:
+                continue
+            for key, prefixes in self._GRAD_GROUPS.items():
+                if name.startswith(prefixes):
+                    acc[key] += p.grad.detach().float().norm().item() ** 2
+                    break
+        return {k: v ** 0.5 for k, v in acc.items() if v > 0.0}
+
+    @torch.no_grad()
+    def _cross_action_cos(self, obs: torch.Tensor, actions: torch.Tensor) -> float:
+        """Mean pairwise cosine of dynamics outputs for a fixed root across distinct
+        actions. ~1.0 = action-blind dynamics; lower = action-aware. Diagnostic only."""
+        probe_acts = torch.unique(actions[:, 0])[:12]
+        n = int(probe_acts.numel())
+        if n < 2:
+            return float("nan")
+        rh = self.network.representation(obs[:1])
+        rh_n = rh.expand(n, *rh.shape[1:]).contiguous()
+        dyn_out, _ = self.network.dynamics(rh_n, probe_acts)
+        v = F.normalize(dyn_out.reshape(n, -1).float(), dim=-1)
+        sim = v @ v.t()
+        off = sim[~torch.eye(n, dtype=torch.bool, device=sim.device)]
+        return off.mean().item()
+
     def _train_step(self) -> dict:
         """Single training step on a batch from the replay buffer."""
         self.network.train()
@@ -491,6 +543,12 @@ class MuZeroTrainer:
         target_policies = batch["target_policies"].to(self.device)
         is_weights_t = torch.tensor(is_weights, device=self.device)
         use_consistency = bool(getattr(self.config, "use_consistency_loss", False))
+        single_frame_consistency = bool(getattr(self.config, "consistency_single_frame_target", False))
+        use_inverse = bool(getattr(self.config, "use_inverse_dynamics_loss", False))
+        inverse_weight = float(getattr(self.config, "inverse_dynamics_loss_weight", 1.0))
+        # Newest-frame channel count, for slicing a single-frame consistency target
+        # out of the T-frame stack (newest frame occupies the first num_planes channels).
+        num_planes = getattr(self.game, "num_planes", None)
         target_obs_mask = batch["target_obs_mask"].to(self.device)             # (B, K+1)
         if use_consistency:
             target_observations = batch["target_observations"].to(self.device)  # (B, K+1, C, H, W)
@@ -529,6 +587,7 @@ class MuZeroTrainer:
             hidden, policy_logits, value_logits = self.network.initial_inference_logits(obs)
             value_logits_k0 = value_logits  # save for priority update
             policy_logits_k0 = policy_logits  # save for entropy logging
+            root_hidden_k0 = hidden  # save for in-loop cross-action-cos probe (detached later)
 
             # Per-sample losses at root (k=0) — always full weight
             policy_loss = policy_loss_fn(policy_logits, target_policies[:, 0])
@@ -536,8 +595,10 @@ class MuZeroTrainer:
                                           self.network.value_support_size)
             reward_loss = torch.zeros(obs.shape[0], device=self.device)
             consistency_loss = torch.zeros(obs.shape[0], device=self.device)
+            inverse_loss = torch.zeros(obs.shape[0], device=self.device)
 
             for k in range(self.config.num_unroll_steps):
+                hidden_in = hidden  # h_k — the dynamics input at this unroll step
                 hidden, reward_logits, policy_logits, value_logits = \
                     self.network.recurrent_inference_logits(hidden, actions[:, k])
 
@@ -554,13 +615,29 @@ class MuZeroTrainer:
                     # SimSiam: online branch via dynamics (grad); target branch via representation
                     # of the actual future observation (stop-grad). Matches LightZero
                     # lzero/policy/efficientzero.py consistency loop.
+                    target_obs_k = target_observations[:, k + 1]
+                    if single_frame_consistency and num_planes is not None:
+                        # Zero all but the newest frame so the target depends on the
+                        # actual position at k+1, not the ~7/8 shared history frames.
+                        sf = torch.zeros_like(target_obs_k)
+                        sf[:, :num_planes] = target_obs_k[:, :num_planes]
+                        target_obs_k = sf
                     dyn_proj = self.network.project(hidden, with_grad=True)
                     with torch.no_grad():
-                        target_hidden = self.network.representation(target_observations[:, k + 1])
+                        target_hidden = self.network.representation(target_obs_k)
                         tgt_proj = self.network.project(target_hidden, with_grad=False)
                     consistency_loss = consistency_loss + unroll_scale * (
                         _negative_cosine_similarity(dyn_proj, tgt_proj)
                         * target_obs_mask[:, k + 1]
+                    )
+
+                if use_inverse:
+                    # ICM inverse model: recover a_k from (h_k, h_{k+1}). Gradient flows
+                    # into both hidden states, forcing the dynamics output to encode the
+                    # action. Masked past game end. CE over the full action space.
+                    inv_logits = self.network.predict_inverse_action(hidden_in, hidden)
+                    inverse_loss = inverse_loss + unroll_scale * (
+                        F.cross_entropy(inv_logits, actions[:, k], reduction="none") * mask_k
                     )
 
             per_sample_loss = outer_scale * (
@@ -568,6 +645,7 @@ class MuZeroTrainer:
                 + value_weight * value_loss
                 + reward_loss
                 + self.config.consistency_loss_weight * consistency_loss
+                + inverse_weight * inverse_loss
             )
             total_loss = (is_weights_t * per_sample_loss).mean()
 
@@ -582,6 +660,7 @@ class MuZeroTrainer:
                 "value_loss": float("nan"),
                 "reward_loss": float("nan"),
                 "consistency_loss": float("nan"),
+                "inverse_loss": float("nan"),
                 "grad_norm": float("nan"),
                 "amp_scale": float(self.scaler.get_scale()),
                 "value_mae": float("nan"),
@@ -591,6 +670,12 @@ class MuZeroTrainer:
         self.optimizer.zero_grad()
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)
+        # Per-subnetwork grad norms (pre-clip), only on log steps. Splits the single
+        # total grad_norm into where gradient actually lands — the diagnostic that
+        # surfaces gradient starvation of the world-model body (zero-init heads, draw
+        # basin) vs healthy flow into dynamics/representation/inverse head.
+        log_now = (self.global_step % max(1, self.config.log_interval) == 0)
+        subnet_grad = self._subnetwork_grad_norms() if log_now else {}
         # clip_grad_norm_ returns the pre-clip total norm — useful as a divergence
         # signal (sudden spike → bad gradient → likely source of loss spikes).
         grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
@@ -680,7 +765,13 @@ class MuZeroTrainer:
                                if n_sp > 0 else float("nan"))
         self.replay_buffer.update_priorities(game_indices, td_errors, self.config.per_epsilon)
 
-        return {
+        # In-loop action-awareness probe (log steps only): cosine spread of the
+        # dynamics output across distinct actions from a fixed root. ~1.0 = the
+        # action-blind collapse; falling toward the ~0.6 inverse-trained regime is
+        # the live signal that the dynamics is action-conditioned.
+        cross_action_cos = self._cross_action_cos(obs, actions) if log_now else float("nan")
+
+        result = {
             "total_loss": total_loss.item(),
             "policy_loss": (outer_scale * policy_loss.mean()).item(),
             # Drop the phase-dependent ``value_weight`` factor from the displayed
@@ -690,6 +781,7 @@ class MuZeroTrainer:
             "value_loss": (outer_scale * value_loss.mean()).item(),
             "reward_loss": (outer_scale * reward_loss.mean()).item(),
             "consistency_loss": (outer_scale * self.config.consistency_loss_weight * consistency_loss.mean()).item(),
+            "inverse_loss": (outer_scale * inverse_weight * inverse_loss.mean()).item(),
             "grad_norm": float(grad_norm),
             "amp_scale": float(self.scaler.get_scale()),
             "value_mae": value_mae,
@@ -702,7 +794,12 @@ class MuZeroTrainer:
             "value_loss_warmstart": value_loss_warm,
             "value_loss_selfplay": value_loss_self,
             "batch_warmstart_frac": (n_warm / max(1, is_warm.numel())),
+            "cross_action_cos": cross_action_cos,
         }
+        # Per-sub-network grad norms (present only on log steps) → grad/<group>.
+        for k, v in subnet_grad.items():
+            result[f"gnorm_{k}"] = v
+        return result
 
     @torch.no_grad()
     def _reanalyze(self):
@@ -859,7 +956,16 @@ class MuZeroTrainer:
         policy_keys = {"policy_entropy_pred", "policy_entropy_target"}
         train_keys = {"batch_warmstart_frac"}
         for key, value in loss_info.items():
-            if key in ("grad_norm", "amp_scale") or key in train_keys:
+            # Skip NaN universally (TB grays curves on NaN; e.g. cross_action_cos /
+            # gnorm_* / strata are only populated on log steps or non-empty strata).
+            if isinstance(value, float) and value != value:  # NaN
+                continue
+            if key.startswith("gnorm_"):
+                # Per-sub-network pre-clip grad norm → grad/<group>.
+                self.writer.add_scalar(f"grad/{key[len('gnorm_'):]}", value, step)
+            elif key == "cross_action_cos":
+                self.writer.add_scalar("dynamics/cross_action_cos", value, step)
+            elif key in ("grad_norm", "amp_scale") or key in train_keys:
                 self.writer.add_scalar(f"train/{key}", value, step)
             elif key in value_keys:
                 self.writer.add_scalar(f"value/{key[len('value_'):]}", value, step)
@@ -869,15 +975,19 @@ class MuZeroTrainer:
                 # Per-stratum keys (policy_loss_warmstart etc.) and the rest
                 # land in loss/ alongside the aggregate counterparts so they
                 # graph next to each other in TB.
-                # NaN-skip: tensorboard treats NaN as a real point and grays
-                # the curve; emit nothing when the stratum was empty.
-                if isinstance(value, float) and value != value:  # NaN
-                    continue
                 self.writer.add_scalar(f"loss/{key}", value, step)
         self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], step)
         self.writer.add_scalar("train/per_beta", self.config.per_beta_init + (1.0 - self.config.per_beta_init) * (
             step / max(1, self.config.training_steps)
         ), step)
+        # Training throughput across this log window (steps/sec).
+        now = time.monotonic()
+        if self._last_log_t is not None and self._last_log_step is not None and now > self._last_log_t:
+            sps = (step - self._last_log_step) / (now - self._last_log_t)
+            if sps > 0:
+                self.writer.add_scalar("train/steps_per_sec", sps, step)
+        self._last_log_t = now
+        self._last_log_step = step
 
     def _save_checkpoint(self, step: int):
         torch.save({

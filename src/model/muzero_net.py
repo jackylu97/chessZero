@@ -175,6 +175,7 @@ class PredictionNetwork(nn.Module):
         fc_hidden: int,
         value_support_size: int = 1,
         value_head_type: str = "support",
+        value_head_init_std: float = 0.0,
     ):
         super().__init__()
         self.value_support_size = value_support_size
@@ -204,7 +205,18 @@ class PredictionNetwork(nn.Module):
             nn.Flatten(),
             mlp_head(latent_h * latent_w, fc_hidden, value_out),
         )
-        _zero_init_last_linear(self.value_head)
+        # Value-head output init. Default (std=0.0) zero-inits the last linear —
+        # the standard MuZero/LightZero stability trick. BUT zero weights make the
+        # head's Jacobian w.r.t. its input zero (grad_to_input = Wᵀ·grad_out = 0),
+        # so at cold start the value head passes NO gradient back to the
+        # representation/dynamics body — only the head's own weights move. A small
+        # nonzero std lets some body gradient flow from step 0 (removes the cold-
+        # start block; does NOT fix draw-basin gradient vanishing — that needs a
+        # body-direct signal like inverse dynamics). See dynamics_gradient_starvation.
+        if value_head_init_std and value_head_init_std > 0:
+            _small_init_last_linear(self.value_head, value_head_init_std)
+        else:
+            _zero_init_last_linear(self.value_head)
 
     def forward(self, hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -261,6 +273,39 @@ class PredictionHead(nn.Module):
         return self.net(x)
 
 
+class InverseDynamicsHead(nn.Module):
+    """Predict action a_k from (h_k, h_{k+1}) — ICM/Pathak inverse model.
+
+    The action is recoverable from (h_k, dynamics(h_k, a_k)) ONLY if the dynamics
+    output actually depends on a_k. Minimizing the inverse-prediction loss is
+    therefore a non-bypassable pressure forcing the dynamics to encode the action
+    — directly counteracting the action-blind collapse where dynamics(h, a_i) ≈
+    dynamics(h, a_j) for all actions.
+
+    Unlike the EfficientZero consistency loss (which trains dynamics(h,a)→repr(next)
+    and is satisfiable by memorizing h→next while ignoring a), the inverse model
+    cannot be satisfied by an action-blind dynamics. Verified on the chess preset:
+    inverse loss drives cross-action cos 1.0→0.61 where every consistency variant
+    (8-frame / single-frame / contrastive) stayed at ~1.0. See
+    dynamics_gradient_starvation memory note + scripts/probe_fix_candidates.py.
+    """
+
+    def __init__(self, hidden_planes: int, latent_h: int, latent_w: int,
+                 action_space_size: int, hidden: int = 256):
+        super().__init__()
+        in_dim = 2 * hidden_planes * latent_h * latent_w
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, action_space_size),
+        )
+
+    def forward(self, h_k: torch.Tensor, h_next: torch.Tensor) -> torch.Tensor:
+        b = h_k.shape[0]
+        x = torch.cat([h_k.reshape(b, -1), h_next.reshape(b, -1)], dim=1)
+        return self.net(x)
+
+
 class MuZeroNetwork(nn.Module):
     """Full MuZero network combining representation, dynamics, prediction.
 
@@ -292,6 +337,9 @@ class MuZeroNetwork(nn.Module):
         value_target_scale: float = 1.0,
         value_head_type: str = "support",
         draw_score: float = 0.0,
+        value_head_init_std: float = 0.0,
+        use_inverse_dynamics_loss: bool = False,
+        inverse_dynamics_hidden: int = 256,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -302,6 +350,7 @@ class MuZeroNetwork(nn.Module):
         self.value_target_scale = value_target_scale
         self.value_head_type = value_head_type
         self.draw_score = draw_score
+        self.use_inverse_dynamics_loss = use_inverse_dynamics_loss
 
         self.representation = RepresentationNetwork(
             observation_channels, hidden_planes, num_blocks,
@@ -317,7 +366,18 @@ class MuZeroNetwork(nn.Module):
             hidden_planes, action_space_size,
             latent_h, latent_w, fc_hidden, value_support_size,
             value_head_type=value_head_type,
+            value_head_init_std=value_head_init_std,
         )
+
+        # Inverse-dynamics head (ICM): predicts a_k from (h_k, h_{k+1}). Forces the
+        # dynamics output to encode the action. Training-only; not used by MCTS.
+        if use_inverse_dynamics_loss:
+            self.inverse_dynamics_head = InverseDynamicsHead(
+                hidden_planes, latent_h, latent_w, action_space_size,
+                hidden=inverse_dynamics_hidden,
+            )
+        else:
+            self.inverse_dynamics_head = None
 
         if use_consistency_loss:
             flat_dim = hidden_planes * latent_h * latent_w
@@ -341,6 +401,16 @@ class MuZeroNetwork(nn.Module):
         if with_grad:
             return self.prediction_head(proj)
         return proj.detach()
+
+    def predict_inverse_action(self, h_k: torch.Tensor, h_next: torch.Tensor) -> torch.Tensor:
+        """Inverse-dynamics: logits over actions predicted from (h_k, h_{k+1}).
+
+        Gradient flows into BOTH hidden states (no detach) so the dynamics learns
+        to make its output action-recoverable. Training-only.
+        """
+        assert self.inverse_dynamics_head is not None, \
+            "predict_inverse_action() called with use_inverse_dynamics_loss=False"
+        return self.inverse_dynamics_head(h_k, h_next)
 
     def initial_inference(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run representation + prediction on observation.
@@ -619,6 +689,23 @@ def _zero_init_last_linear(module: nn.Module) -> None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Sequential):
         _zero_init_last_linear(module[-1])
+
+
+def _small_init_last_linear(module: nn.Module, std: float) -> None:
+    """Small-variance normal init of the last Linear (bias zeroed).
+
+    Used as a flag-gated alternative to ``_zero_init_last_linear`` for the value
+    head: keeps initial output magnitude tiny (near-agnostic predictions, MCTS
+    stable) while making the head's Jacobian w.r.t. its input NONZERO, so gradient
+    reaches the representation/dynamics body from training step 0 instead of being
+    blocked until the zero-init weights drift away from zero.
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=std)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Sequential):
+        _small_init_last_linear(module[-1], std)
 
 
 def _pad_to_size(x: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
