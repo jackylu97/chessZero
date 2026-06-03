@@ -454,6 +454,7 @@ class ReplayBuffer:
         eval_to_wdl_alpha: float = 4.0,
         eval_to_wdl_beta: float = 2.0,
         warmstart_sample_frac: float = 0.0,
+        decisive_sample_frac: float = 0.0,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -469,54 +470,60 @@ class ReplayBuffer:
         probs = priorities ** alpha
         probs /= probs.sum()
 
-        # Stratified sampling: when warmstart_sample_frac > 0, partition the
-        # buffer by external_values (warmstart games have it populated;
-        # self-play games don't). Sample floor(B*frac) from warmstart and the
-        # rest from self-play. Maintains a permanent SL anchor in every batch
-        # — directly attacks the catastrophic-forgetting / drawish-basin loop
-        # that triggers when self-play data fully replaces warmstart.
-        # Falls back to flat sampling when frac=0 or one stratum is empty.
-        warm_idx_arr = None
-        sp_idx_arr = None
+        # Stratified sampling: oversample a "priority subset" of games into every
+        # batch so a specific signal can't be flooded out by the majority class.
+        #   Mode A (warmstart_sample_frac>0): subset = warmstart games
+        #     (external_values populated); complement = self-play. Keeps a
+        #     Stockfish anchor in every batch (catastrophic-forgetting guard).
+        #   Mode B (decisive_sample_frac>0): subset = DECISIVE self-play games
+        #     (|game_outcome|>=0.5, i.e. |z|=1); complement = the rest (draws +
+        #     any warmstart). Keeps a NON-CONSTANT value signal (|z|=1 targets)
+        #     in every batch against the draw-saturation loop, where a rising
+        #     self-play draw rate makes the z=0 majority wash out the value
+        #     gradient and the value head collapses to predicting "draw".
+        # Modes are mutually exclusive (warmstart takes precedence). Both fall
+        # back to flat PER when frac=0 or a stratum is empty.
+        subset_idx_arr = None
+        comp_idx_arr = None
+        strat_frac = 0.0
         if warmstart_sample_frac > 0.0:
-            warm_idx_arr = np.array(
-                [i for i in range(n) if self.buffer[i].external_values],
-                dtype=np.int64,
-            )
-            sp_idx_arr = np.array(
-                [i for i in range(n) if not self.buffer[i].external_values],
-                dtype=np.int64,
-            )
+            strat_frac = warmstart_sample_frac
+            subset_idx_arr = np.array(
+                [i for i in range(n) if self.buffer[i].external_values], dtype=np.int64)
+            comp_idx_arr = np.array(
+                [i for i in range(n) if not self.buffer[i].external_values], dtype=np.int64)
+        elif decisive_sample_frac > 0.0:
+            strat_frac = decisive_sample_frac
+            subset_idx_arr = np.array(
+                [i for i in range(n)
+                 if abs(self.buffer[i].game_outcome) >= 0.5 and not self.buffer[i].external_values],
+                dtype=np.int64)
+            comp_idx_arr = np.array(
+                [i for i in range(n)
+                 if not (abs(self.buffer[i].game_outcome) >= 0.5 and not self.buffer[i].external_values)],
+                dtype=np.int64)
 
-        if (warm_idx_arr is not None and len(warm_idx_arr) > 0
-                and len(sp_idx_arr) > 0):
-            n_warm = int(round(batch_size * warmstart_sample_frac))
-            n_sp = batch_size - n_warm
+        if (subset_idx_arr is not None and len(subset_idx_arr) > 0
+                and len(comp_idx_arr) > 0):
+            n_sub = int(round(batch_size * strat_frac))
+            n_comp = batch_size - n_sub
 
-            warm_probs = probs[warm_idx_arr]
-            warm_probs = warm_probs / warm_probs.sum()
-            sp_probs = probs[sp_idx_arr]
-            sp_probs = sp_probs / sp_probs.sum()
+            sub_probs = probs[subset_idx_arr]
+            sub_probs = sub_probs / sub_probs.sum()
+            comp_probs = probs[comp_idx_arr]
+            comp_probs = comp_probs / comp_probs.sum()
 
-            picked_warm_local = np.random.choice(
-                len(warm_idx_arr), size=n_warm, p=warm_probs
-            )
-            picked_sp_local = np.random.choice(
-                len(sp_idx_arr), size=n_sp, p=sp_probs
-            )
+            picked_sub_local = np.random.choice(len(subset_idx_arr), size=n_sub, p=sub_probs)
+            picked_comp_local = np.random.choice(len(comp_idx_arr), size=n_comp, p=comp_probs)
             game_indices = np.concatenate([
-                warm_idx_arr[picked_warm_local],
-                sp_idx_arr[picked_sp_local],
+                subset_idx_arr[picked_sub_local],
+                comp_idx_arr[picked_comp_local],
             ])
-            # IS weights computed against the per-stratum sampling probabilities.
+            # IS weights against the per-stratum sampling probabilities.
             # weight_i = 1 / (k_stratum * P_stratum(i)), then normalize across batch.
             weights = np.empty(batch_size, dtype=np.float64)
-            weights[:n_warm] = (
-                len(warm_idx_arr) * warm_probs[picked_warm_local]
-            ) ** (-beta)
-            weights[n_warm:] = (
-                len(sp_idx_arr) * sp_probs[picked_sp_local]
-            ) ** (-beta)
+            weights[:n_sub] = (len(subset_idx_arr) * sub_probs[picked_sub_local]) ** (-beta)
+            weights[n_sub:] = (len(comp_idx_arr) * comp_probs[picked_comp_local]) ** (-beta)
             weights = (weights / weights.max()).astype(np.float32)
         else:
             game_indices = np.random.choice(n, size=batch_size, p=probs)

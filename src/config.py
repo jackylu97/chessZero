@@ -200,6 +200,19 @@ class MuZeroConfig:
     # 0.0 = back-compat (no stratification). 0.3-0.5 = chess recommended.
     warmstart_sample_frac: float = 0.0
 
+    # Decisive-game resampling: at every batch, sample floor(batch_size *
+    # decisive_sample_frac) games from DECISIVE self-play games (|game_outcome|=1,
+    # i.e. |z|=1) and the rest from the others (draws). Keeps a non-constant value
+    # signal in every batch when the self-play draw rate climbs and the z=0 majority
+    # would otherwise wash out the value gradient (the draw-saturation loop:
+    # flat value -> safe-draw play -> all-draw targets -> flat value). The cheap,
+    # self-play-only seed for the value head (vs Stockfish warmstart's external
+    # seed). Mutually exclusive with warmstart_sample_frac (warmstart wins). Falls
+    # back to flat PER when 0.0 or no decisive games exist yet. 0.5 = aggressive
+    # (half the batch decisive vs a natural ~8-15%); tune down toward 0.3 if it
+    # overfits the small decisive-game set. See deferred_decisive_game_prioritization.
+    decisive_sample_frac: float = 0.0
+
     # AlphaZero-style history encoding: stack the last N ply observations
     # along the channel dimension before passing to the network. Newest
     # frame first. Missing frames (early game) zero-padded.
@@ -440,6 +453,13 @@ def get_config(game: str) -> MuZeroConfig:
             q_ratio=0.0,                # Lc0 default; pure z target.
             warmstart_sample_frac=0.0,  # Cold-start mode (2026-05-07): no warmstart anchor.
                                         # Bump back to 0.4 when re-enabling the Stockfish pool.
+            decisive_sample_frac=0.5,   # 2026-06-02: decisive-game resampling seed for the value
+                                        # head. The run hit the draw-saturation loop (self-play draw
+                                        # rate 0.76->0.92 by step 2048, value head flat). Force half
+                                        # the batch from |z|=1 games so the value head keeps a
+                                        # non-constant target to learn from. Cheap self-play-only seed;
+                                        # q_ratio (the amplifier) and Stockfish warmstart are the
+                                        # follow-on levers if this isn't enough.
             history_frames=8,           # AlphaZero canonical: 8 ply frames stacked. Lets the
                                         # network perceive threefold repetition + 50-move-rule
                                         # progress (a stateless encoder cannot). Reconstructed
