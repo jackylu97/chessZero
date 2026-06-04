@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "flask>=3.0.0",
     "numpy>=2.2.6",
+    "psutil>=5.9.0",
     "python-chess>=1.999",
     "tensorboard>=2.20.0",
     "torch>=2.11.0",
@@ -17,3 +18,8 @@ dependencies = [
 dev = [
     "pytest>=9.0.3",
 ]
+
+[tool.uv]
+# Deps-only project: the root isn't an installable package (scripts self-insert
+# the repo root into sys.path), so don't try to build/install it on `uv sync`.
+package = false
