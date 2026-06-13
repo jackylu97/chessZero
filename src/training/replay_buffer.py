@@ -278,6 +278,15 @@ class GameHistory:
 
                 policy = self.policies[idx] if idx < len(self.policies) else None
                 if policy is None or len(policy) == 0:
+                    # INTENTIONAL benign no-op (bug_hunt_2026_06_13.md §E).
+                    # Root sampling (sample_batch: randint(0, len(game))) can land
+                    # on the terminal index, where idx == len(actions) so there is
+                    # no MCTS policy (self.policies has one entry per non-terminal
+                    # ply). A ZEROS target — unlike a uniform target — contributes
+                    # exactly 0 CE gradient, so this position trains its (correct,
+                    # nonzero, STM-POV) VALUE target only and pulls the policy head
+                    # toward nothing. Do NOT change this to uniform/argmax: that
+                    # would inject a spurious policy gradient at terminal states.
                     policy = np.zeros(action_space_size, dtype=np.float32)
                 else:
                     policy = np.asarray(policy, dtype=np.float32)
