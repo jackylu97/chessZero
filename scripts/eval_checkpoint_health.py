@@ -32,15 +32,60 @@ import chess.engine
 from src.config import get_config
 from src.games.chess import ChessGame, _move_to_action, _action_to_move
 from src.model.muzero_net import MuZeroNetwork, _min_max_normalize
-from src.training.replay_buffer import stack_with_history
+from src.training.replay_buffer import stack_with_history, _iter_shard_games
 
 # --- thresholds (tune once; shared across runs) ----------------------------
 TH = dict(
     latent_std_min=0.01, crosspos_cos_max=0.98,
     value_calib_win=0.25, value_calib_draw=0.35, value_spread_min=0.05, draw_sat_max=0.85,
+    value_eval_corr_min=0.50,  # corr(head V, Stockfish eval) on in-distribution pool positions
     inv_recovery_min=0.30, crossaction_cos_max=0.90, dyn_value_std_min=0.02,
     sf_overlap_min=0.30,
 )
+
+
+def pool_calib_positions(game, hf, pool_dir, seed, n_per_bucket=40, max_games=400):
+    """In-distribution calibration set: real Stockfish-pool positions WITH full
+    8-frame history (no zero-padding), binned by their side-to-move eval into
+    clear-win / balanced-draw / clear-loss. Returns
+    (buckets: {label: [(obs, eval)]}, flat: [(obs, eval)]).
+    Replaces the old constructed-FEN-with-zero-pad calibration, which was
+    material- AND history-OOD (warmstart data is dense middlegames with history).
+    """
+    import glob
+    rng = np.random.default_rng(seed)
+    paths = sorted(glob.glob(os.path.join(pool_dir, "**", "*.pkl"), recursive=True))
+    rng.shuffle(paths)
+    buckets = {"win (eval>+0.5)": [], "draw (|eval|<0.1)": [], "loss (eval<-0.5)": []}
+    flat = []
+    used = 0
+    for p in paths:
+        if used >= max_games or all(len(v) >= n_per_bucket for v in buckets.values()):
+            break
+        try:
+            games = list(_iter_shard_games(p, game=game))
+        except Exception:
+            continue
+        rng.shuffle(games)
+        for gh in games:
+            if used >= max_games:
+                break
+            n_ev = len(gh.external_values)
+            if n_ev == 0:
+                continue
+            used += 1
+            for ply in rng.choice(n_ev, size=min(8, n_ev), replace=False):
+                ply = int(ply)
+                ev = float(gh.external_values[ply])
+                obs = gh._stack_history(ply, hf)  # real history, STM-relative
+                flat.append((obs, ev))
+                if ev > 0.5 and len(buckets["win (eval>+0.5)"]) < n_per_bucket:
+                    buckets["win (eval>+0.5)"].append((obs, ev))
+                elif abs(ev) < 0.1 and len(buckets["draw (|eval|<0.1)"]) < n_per_bucket:
+                    buckets["draw (|eval|<0.1)"].append((obs, ev))
+                elif ev < -0.5 and len(buckets["loss (eval<-0.5)"]) < n_per_bucket:
+                    buckets["loss (eval<-0.5)"].append((obs, ev))
+    return buckets, flat
 # Below this step, a lagging value head is read as "early/still-developing", not as
 # "the persistent bottleneck" — so the gate says KEEP-RUNNING rather than PROCEED.
 EARLY_STEPS = 6000
@@ -97,6 +142,10 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--mcts-sims", type=int, default=40)
     ap.add_argument("--stockfish", default="/usr/games/stockfish")
+    ap.add_argument("--pool-dir", default="data/stockfish_injection",
+                    help="Stockfish shard dir for in-distribution value calibration "
+                         "(real positions + full history). Falls back to constructed "
+                         "FENs if the pool is absent.")
     ap.add_argument("--logdir", default=None)
     args = ap.parse_args()
 
@@ -166,20 +215,62 @@ def main():
 
     # ---- 3. Value head: calibration + spread + draw saturation -------------
     print(f"\n[3] VALUE HEAD")
-    calib_v = {}
+    # In-distribution calibration: real Stockfish-pool positions WITH full history,
+    # binned by side-to-move eval. (The old constructed-FEN check used zero-padded
+    # history on material-OOD toy endgames; kept below as an informational readout
+    # only — it no longer gates the verdict.)
+    calibrated = None
+    veval_corr = float("nan")
+    buckets, flat = (({}, []) if not os.path.isdir(args.pool_dir)
+                     else pool_calib_positions(game, HF, args.pool_dir, seed=7))
+    if flat:
+        @torch.no_grad()
+        def batch_V(obs_list):
+            xs = torch.stack(obs_list).to(dev)
+            _, vl = net.prediction(net.representation(xs))
+            from src.model.utils import wdl_to_scalar
+            return wdl_to_scalar(vl.float(), draw_score=cfg.draw_score).cpu().numpy()
+        bucket_means = {}
+        for label, items in buckets.items():
+            if items:
+                vs = batch_V([o for o, _ in items])
+                bucket_means[label] = (float(np.mean(vs)), float(np.std(vs)), len(items))
+                print(f"    {label:20s} mean V={bucket_means[label][0]:+.3f} "
+                      f"±{bucket_means[label][1]:.3f}  (n={len(items)})  [real history]")
+        Vall = batch_V([o for o, _ in flat]); Eall = np.array([e for _, e in flat])
+        if Vall.std() > 1e-6 and Eall.std() > 1e-6:
+            veval_corr = float(np.corrcoef(Vall, Eall)[0, 1])
+        slope = float(np.polyfit(Eall, Vall, 1)[0]) if Eall.std() > 1e-6 else float("nan")
+        print(f"    corr(V, Stockfish eval)={veval_corr:+.3f}  slope={slope:+.3f}  (n={len(flat)}, in-distribution)")
+        vw = bucket_means.get("win (eval>+0.5)", (None,))[0]
+        vd = bucket_means.get("draw (|eval|<0.1)", (None,))[0]
+        vl_ = bucket_means.get("loss (eval<-0.5)", (None,))[0]
+        calibrated = bool(
+            veval_corr > TH["value_eval_corr_min"]
+            and (vw is None or vw > TH["value_calib_win"])
+            and (vl_ is None or vl_ < -TH["value_calib_win"])
+            and (vd is None or abs(vd) < TH["value_calib_draw"])
+        )
+    # Informational: constructed FENs (zero-pad history, material-OOD) — NOT gating.
     for name, fen, sign in CALIB:
         st, board = obs_from_fen(game, fen)
-        cur = game.to_tensor(st); obs = stack_with_history(cur, [], HF)  # zero-pad history
+        cur = game.to_tensor(st); obs = stack_with_history(cur, [], HF)
         _, _, wdl, v = eval_pos(obs)
-        calib_v[sign] = v
-        print(f"    {name:28s} V={v:+.3f}  WDL=({wdl[0]:.2f},{wdl[1]:.2f},{wdl[2]:.2f})  [zero-pad history]")
+        print(f"    [ref] {name:24s} V={v:+.3f}  WDL=({wdl[0]:.2f},{wdl[1]:.2f},{wdl[2]:.2f})  [constructed, zero-pad — OOD]")
+    if calibrated is None:  # no pool — fall back to the constructed-FEN gate
+        cv = {}
+        for name, fen, sign in CALIB:
+            st, board = obs_from_fen(game, fen)
+            obs = stack_with_history(game.to_tensor(st), [], HF)
+            _, _, _, v = eval_pos(obs); cv[sign] = v
+        calibrated = (cv.get(+1, 0) > TH["value_calib_win"] and cv.get(-1, 0) < -TH["value_calib_win"]
+                      and abs(cv.get(0, 1)) < TH["value_calib_draw"])
+        print("    (no pool — calibration gated on constructed FENs, zero-pad)")
     mid_vs, mid_pd = [], []
     for name, s, board, obs, legal in mids:
         _, _, wdl, v = eval_pos(obs); mid_vs.append(v); mid_pd.append(wdl[1].item())
     vspread = float(np.std(mid_vs)); draw_sat = float(np.mean(mid_pd))
     print(f"    midgame V spread (std) {vspread:.3f} | mean P(draw) {draw_sat:.3f}")
-    calibrated = (calib_v.get(+1, 0) > TH["value_calib_win"] and calib_v.get(-1, 0) < -TH["value_calib_win"]
-                  and abs(calib_v.get(0, 1)) < TH["value_calib_draw"])
     verdict["value_calibrated"] = bool(calibrated)
     verdict["value_spread_ok"] = bool(vspread > TH["value_spread_min"])
     verdict["value_not_draw_saturated"] = bool(draw_sat < TH["draw_sat_max"])
