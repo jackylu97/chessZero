@@ -414,16 +414,12 @@ def get_config(game: str) -> MuZeroConfig:
             lr_decay_milestones=[0.5, 0.75],  # decay 10× at 50k and 75k
             lr_warmup_steps=500,               # ramp up to lr over first 500 steps;
                                                # AMP scale is still stabilizing there.
-            replay_buffer_size=750,     # memory-capped. Halved from 1500 on 2026-05-08 alongside
-                                        # the max_plies bump 400→1024. Per-game memory is
-                                        # roughly proportional to ply count (each ply stores
-                                        # ~50 KB observation + sparse policy + bookkeeping),
-                                        # so a 2× ply cap with constant buffer-size would
-                                        # blow past the 24 GB WSL ceiling. 750 games × an
-                                        # estimated ~700-ply avg × ~50 KB/ply ≈ 26 GB peak;
-                                        # may need to drop further if avg game length exceeds
-                                        # ~700 plies under the new cap. Watch RSS during the
-                                        # first self-play batch.
+            replay_buffer_size=1500,    # 2026-06-12: restored to 1500 (was halved to 750 on
+                                        # 2026-05-08 to fit the 24 GB WSL RSS ceiling). The
+                                        # run box now has 251 GB RAM; at ~700-ply avg ×
+                                        # ~50 KB/ply, 1500 games ≈ 52 GB peak — comfortable.
+                                        # 2× the buffer also halves sample staleness pressure
+                                        # at the same self-play cadence.
             warmstart_buffer_size=None, # Cold-start mode (2026-05-07): no warmstart pool,
                                         # all 2500 slots available for self-play games.
                                         # Pair with stockfish_injection_games=0 and
@@ -431,10 +427,10 @@ def get_config(game: str) -> MuZeroConfig:
             min_buffer_size=500,
             num_self_play_games=256,   # one num_parallel_games sweep per round
             self_play_interval=512,   # 2:1 train:selfplay ratio
-            lr=2e-3,                   # 2× paper floor; grad_norm + amp_scale confirm
-                                        # optimizer has headroom at 1e-3. With 500-step
-                                        # warmup (below). See design.md § Deferred: Double
-                                        # Base Learning Rate for Chess.
+            lr=1e-3,                   # 2026-06-12: dropped from 2e-3 back to the paper
+                                        # floor for this run. With 500-step warmup (below).
+                                        # See design.md § Deferred: Double Base Learning
+                                        # Rate for Chess for the 2e-3 reasoning if re-raising.
             value_loss_weight_warmstart=1.0,  # clean Stockfish targets: strong supervision
             value_loss_weight_selfplay=1.0,   # MC returns (td_steps=-1) → no bootstrap noise; WDL
                                                # cross-entropy is naturally small (max ln(3)≈1.1).
@@ -549,12 +545,14 @@ def get_config(game: str) -> MuZeroConfig:
             #     still gives ~1.3-1.5×.
             tensor_mcts_amp_dtype="float16",
             compile_network=False,
-            #   save_buffer=False: don't pickle the replay buffer to disk.
-            #     v3 compact format hit reproducible "illegal move on load"
-            #     errors (chess_gpu pin-detection edge case — bishop pinned
-            #     to king along rank). Resume cold-starts buffer via self-
-            #     play; ~30 min cost is cheaper than debugging buffer corruption.
-            save_buffer=False,
+            #   save_buffer=True: re-enabled 2026-06-12. Was disabled 2026-05-07
+            #     when the v3 compact format hit "illegal move on load" errors
+            #     traced to a chess_gpu pin-detection edge case (bishop pinned
+            #     to king along rank); that engine bug has since been fixed
+            #     (see run 2026_05_08_per_fix "post-chess_gpu-bug-fix"). If
+            #     load errors reappear on resume, flip back to False — the
+            #     loader tolerates a missing/corrupt .buf by cold-starting.
+            save_buffer=True,
         ),
         "checkers": MuZeroConfig(
             game="checkers",
