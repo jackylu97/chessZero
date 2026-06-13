@@ -1729,6 +1729,23 @@ def _step_batch_impl(
     new_side = (1 - state.side.to(torch.int64)).to(torch.int8)
     new_ply = (state.ply.to(torch.int64) + 1).to(torch.int16)
 
+    # Freeze ALREADY-done games (state.done True BEFORE this step): carry every
+    # board field forward unchanged so a finished game is fully static under
+    # later sentinel steps. Without this the board keeps mutating and the
+    # end-of-batch terminal observation (self_play.py final_obs) is corrupt for
+    # every game that finished before the batch's longest. Games that become
+    # newly-done THIS step are unaffected (their gate is state.done == False).
+    # See bug_hunt_2026_06_13.md §D.
+    already_done = state.done
+    d1 = already_done.view(N, 1)  # broadcast over (N, *) per-field shapes
+    new_pieces = torch.where(d1, state.pieces, new_pieces)
+    new_side = torch.where(already_done, state.side, new_side)
+    new_castling = torch.where(d1, state.castling, new_castling)
+    new_ep = torch.where(already_done, state.ep, new_ep)
+    new_halfmove = torch.where(already_done, state.halfmove, new_halfmove)
+    new_fullmove = torch.where(already_done, state.fullmove, new_fullmove)
+    new_ply = torch.where(already_done, state.ply, new_ply)
+
     # Provisional new state (terminals computed below).
     new_state = ChessBatchedState(
         pieces=new_pieces,
@@ -1783,6 +1800,11 @@ def _step_batch_impl(
     matches = (new_rep_hashes == new_hash.unsqueeze(1)) & valid
     threefold = matches.sum(dim=1) >= 3
 
+    # Freeze the repetition ring for already-done games too (§D). A done game's
+    # board is static, so its rep history must not absorb sentinel-step hashes.
+    new_rep_hashes = torch.where(d1, old_rep_hashes, new_rep_hashes)
+    new_rep_count = torch.where(already_done, old_rep_count, new_rep_count)
+
     new_state.rep_hashes = new_rep_hashes
     new_state.rep_count = new_rep_count
 
@@ -1808,7 +1830,9 @@ def _step_batch_impl(
     done = mate | stalemate | seventy_five_move | ply_cap | threefold | insufficient_material
 
     # Mover-POV reward (matches Game.step). Mover = side just moved = old side.
-    reward = torch.where(mate, 1.0, 0.0).to(torch.float32)
+    # Already-done games emit reward 0 — no terminal reward is re-emitted under
+    # sentinel steps (§D).
+    reward = torch.where(mate & ~already_done, 1.0, 0.0).to(torch.float32)
 
     # Winner from white's POV: +1 if white wins, -1 if black wins, 0 draw.
     winner = torch.where(
