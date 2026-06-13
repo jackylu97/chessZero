@@ -66,9 +66,11 @@ def select_action_gpu(
 
     Returns:
         action: [N] int64 — chosen action per game.
-        dense_policy: [N, A] float32 — visit-count-weighted distribution
-            (option-(b) duplicates are summed via scatter_add). For greedy
-            games this is one-hot at the chosen action.
+        dense_policy: [N, A] float32 — RAW deduped visit fraction
+            N(a)/ΣN(a) (option-(b) duplicates summed per unique action via
+            scatter_add). Temperature-independent training target for ALL
+            temperatures, including greedy (T=0); see bug_hunt_2026_06_13.md
+            §A+§B. Temperature drives only ``action`` selection.
     """
     n, K = child_actions.shape
     dev = child_actions.device
@@ -82,49 +84,54 @@ def select_action_gpu(
 
     is_greedy = temperature == 0                                       # [N]
 
-    # Greedy path: argmax visits.
-    greedy_slot = visits_f.argmax(dim=1)                               # [N]
+    # bug_hunt_2026_06_13.md §A: SUM the per-slot visits into a per-unique-action
+    # dense tensor FIRST (option-(b) duplicates split an action's visits across
+    # many of the K slots), then apply temperature / build the target on the
+    # deduped action-level visits — matching the numpy _build_compat_roots path.
+    # Doing temperature per-slot (softmax over raw K slots) corrupts both the
+    # training target and the move choice for T≠1 since softmax is nonlinear.
+    actions_long = child_actions.clamp(min=0).long()                   # [N, K]
+    masked_visits = torch.where(valid, visits_f, torch.zeros_like(visits_f))
+    dense_visits = torch.zeros(n, action_space_size, device=dev, dtype=torch.float32)
+    dense_visits.scatter_add_(1, actions_long, masked_visits)          # [N, A]
 
-    # Sampled path: softmax(log(visits) / T). log-space is numerically stable
-    # for high inv_temp; zero-visit slots get -inf logits → 0 prob.
+    # Dense TRAINING TARGET: raw deduped visit fraction N(a)/ΣN(a), independent
+    # of temperature (bug_hunt §B). Rows with no visits fall back to all-zeros.
+    visit_total = dense_visits.sum(dim=1, keepdim=True)                # [N, 1]
+    dense_target = dense_visits / visit_total.clamp(min=1e-9)          # [N, A]
+
+    # Greedy path: argmax over summed action visits.
+    greedy_action = dense_visits.argmax(dim=1)                         # [N]
+
+    # Sampled path: softmax(log(summed_visits) / T) over UNIQUE actions.
+    # log-space is numerically stable for high inv_temp; zero-visit actions get
+    # -inf logits → 0 prob.
+    action_valid = dense_visits > 0                                    # [N, A]
     safe_temp = temperature.clamp(min=1e-3)
     inv_temp = (1.0 / safe_temp).unsqueeze(1)                          # [N, 1]
-    log_visits = torch.log(visits_f.clamp(min=1e-9))                   # [N, K]
-    slot_logits = log_visits * inv_temp                                # [N, K]
-    # Mask invalid slots to -inf so they get 0 prob.
-    slot_logits = torch.where(
-        valid, slot_logits, torch.full_like(slot_logits, _NEG_INF)
+    log_visits = torch.log(dense_visits.clamp(min=1e-9))               # [N, A]
+    action_logits = log_visits * inv_temp                              # [N, A]
+    action_logits = torch.where(
+        action_valid, action_logits, torch.full_like(action_logits, _NEG_INF)
     )
-    slot_probs = torch.softmax(slot_logits, dim=1)                     # [N, K]
-    # If a row is all-invalid (or all zero visits), softmax of all -inf is
-    # NaN. Fall back to uniform over valid (or any) — this is a safety net;
-    # in practice the root always has at least one valid sampled slot.
-    has_any = valid.any(dim=1, keepdim=True)
+    sample_probs = torch.softmax(action_logits, dim=1)                 # [N, A]
+    # Safety net: a row with no valid action (all-invalid root) or NaN softmax
+    # falls back to uniform over valid actions (or all if none).
+    has_any = action_valid.any(dim=1, keepdim=True)
     safe_probs = torch.where(
-        valid, torch.ones_like(slot_probs), torch.zeros_like(slot_probs)
+        action_valid,
+        torch.ones_like(sample_probs),
+        torch.zeros_like(sample_probs),
     )
     safe_probs = safe_probs / safe_probs.sum(dim=1, keepdim=True).clamp(min=1.0)
-    nan_mask = torch.isnan(slot_probs).any(dim=1, keepdim=True) | ~has_any
-    slot_probs = torch.where(nan_mask, safe_probs, slot_probs)
+    nan_mask = torch.isnan(sample_probs).any(dim=1, keepdim=True) | ~has_any
+    sample_probs = torch.where(nan_mask, safe_probs, sample_probs)
 
-    sampled_slot = torch.multinomial(slot_probs, 1).squeeze(1)         # [N]
+    sampled_action = torch.multinomial(sample_probs, 1).squeeze(1)     # [N]
 
-    next_slot = torch.where(is_greedy, greedy_slot, sampled_slot)
-    action = child_actions.gather(1, next_slot.unsqueeze(1)).squeeze(1).long()
+    action = torch.where(is_greedy, greedy_action, sampled_action).long()
 
-    # Dense policy.
-    actions_long = child_actions.clamp(min=0).long()
-    masked_probs = torch.where(
-        valid, slot_probs, torch.zeros_like(slot_probs)
-    )
-    dense_sampled = torch.zeros(n, action_space_size, device=dev, dtype=torch.float32)
-    dense_sampled.scatter_add_(1, actions_long, masked_probs)
-
-    dense_greedy = torch.zeros_like(dense_sampled)
-    dense_greedy.scatter_(1, action.unsqueeze(1), 1.0)
-
-    dense = torch.where(is_greedy.unsqueeze(1), dense_greedy, dense_sampled)
-    return action, dense
+    return action, dense_target
 
 
 class TensorMCTS:

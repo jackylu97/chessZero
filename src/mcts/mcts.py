@@ -670,23 +670,30 @@ def select_action(
     actions = root.child_actions
     visits = root.child_visits.astype(np.float64)
 
+    # bug_hunt_2026_06_13.md §B: the dense TRAINING TARGET is the raw visit
+    # fraction N(a)/ΣN(a), temperature-independent for ALL T (matches the
+    # docstring above and reanalyze's T=1.0 convention). Temperature affects
+    # only WHICH action we sample/play, never the stored target.
+    raw_total = visits.sum()
+    if raw_total <= 0:
+        raw_probs = np.ones(len(actions)) / len(actions)
+    else:
+        raw_probs = visits / raw_total
+
     if temperature == 0:
         action = int(actions[int(np.argmax(visits))])
-        probs = np.zeros(len(actions))
-        probs[int(np.argmax(visits))] = 1.0
     else:
         visits_temp = visits ** (1.0 / temperature)
         total_v = visits_temp.sum()
         if total_v <= 0:
-            visit_probs = np.ones(len(actions)) / len(actions)
+            select_probs = np.ones(len(actions)) / len(actions)
         else:
-            visit_probs = visits_temp / total_v
-        action = int(np.random.choice(actions, p=visit_probs))
-        probs = visit_probs
+            select_probs = visits_temp / total_v
+        action = int(np.random.choice(actions, p=select_probs))
 
     max_action = int(actions.max()) + 1
     action_probs = np.zeros(max_action, dtype=np.float32)
-    action_probs[actions] = probs
+    action_probs[actions] = raw_probs
     return action, action_probs
 
 

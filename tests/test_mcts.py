@@ -437,8 +437,13 @@ def test_select_action_temperature_zero_picks_max_visited():
     root.child_actions = np.array([2, 5, 7])
     root.child_visits = np.array([3.0, 10.0, 1.0])
     action, probs = select_action(root, temperature=0)
+    # Selection at T=0 is greedy argmax-visits.
     assert action == 5
-    assert probs[5] == 1.0
+    # bug_hunt_2026_06_13.md §B: the dense TRAINING TARGET is the raw visit
+    # fraction N(a)/ΣN(a) for ALL temperatures (incl. T=0) — not one-hot.
+    assert probs[2] == pytest.approx(3 / 14)
+    assert probs[5] == pytest.approx(10 / 14)
+    assert probs[7] == pytest.approx(1 / 14)
     assert sum(probs) == pytest.approx(1.0)
 
 
