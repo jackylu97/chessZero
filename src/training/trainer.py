@@ -20,6 +20,7 @@ from ..games.base import Game
 from ..model.muzero_net import MuZeroNetwork
 from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar, inverse_scalar_transform
 from .replay_buffer import ReplayBuffer, _iter_shard_games
+from .representation_probe import compute_repr_metrics
 from .self_play import run_self_play
 
 
@@ -145,6 +146,9 @@ class MuZeroTrainer:
         # at a time by _inject_stockfish_games to avoid re-reading each shard.
         self._injection_shard_idx: int = 0
         self._injection_shard_games: list = []
+        # Lazily-built fixed held-out probe set for the in-loop representation
+        # informativeness metric (repr/* scalars). See representation_probe.py.
+        self._repr_probe_set = None
 
     def train(self):
         """Run the full training loop."""
@@ -224,6 +228,10 @@ class MuZeroTrainer:
 
             if step > 0 and step % self.config.eval_interval == 0:
                 self._evaluate(step)
+
+            if (getattr(self.config, "repr_probe_interval", 0) > 0
+                    and step % self.config.repr_probe_interval == 0):
+                self._log_representation_probe(step)
 
         self._save_checkpoint(self.config.training_steps)
         self.writer.close()
@@ -360,6 +368,79 @@ class MuZeroTrainer:
             f"Step {self.global_step}: self-play done | "
             f"RSS {rss_before:.2f} → {rss_after:.2f} GB (Δ {rss_delta:+.2f}){gpu_msg}"
         )
+
+    def _build_repr_probe_set(self):
+        """Sample a FIXED held-out set of (stacked_obs, stm_eval, stm_outcome) for
+        the in-loop representation probe. Prefers Stockfish-labelled positions
+        (injection shards, then warmstart games in the buffer); falls back to
+        self-play game outcomes (eval label NaN -> repr/r2_eval is NaN). Built
+        once and reused so the repr/* trajectory is comparable across steps.
+        Returns (obs[M,C,H,W] f32, eval[M] f32, outcome[M] f32) or None.
+        """
+        hf = getattr(self.config, "history_frames", 1)
+        target = int(getattr(self.config, "repr_probe_positions", 768))
+        rng = np.random.default_rng(12345)
+        obs_l, ev_l, out_l = [], [], []
+
+        def add_from_games(games, need_ev):
+            for gh in games:
+                n = len(gh.external_values) if need_ev else len(gh.actions)
+                if n <= 0:
+                    continue
+                for ply in rng.choice(n, size=min(6, n), replace=False):
+                    ply = int(ply)
+                    obs_l.append(gh._stack_history(ply, hf).numpy())
+                    stm_white = (ply % 2 == 0)
+                    out_l.append(float(gh.game_outcome) * (1.0 if stm_white else -1.0))
+                    ev_l.append(float(gh.external_values[ply]) if need_ev else float("nan"))
+                if len(obs_l) >= target:
+                    break
+
+        if self._injection_shards:
+            for p in self._injection_shards:
+                try:
+                    add_from_games(list(_iter_shard_games(p, self.game)), need_ev=True)
+                except Exception:
+                    continue
+                if len(obs_l) >= target:
+                    break
+        if len(obs_l) < target:
+            add_from_games([g for g in self.replay_buffer.buffer if g.external_values], need_ev=True)
+        if len(obs_l) < target // 2:
+            add_from_games([g for g in self.replay_buffer.buffer if not g.external_values], need_ev=False)
+
+        if len(obs_l) < 50:
+            return None
+        return (np.asarray(obs_l, dtype=np.float32),
+                np.asarray(ev_l, dtype=np.float32),
+                np.asarray(out_l, dtype=np.float32))
+
+    def _log_representation_probe(self, step: int) -> None:
+        """Log representation-informativeness metrics (repr/*) on the fixed probe
+        set. r2_eval = linear decodability of Stockfish eval from the frozen
+        latent — the leading indicator of draw-basin collapse (falls while value
+        LOSS can look healthy). Runs under no_grad on the long repr_probe_interval.
+        """
+        if self._repr_probe_set is None:
+            self._repr_probe_set = self._build_repr_probe_set()
+            if self._repr_probe_set is None:
+                return
+        obs, ev, out = self._repr_probe_set
+        H = []
+        with torch.no_grad():
+            for s in range(0, len(obs), 256):
+                x = torch.from_numpy(obs[s:s + 256]).to(self.device)
+                h = self.network.representation(x).reshape(x.shape[0], -1).float().cpu().numpy()
+                H.append(h)
+        m = compute_repr_metrics(np.concatenate(H, 0), ev, out, seed=0)
+        self.writer.add_scalar("repr/r2_eval", m["r2_eval"], step)
+        self.writer.add_scalar("repr/r2_outcome", m["r2_out"], step)
+        self.writer.add_scalar("repr/crosspos_cos", m["crosspos_cos"], step)
+        self.writer.add_scalar("repr/eff_rank", m["eff_rank"], step)
+        self.writer.add_scalar("repr/sign_acc", m["sign_acc"], step)
+        tqdm.write(f"Step {step}: repr probe — r2_eval={m['r2_eval']:.3f} "
+                   f"r2_out={m['r2_out']:.3f} cpc={m['crosspos_cos']:.3f} "
+                   f"eff_rank={m['eff_rank']:.1f} (n={m['n']})")
 
     def set_injection_shards(self, shard_paths: list) -> None:
         """Attach a pool of Stockfish shards for in-loop injection.

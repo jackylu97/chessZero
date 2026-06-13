@@ -350,6 +350,17 @@ class MuZeroConfig:
     # the underlying nn.Module is unchanged, so checkpoints save/load cleanly.
     compile_network: bool = False
 
+    # In-loop representation-informativeness probe (repr/* TensorBoard scalars).
+    # Every ``repr_probe_interval`` steps, freeze the net and measure how linearly
+    # decodable Stockfish eval / game outcome is from the representation on a fixed
+    # held-out probe set (plus cross-position cosine + effective rank as collapse
+    # guards). r2_eval is the leading indicator of draw-basin collapse — it falls
+    # while the value LOSS can still look healthy (see bug_hunt_2026_06_13.md and
+    # scripts/probe_representation.py). 0 = disabled. Costs a few seconds per call,
+    # so use a long interval. ``repr_probe_positions`` = held-out set size.
+    repr_probe_interval: int = 0
+    repr_probe_positions: int = 768
+
     # Multi-game (Phase 2)
     multi_game: bool = False
     games: list[str] = field(default_factory=lambda: ["tictactoe"])
@@ -480,6 +491,7 @@ def get_config(game: str) -> MuZeroConfig:
             num_parallel_games=256,    # matches training batch_size; batched-sync run_batch
             sample_k=50,               # Sampled MuZero: sample K distinct actions per node (Hubert 2021 Proposed Modification)
             eval_interval=5000,
+            repr_probe_interval=2000,  # log repr/* informativeness metrics every 2k steps
             use_consistency_loss=True, # EfficientZero SimSiam consistency loss on dynamics rollouts
             consistency_single_frame_target=True,  # corrected default: 8-frame stack target was
                                                     # ~88% action-invariant (collapse-prone). Grounds
