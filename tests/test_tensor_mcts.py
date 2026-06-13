@@ -362,10 +362,25 @@ def test_multiple_games_run_independently():
         def recurrent_inference(self, hidden, action):
             next_hidden, _, policy_logits, value = super().recurrent_inference(hidden, action)
             b = hidden.shape[0]
+            # Reward the winning action ONLY at depth 1 (i.e. when expanded from
+            # the ROOT, whose hidden state is all-zero). The root sets the
+            # winning action's child reward to +1; we then emit a NON-zero
+            # next_hidden so deeper expansions see a non-root parent and never
+            # re-award. Without this guard the (degenerate) network would reward
+            # the same action at every depth, and at discount=1.0 the opponent
+            # collecting that same reward one ply deeper makes the "winning"
+            # action no longer strictly dominant — a brittle expectation that
+            # the old buggy duplicate-slot structure happened to satisfy but the
+            # correct (deduped) search does not. Gating to depth 1 makes the
+            # winning action unambiguously best, matching the test's intent.
+            is_root_parent = (hidden.reshape(b, -1).abs().sum(dim=1) == 0)  # [b]
             reward = torch.zeros(b, 1)
-            reward[0, 0] = float(action[0].item() == win_a)
-            if b > 1:
+            if is_root_parent[0]:
+                reward[0, 0] = float(action[0].item() == win_a)
+            if b > 1 and is_root_parent[1]:
                 reward[1, 0] = float(action[1].item() == win_b)
+            # Non-zero hidden marks "below root" for the next recurrence.
+            next_hidden = next_hidden + 1.0
             return next_hidden, reward, policy_logits, value
 
     # K=20 over action_space=5: per-action P(missed) = (4/5)^20 ≈ 0.012, but
@@ -726,16 +741,19 @@ def test_dirichlet_noise_replaces_priors_at_eps_one():
 
 
 def test_dirichlet_noise_mixing_at_eps_half():
-    """At ε=0.5: ``priors[i] = 0.5/K + 0.5·noise[i]``.
+    """At ε=0.5 the blend is ``priors[a] = 0.5·β̂(a) + 0.5·noise[a]`` over the
+    U UNIQUE sampled actions (Sampled-MuZero dedup), with the K−U padding slots
+    held at prior 0.
 
-    With noise[i] ∈ [0, 1] and Σ noise = 1:
-        Σ priors = 0.5·1 + 0.5·1 = 1
-        priors[i] ∈ [0.5/K, 0.5/K + 0.5]
+    β̂(a) = count(a)/K (≥ 1/K since each unique action has count ≥ 1) and the
+    Dirichlet noise is drawn over the U unique actions (Σ noise = 1, noise ∈
+    [0, 1]). So for each VALID slot:
+        Σ_valid priors = 0.5·1 + 0.5·1 = 1
+        priors[a] ∈ [0.5·β̂(a), 0.5·β̂(a) + 0.5] ⊆ [0.5/K, 1]
 
-    K=4 → priors[i] ∈ [0.125, 0.625]. A pure-replacement bug (noise overwrites
-    priors) or pure-addition bug (priors=1/K + noise) would violate these
-    bounds — pure-add would push the sum above 1, pure-replace would let
-    priors[i] drop below 0.5/K.
+    Padding slots stay exactly 0. A pure-replacement bug (noise overwrites the
+    β̂ prior) would drop a valid slot below 0.5·β̂(a); a pure-addition bug
+    (priors = β̂ + noise) would push Σ above 1.
     """
     K = 4
     config = StubConfig(num_simulations=1, sample_k=K,
@@ -745,9 +763,17 @@ def test_dirichlet_noise_mixing_at_eps_half():
     mcts.run_batch(_make_obs_batch(1), _make_legals(1), add_noise=True)
 
     priors = mcts.child_priors[0, 0, :]
-    assert priors.sum().item() == pytest.approx(1.0, abs=1e-5)
+    actions = mcts.child_actions[0, 0, :]
+    valid = actions != -1
+    # Valid (unique-action) priors sum to 1; padding slots are exactly 0.
+    assert priors[valid].sum().item() == pytest.approx(1.0, abs=1e-5)
+    assert (priors[~valid] == 0).all(), \
+        f"padding slots must be 0, got {priors[~valid].tolist()}"
 
+    # Per valid slot: 0.5·β̂(a) ≤ priors[a] ≤ 0.5·β̂(a)+0.5. Lower-bound the
+    # base by the minimum possible β̂ (= 1/K) and upper-bound by 1.
     lo = 0.5 / K - 1e-6
-    hi = 0.5 / K + 0.5 + 1e-6
-    assert (priors >= lo).all(), f"priors {priors.tolist()} below lower bound {lo}"
-    assert (priors <= hi).all(), f"priors {priors.tolist()} above upper bound {hi}"
+    hi = 1.0 + 1e-6
+    vp = priors[valid]
+    assert (vp >= lo).all(), f"valid priors {vp.tolist()} below lower bound {lo}"
+    assert (vp <= hi).all(), f"valid priors {vp.tolist()} above upper bound {hi}"

@@ -559,6 +559,78 @@ class TensorMCTS:
             hidden_batch, policy_logits_root, legal_mask, add_noise
         )
 
+    @staticmethod
+    def _dedup_sampled(sampled_actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dedup [N, K] i.i.d.-sampled actions to UNIQUE actions per row.
+
+        Sampled MuZero (Hubert 2021 §5.1) Proposed Modification: with β = π the
+        PUCT prior over the unique sampled actions reduces to β̂(a) = count(a)/K.
+        This mirrors the numpy oracle (`mcts.py::_sample_iid_with_replacement`,
+        which uses `np.unique(..., return_counts=True)` and `count/K`), but keeps
+        the fixed [N, K] slot width: each unique action occupies exactly ONE slot
+        with prior = count(a)/K; the remaining (K − U) slots are padded with
+        action = -1 / prior = 0 (PUCT masks action == -1 to -inf, so padding is
+        never selected).
+
+        Vectorized & fully on-device — no per-row Python loop, no CPU sync:
+        sort each row, mark each value's first occurrence as its representative
+        slot, count run-lengths via a segment-sum, and scatter the unique actions
+        + counts back onto the representative slots.
+
+        Args:
+            sampled_actions: [N, K] int64, K i.i.d. samples (with replacement).
+
+        Returns:
+            actions: [N, K] int32 — unique actions on representative slots,
+                -1 on padding slots.
+            priors: [N, K] float32 — β̂(a) = count(a)/K on representative slots,
+                0.0 on padding slots. Each row's non-pad priors sum to 1.
+        """
+        n, K = sampled_actions.shape
+        dev = sampled_actions.device
+
+        # Sort each row so equal actions are contiguous.
+        sorted_actions, _ = torch.sort(sampled_actions, dim=1)            # [N, K]
+        # A slot is the representative (first occurrence) of its value iff it
+        # differs from its left neighbour. Slot 0 is always a representative.
+        is_first = torch.ones(n, K, dtype=torch.bool, device=dev)
+        is_first[:, 1:] = sorted_actions[:, 1:] != sorted_actions[:, :-1]
+
+        # Run-length count per unique value, placed on its representative slot.
+        # Each value spans [rep, next_rep); count = next_rep_index − rep_index.
+        # rank[j] = number of representatives at or before slot j (1-indexed
+        # group id). Representatives appear at the group-start positions; the
+        # count of group g is (start of g+1) − (start of g). Compute via the
+        # difference of representative slot indices.
+        col = torch.arange(K, device=dev).unsqueeze(0).expand(n, K)       # [N, K]
+        # Slot index of each representative; non-reps get K (sorted to the end).
+        rep_pos = torch.where(is_first, col, torch.full_like(col, K))     # [N, K]
+        rep_sorted, _ = torch.sort(rep_pos, dim=1)                        # [N, K]
+        # next-start per representative (shift left); last real group ends at K.
+        next_pos = torch.full_like(rep_sorted, K)
+        next_pos[:, :-1] = rep_sorted[:, 1:]
+        counts_packed = (next_pos - rep_sorted).clamp(min=0)              # [N, K]
+        # rep_sorted lists representative slot indices (padding entries == K);
+        # scatter the packed counts back onto those slots.
+        valid_rep = rep_sorted < K
+        rep_idx = rep_sorted.clamp(max=K - 1)                            # [N, K]
+        counts = torch.zeros(n, K, dtype=torch.float32, device=dev)
+        # scatter_ADD (not scatter_): padding reps (value K, clamped to K-1)
+        # contribute 0 and must not clobber the real rep that legitimately
+        # owns slot K-1.
+        counts.scatter_add_(
+            1, rep_idx,
+            torch.where(valid_rep, counts_packed.to(torch.float32),
+                        torch.zeros_like(counts_packed, dtype=torch.float32)),
+        )
+
+        actions = torch.where(
+            is_first, sorted_actions,
+            torch.full_like(sorted_actions, -1),
+        ).to(torch.int32)                                                # [N, K]
+        priors = counts / float(K)                                       # [N, K]
+        return actions, priors
+
     def _initialize_root_from_mask(
         self,
         hidden_batch: torch.Tensor,
@@ -574,21 +646,34 @@ class TensorMCTS:
         masked_logits = policy_logits_root.masked_fill(~legal_mask, _NEG_INF)
         root_probs = torch.softmax(masked_logits, dim=-1)  # [N, A]
 
-        # Sampled MuZero §5.1: K i.i.d. samples with replacement from β = π.
-        # Option (b): keep duplicates with β̂(slot) = 1/K. Per-action mass
-        # aggregates downstream as count(a)/K.
+        # Sampled MuZero §5.1: K i.i.d. samples with replacement from β = π,
+        # deduped to UNIQUE actions with PUCT prior β̂(a) = count(a)/K on one
+        # slot each (padding actions = -1 / prior = 0). Mirrors the numpy oracle
+        # (mcts.py BatchedMCTS root + _sample_iid_with_replacement). Summing an
+        # action's mass onto ONE slot (vs Option (b)'s 1/K-per-duplicate-slot)
+        # is required so PUCT's prior_score isn't fragmented and swamped by the
+        # value term after the first visit.
         sampled_actions = torch.multinomial(root_probs, K, replacement=True)  # [N, K] int64
-        priors_root = torch.full(
-            (n, K), 1.0 / K, dtype=torch.float32, device=dev
-        )
+        actions_dedup, priors_root = self._dedup_sampled(sampled_actions)
 
         if add_noise and self.config.dirichlet_epsilon > 0:
             alpha = float(self.config.dirichlet_alpha)
             eps = float(self.config.dirichlet_epsilon)
-            noise = torch.distributions.Dirichlet(
-                torch.full((K,), alpha, device=dev)
-            ).sample((n,))  # [N, K]
+            # Dirichlet over the UNIQUE actions (matches numpy _add_dirichlet_noise,
+            # which draws dir(alpha * len(children)) over the deduped children and
+            # blends prior*(1-eps) + noise*eps). Draw K i.i.d. Gamma(alpha) samples,
+            # zero them on padding slots, and renormalize per row so the noise is a
+            # proper Dirichlet over only the valid (unique) actions.
+            valid = actions_dedup != -1                                  # [N, K]
+            gamma = torch.distributions.Gamma(
+                torch.full((n, K), alpha, device=dev),
+                torch.ones((n, K), device=dev),
+            ).sample()                                                   # [N, K]
+            gamma = torch.where(valid, gamma, torch.zeros_like(gamma))
+            noise = gamma / gamma.sum(dim=1, keepdim=True).clamp(min=1e-8)
             priors_root = priors_root * (1.0 - eps) + noise.to(torch.float32) * eps
+
+        sampled_actions = actions_dedup  # name reused by the write below
 
         # Allocate root at index 0 for every game.
         self.node_count.fill_(1)
@@ -1058,10 +1143,13 @@ class TensorMCTS:
                 leaf_action.long(),
             )
 
-        # Sample K leaf children. Option (b): keep duplicates, β̂(slot) = 1/K.
+        # Sample K leaf children i.i.d. with replacement from β = π, deduped to
+        # UNIQUE actions with PUCT prior β̂(a) = count(a)/K on one slot each
+        # (padding = -1 / prior 0). Mirrors the numpy oracle (mcts.py BatchedMCTS
+        # leaf expansion). No Dirichlet noise at leaves (root-only).
         leaf_probs = torch.softmax(policy_logits, dim=-1)
         leaf_sampled = torch.multinomial(leaf_probs, K, replacement=True)  # [N, K] int64
-        leaf_priors = torch.full((n, K), 1.0 / K, dtype=torch.float32, device=dev)
+        leaf_sampled, leaf_priors = self._dedup_sampled(leaf_sampled)
 
         # Allocate new node slots.
         new_node_idx = self.node_count.clone()  # [N] int32
