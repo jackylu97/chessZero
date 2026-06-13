@@ -76,6 +76,11 @@ FILE_H = _build_file_mask(7)
 NOT_FILE_A = ~FILE_A  # for east shifts (<< 1, << 9, >> 7)
 NOT_FILE_H = ~FILE_H  # for west shifts (>> 1, >> 9, << 7)
 
+# Square-color masks (bit patterns match python-chess BB_DARK/LIGHT_SQUARES),
+# stored as int64. Used by _insufficient_material (bug_hunt_2026_06_13.md §C).
+BB_DARK_SQUARES = int(np.uint64(0xaa55aa55aa55aa55).view(np.int64))
+BB_LIGHT_SQUARES = int(np.uint64(0x55aa55aa55aa55aa).view(np.int64))
+
 
 def _lsr(g: torch.Tensor, n: int) -> torch.Tensor:
     """Logical (unsigned) right shift on int64 tensor.
@@ -1466,6 +1471,97 @@ _B_QS_RFROM, _B_QS_RTO = 56, 59   # a8 → d8
 _UNDERPROMO_TO_PT = (P_ROOK, P_BISHOP, P_KNIGHT)
 
 
+def _insufficient_material(state: "ChessBatchedState") -> torch.Tensor:
+    """Batched python-chess-exact ``board.is_insufficient_material()``.
+
+    Mirrors ``chess.Board.has_insufficient_material(color)`` for both colors
+    and ANDs them (bug_hunt_2026_06_13.md §C — the GPU engine was missing the
+    insufficient-material draw term, flooding the buffer with artificial draws).
+
+    Returns a (N,) bool: True iff NEITHER side has winning material, by the
+    exact material/bishop-square-color rules python-chess uses:
+      - a side with any pawn/rook/queen is sufficient;
+      - a side holding a knight is insufficient only if it has nothing else
+        (popcount(side) <= 2, i.e. king + that one knight) AND the opponent has
+        no non-king/non-queen pieces (no selfmate material);
+      - a side holding a bishop is insufficient only if ALL bishops on the board
+        (both colors) are on one square color AND there are no pawns and no
+        knights anywhere;
+      - a bare king (king only) is always insufficient.
+
+    This is an EXACT match, not a conservative subset: it returns True on
+    exactly the set python-chess does. Verified by cross-validation in
+    tests/test_chess_gpu_insufficient_material.py (0 false positives AND 0
+    false negatives across constructed + >=1000 random positions).
+    """
+    device = state.device
+    p = state.pieces  # (N, 12) int64 bitboards; white base 0, black base 6.
+
+    def _occ(base: int) -> torch.Tensor:
+        occ = p[:, base + P_PAWN]
+        for off in (P_KNIGHT, P_BISHOP, P_ROOK, P_QUEEN, P_KING):
+            occ = occ | p[:, base + off]
+        return occ
+
+    w_occ = _occ(0)
+    b_occ = _occ(6)
+
+    pawns = p[:, P_PAWN] | p[:, 6 + P_PAWN]
+    knights = p[:, P_KNIGHT] | p[:, 6 + P_KNIGHT]
+    bishops = p[:, P_BISHOP] | p[:, 6 + P_BISHOP]
+    rooks = p[:, P_ROOK] | p[:, 6 + P_ROOK]
+    queens = p[:, P_QUEEN] | p[:, 6 + P_QUEEN]
+
+    dark = torch.tensor(BB_DARK_SQUARES, dtype=torch.int64, device=device)
+    light = torch.tensor(BB_LIGHT_SQUARES, dtype=torch.int64, device=device)
+    zero = torch.zeros((), dtype=torch.int64, device=device)
+
+    # All bishops (both colors) confined to a single square color.
+    no_dark_bishops = (bishops & dark) == zero
+    no_light_bishops = (bishops & light) == zero
+    bishops_same_color = no_dark_bishops | no_light_bishops
+    no_pawns = pawns == zero
+    no_knights = knights == zero
+
+    def _has_insufficient(base: int, occ: torch.Tensor,
+                          opp_occ: torch.Tensor) -> torch.Tensor:
+        # (1) any own pawn/rook/queen → sufficient.
+        own_prq = (occ & (pawns | rooks | queens)) != zero
+
+        # Knight branch: own knight present.
+        has_knight = (occ & knights) != zero
+        # opponent's non-king, non-queen material (pawns/knights/bishops/rooks).
+        kings_bb = p[:, P_KING] | p[:, 6 + P_KING]
+        opp_selfmate = (opp_occ & ~kings_bb & ~queens) != zero
+        knight_insuff = (_popcount(occ) <= 2) & (~opp_selfmate)
+
+        # Bishop branch: own bishop present (and no own knight, since the
+        # knight branch returns first in python-chess).
+        has_bishop = (occ & bishops) != zero
+        bishop_insuff = bishops_same_color & no_pawns & no_knights
+
+        # python-chess control flow (first matching branch wins):
+        #   if own_prq: False
+        #   elif has_knight: knight_insuff
+        #   elif has_bishop: bishop_insuff
+        #   else: True   (bare king)
+        result = torch.where(
+            own_prq,
+            torch.zeros_like(own_prq),
+            torch.where(
+                has_knight,
+                knight_insuff,
+                torch.where(has_bishop, bishop_insuff,
+                            torch.ones_like(own_prq)),
+            ),
+        )
+        return result
+
+    w_insuff = _has_insufficient(0, w_occ, b_occ)
+    b_insuff = _has_insufficient(6, b_occ, w_occ)
+    return w_insuff & b_insuff
+
+
 def _step_batch_impl(
     state: ChessBatchedState,
     actions: torch.Tensor,
@@ -1704,8 +1800,12 @@ def _step_batch_impl(
     # ChessGame.step picks up via `is_game_over(claim_draw=False)`.
     seventy_five_move = new_halfmove >= 150
     ply_cap = new_ply >= max_plies
+    # Insufficient-material draw, matching python-chess
+    # is_insufficient_material() (bug_hunt_2026_06_13.md §C). Winner stays 0
+    # (a draw, like the other draw terminals below).
+    insufficient_material = _insufficient_material(new_state)
 
-    done = mate | stalemate | seventy_five_move | ply_cap | threefold
+    done = mate | stalemate | seventy_five_move | ply_cap | threefold | insufficient_material
 
     # Mover-POV reward (matches Game.step). Mover = side just moved = old side.
     reward = torch.where(mate, 1.0, 0.0).to(torch.float32)
