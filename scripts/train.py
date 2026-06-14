@@ -99,6 +99,17 @@ def main():
                              "for a pure-self-play run with no warmstart anchor "
                              "(also pass --stockfish-injection-games 0 + "
                              "--stockfish-injection-interval 0 to disable injection).")
+    parser.add_argument("--warmstart-buffer-size", type=int, default=None,
+                        help="Override config.warmstart_buffer_size. Enables the "
+                             "TWO-POOL buffer: this many slots are reserved for "
+                             "warmstart (Stockfish) games and evict FIFO only "
+                             "within that pool, so self-play traffic can NEVER "
+                             "displace the warmstart anchor. Required for "
+                             "--warmstart-sample-frac > 0 to keep working past "
+                             "the point where self-play would otherwise drain the "
+                             "warmstart games (the single-pool drain that caused "
+                             "the value-head collapse at step ~15.8k). Must be "
+                             "< replay_buffer_size; the remainder is the self-play pool.")
     parser.add_argument("--use-gpu-chess", action="store_true",
                         help="Use the GPU-resident chess env (GpuChessGame) for self-play.")
     parser.add_argument("--use-tensor-mcts", action="store_true",
@@ -171,6 +182,13 @@ def main():
         config.num_parallel_games = args.num_parallel_games
     if args.warmstart_sample_frac is not None:
         config.warmstart_sample_frac = args.warmstart_sample_frac
+    if args.warmstart_buffer_size is not None:
+        if args.warmstart_buffer_size >= config.replay_buffer_size:
+            parser.error(
+                f"--warmstart-buffer-size ({args.warmstart_buffer_size}) must be "
+                f"< replay_buffer_size ({config.replay_buffer_size}); the remainder "
+                f"is the self-play pool.")
+        config.warmstart_buffer_size = args.warmstart_buffer_size
     if args.use_gpu_chess:
         config.use_gpu_chess = True
     if args.use_tensor_mcts:
