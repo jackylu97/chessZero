@@ -308,16 +308,41 @@ BUCKETS = {
 }
 
 
-def save_shard(path: Path, games: list[GameHistory]) -> None:
-    """Write a shard in the canonical v1 list format with numpy observations.
+def save_shard(path: Path, games: list[GameHistory], format_version: int = 2) -> None:
+    """Write a shard. Default is the compact v2 format.
 
-    `_iter_shard_games` rewraps numpy → torch.from_numpy (zero-copy) on yield,
-    so downstream code sees torch.Tensor observations as expected. Storing
-    torch.Tensor directly would route through torch's pickle storage reducer,
-    which corrupts the heap on large shards and SIGSEGVs training; that's why
-    we explicitly convert to numpy here.
+    format_version=2 (default, EFFICIENT): a header dict
+    ``{"version": 2, "n_records": N}`` followed by N ``to_compact_dict()``
+    pickles. Stores only actions/policies/values (~20-25 KB/game); observations
+    are NOT stored — they are replayed at load time via
+    ``GameHistory.from_compact_dict``. Two payoffs:
+      * ~100-150× smaller on disk than v1 (the legacy full-obs pool blew the
+        machine's disk quota; this fixes that).
+      * Encoding-agnostic — the same shard loads correctly under ANY
+        ``num_planes``/``history_frames`` because obs are rebuilt with the
+        loader's current ``game.to_tensor``. So these shards work unchanged
+        for both the 19-plane and new 22-plane networks.
+    Matches exactly what ``_iter_shard_games`` reads and ``recompact_shards.py``
+    produces.
+
+    format_version=1 (legacy): pickle of ``list[GameHistory]`` with numpy
+    observations (~3.7 MB/game). Retained only for backward compat; avoid for
+    large pools. `_iter_shard_games` rewraps numpy → torch.from_numpy on yield.
+    Observations are stored as numpy (not torch): torch.Tensor pickling routes
+    through torch's storage reducer, which corrupts the heap on large shards and
+    SIGSEGVs training — hence the explicit ``.numpy()`` below.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    if format_version == 2:
+        with open(path, "wb") as f:
+            pickle.dump({"version": 2, "n_records": len(games)},
+                        f, protocol=pickle.HIGHEST_PROTOCOL)
+            for g in games:
+                pickle.dump(g.to_compact_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
+        return
+    if format_version != 1:
+        raise ValueError(
+            f"Unsupported shard format_version {format_version}; expected 1 or 2")
     for g in games:
         if g.observations and hasattr(g.observations[0], "numpy"):
             g.observations = [o.numpy() for o in g.observations]
@@ -332,6 +357,11 @@ def main():
     ap.add_argument("--num-games", type=int, default=5000)
     ap.add_argument("--depth", type=int, default=8)
     ap.add_argument("--shard-size", type=int, default=500)
+    ap.add_argument("--format-version", type=int, default=2, choices=(1, 2),
+                    help="Shard on-disk format. 2 (default) = compact "
+                         "(actions only, obs replayed at load, ~100x smaller, "
+                         "encoding-agnostic). 1 = legacy full-observation list "
+                         "(~3.7 MB/game; only for backward compat).")
     ap.add_argument("--max-plies", type=int, default=400, help="drop games exceeding this")
     ap.add_argument("--stockfish-threads", type=int, default=1, help="UCI Threads option")
     ap.add_argument("--stockfish-hash", type=int, default=128, help="UCI Hash MB")
@@ -461,7 +491,7 @@ def main():
 
             if len(shard) >= args.shard_size:
                 path = args.out_dir / f"shard_{shard_idx:04d}.pkl"
-                save_shard(path, shard)
+                save_shard(path, shard, format_version=args.format_version)
                 elapsed = time.time() - t0
                 rate = completed / max(elapsed, 1e-6)
                 decisive = sum(1 for gg in shard if gg.game_outcome != 0.0)
@@ -475,7 +505,7 @@ def main():
 
         if shard:
             path = args.out_dir / f"shard_{shard_idx:04d}.pkl"
-            save_shard(path, shard)
+            save_shard(path, shard, format_version=args.format_version)
             print(f"  final shard {shard_idx}: {len(shard)} games → {path}")
     finally:
         engine.quit()
