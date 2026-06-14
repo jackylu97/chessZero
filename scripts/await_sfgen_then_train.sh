@@ -10,13 +10,17 @@ OLD_RUN=2026_06_14_qratio_clean
 NEW_RUN=2026_06_14_22plane_anchor
 MIN_GAMES=100000   # sanity floor: abort launch if the pool is smaller than this
 
-echo "[await] $(date -Iseconds) waiting for sfgen workers to finish..."
-while pgrep -f generate_stockfish_games >/dev/null 2>&1; do
+echo "[await] $(date -Iseconds) waiting for sfgen launcher to finish..."
+# Wait on the resilient launcher process, NOT the worker procs: workers
+# auto-restart across crashes, so the worker set briefly empties between
+# attempts and pgrep on them would race. The launcher exits only when its
+# `wait` returns (all workers reached their share).
+while pgrep -f resilient_sf_gen.sh >/dev/null 2>&1; do
   sleep 60
 done
 sleep 5
-echo "[await] sfgen workers gone. master log tail:"
-tail -3 logs/sf_resume_master.log 2>/dev/null
+echo "[await] sfgen launcher exited. master log tail:"
+tail -3 logs/sf_resilient_master.log 2>/dev/null
 
 # Sanity gate on pool size (shards x 500 games).
 shards=$(find data/stockfish_injection -name '*.pkl' | wc -l)
