@@ -167,7 +167,8 @@ class GameHistory:
                     value_head_type: str = "support",
                     history_frames: int = 1,
                     eval_to_wdl_alpha: float = 4.0,
-                    eval_to_wdl_beta: float = 2.0):
+                    eval_to_wdl_beta: float = 2.0,
+                    q_ratio: float = 0.0):
         """Create training target for a given position.
 
         Args:
@@ -201,35 +202,70 @@ class GameHistory:
         wdl_w = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         wdl_l = np.array([0.0, 0.0, 1.0], dtype=np.float32)
 
-        def _wdl_target_at(ply_idx: int) -> np.ndarray:
-            """WDL target at ply_idx from side-to-move's POV.
+        # Lazy import to avoid model→buffer import cycle.
+        from src.model.utils import eval_to_wdl as _eval_to_wdl
 
-            Two paths:
-            (1) Warmstart games (with external_values populated): derive a soft
-                WDL from Stockfish's per-position eval via eval_to_wdl(). Rich
-                graded signal — preserves what Stockfish told us about THIS
-                position, not just the game's eventual outcome.
-            (2) Self-play games (no external_values): one-hot of the actual
-                game outcome from STM POV. The only signal available — Lc0
-                pure-z target.
-            """
-            # Per-position eval available → use it (warmstart games).
-            if self.external_values and ply_idx < len(self.external_values):
-                stm_eval = float(self.external_values[ply_idx])
-                # external_values is already side-to-move-relative (per the
-                # generate_stockfish_games convention) so no parity flip needed.
-                # Lazy import to avoid model→buffer import cycle.
-                from src.model.utils import eval_to_wdl as _eval_to_wdl
-                p_w, p_d, p_l = _eval_to_wdl(
-                    stm_eval, alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta
-                )
-                return np.array([p_w, p_d, p_l], dtype=np.float32)
-            # No per-position eval → fall back to game-outcome one-hot.
+        def _outcome_onehot(ply_idx: int) -> np.ndarray:
+            """STM-relative one-hot of the actual game outcome at ply_idx."""
             if self.game_outcome == 0.0:
                 return wdl_draw
             stm_is_white = (ply_idx % 2 == 0)
             stm_won = (self.game_outcome > 0.0) == stm_is_white
             return wdl_w if stm_won else wdl_l
+
+        def _wdl_target_at(ply_idx: int) -> np.ndarray:
+            """WDL target at ply_idx from side-to-move's POV, with q_ratio blend.
+
+            q_ratio (q) weights the "blended-in" signal; (1-q) weights the
+            phase's legacy target. Blending two probability distributions with
+            weights summing to 1 yields a valid distribution.
+
+            Two phases:
+            (1) Warmstart games (external_values present at this ply): the legacy
+                target is the soft WDL from Stockfish's per-position eval via
+                eval_to_wdl(); q blends in the GAME OUTCOME one-hot.
+                    target = (1-q)·eval_to_wdl(external)  +  q·outcome_onehot
+            (2) Self-play games (no external_values, or ply past their end): the
+                legacy target is the STM-relative outcome one-hot (Lc0 pure-z);
+                q blends in the MCTS ROOT VALUE mapped to WDL via eval_to_wdl().
+                    target = (1-q)·outcome_onehot  +  q·eval_to_wdl(root_value)
+                If root_values is missing/short for this ply, fall back to pure
+                outcome_onehot (q effectively 0).
+
+            At q_ratio == 0.0 both phases reduce exactly to the legacy target.
+            """
+            q = float(q_ratio)
+            # Per-position eval available → warmstart phase.
+            if self.external_values and ply_idx < len(self.external_values):
+                stm_eval = float(self.external_values[ply_idx])
+                # external_values is already side-to-move-relative (per the
+                # generate_stockfish_games convention) so no parity flip needed.
+                p_w, p_d, p_l = _eval_to_wdl(
+                    stm_eval, alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta
+                )
+                legacy = np.array([p_w, p_d, p_l], dtype=np.float32)
+                if q == 0.0:
+                    return legacy
+                blended_in = _outcome_onehot(ply_idx)
+                target = (1.0 - q) * legacy + q * blended_in
+                assert abs(float(target.sum()) - 1.0) < 1e-5, target
+                return target.astype(np.float32)
+            # Self-play phase: legacy target is the outcome one-hot.
+            legacy = _outcome_onehot(ply_idx)
+            if q == 0.0:
+                return legacy
+            # Blend in the MCTS root value (STM POV scalar) mapped to WDL.
+            if ply_idx < len(self.root_values):
+                rv = float(self.root_values[ply_idx])
+                p_w, p_d, p_l = _eval_to_wdl(
+                    rv, alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta
+                )
+                blended_in = np.array([p_w, p_d, p_l], dtype=np.float32)
+                target = (1.0 - q) * legacy + q * blended_in
+                assert abs(float(target.sum()) - 1.0) < 1e-5, target
+                return target.astype(np.float32)
+            # root_values missing/short → fall back to pure outcome (q≈0).
+            return legacy
 
         for i in range(num_unroll_steps + 1):
             idx = state_index + i
@@ -464,6 +500,7 @@ class ReplayBuffer:
         eval_to_wdl_beta: float = 2.0,
         warmstart_sample_frac: float = 0.0,
         decisive_sample_frac: float = 0.0,
+        q_ratio: float = 0.0,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -556,6 +593,7 @@ class ReplayBuffer:
                 history_frames=history_frames,
                 eval_to_wdl_alpha=eval_to_wdl_alpha,
                 eval_to_wdl_beta=eval_to_wdl_beta,
+                q_ratio=q_ratio,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)

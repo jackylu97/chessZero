@@ -616,6 +616,7 @@ class MuZeroTrainer:
             eval_to_wdl_beta=getattr(self.config, "eval_to_wdl_beta", 2.0),
             warmstart_sample_frac=getattr(self.config, "warmstart_sample_frac", 0.0),
             decisive_sample_frac=getattr(self.config, "decisive_sample_frac", 0.0),
+            q_ratio=getattr(self.config, "q_ratio", 0.0),
         )
 
         obs = batch["observations"].to(self.device)

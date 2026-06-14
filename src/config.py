@@ -172,13 +172,25 @@ class MuZeroConfig:
     # scalar exposed to MCTS PUCT and Q backups.
     draw_score: float = 0.0
 
-    # MCTS Q-blend ratio for WDL training targets:
-    #   target = q_ratio · q_mcts + (1 - q_ratio) · z
-    # where z is the one-hot game outcome and q_mcts is the MCTS root WDL
-    # captured during self-play. Lc0 default 0.0 (pure z, Monte Carlo).
-    # Higher values mitigate the credit-assignment problem on noisy self-play
-    # outcomes. Requires storing MCTS root WDL in GameHistory (currently we
-    # store only scalar root_values, so q_ratio>0 needs a schema extension).
+    # q-blend ratio for WDL training targets (applied in BOTH phases by
+    # GameHistory.make_target / _wdl_target_at). q_ratio (q) is the weight on
+    # the "blended-in" signal; (1-q) is the weight on the phase's legacy target.
+    # Blending two probability distributions with weights summing to 1 yields a
+    # valid distribution.
+    #   WARMSTART ply (external_values present):
+    #     target = (1-q)·eval_to_wdl(external_value) + q·outcome_onehot
+    #     i.e. blend the GAME OUTCOME into the Stockfish-eval target. This
+    #     de-saturates warmstart value targets so the head reads won positions
+    #     decisively rather than washing them toward the eval's draw zone.
+    #   SELF-PLAY ply (no external_values, or ply past their end):
+    #     target = (1-q)·outcome_onehot + q·eval_to_wdl(root_value)
+    #     i.e. blend the MCTS ROOT VALUE (scalar root_values[i], STM POV, mapped
+    #     to WDL via eval_to_wdl) into the outcome one-hot — the Lc0 q-blend.
+    #     Falls back to pure outcome_onehot if root_values is missing/short.
+    # At q_ratio == 0.0 this reduces EXACTLY to the legacy behavior (warmstart →
+    # pure eval_to_wdl; self-play → pure outcome one-hot) — back-compat guarantee.
+    # Lc0 default 0.0. Higher values mitigate the credit-assignment problem on
+    # noisy self-play outcomes.
     q_ratio: float = 0.0
 
     # eval_to_wdl conversion (warmstart-only, value_head_type="wdl"): convert
@@ -457,7 +469,11 @@ def get_config(game: str) -> MuZeroConfig:
                                         # positions get a small negative push during search,
                                         # encouraging decisive moves over solid draws. Doesn't
                                         # affect training targets.
-            q_ratio=0.0,                # Lc0 default; pure z target.
+            q_ratio=0.5,                # 50/50 q-blend: warmstart targets blend game
+                                        # outcome into the Stockfish-eval WDL (de-saturates
+                                        # the value head on won positions); self-play targets
+                                        # blend the MCTS root value into the outcome one-hot
+                                        # (Lc0 q-blend). q=0 reproduces legacy behavior.
             warmstart_sample_frac=0.0,  # Cold-start mode (2026-05-07): no warmstart anchor.
                                         # Bump back to 0.4 when re-enabling the Stockfish pool.
             decisive_sample_frac=0.5,   # 2026-06-02: decisive-game resampling seed for the value
