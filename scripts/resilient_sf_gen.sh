@@ -24,6 +24,27 @@ OUT_ROOT=data/stockfish_injection
 BUCKETS=(8v5 8v6 8v7 8v8)
 mkdir -p logs
 
+# Accurate game count for a bucket dir: read each shard's header (compact v2
+# carries n_records; legacy is a list). Robust to MIXED shard sizes in the
+# pool (old 500-game shards + new small shards), unlike a shards*500 estimate.
+count_games() {
+  .venv/bin/python - "$1" <<'PY'
+import sys, glob, pickle
+total = 0
+for f in glob.glob(sys.argv[1] + "/**/*.pkl", recursive=True):
+    try:
+        with open(f, "rb") as fh:
+            h = pickle.load(fh)
+        if isinstance(h, dict) and h.get("version") == 2:
+            total += int(h.get("n_records", 0))
+        elif isinstance(h, list):
+            total += len(h)
+    except Exception:
+        pass
+print(total)
+PY
+}
+
 run_worker() {
   local bucket=$1 widx=$2 seed=$3 share=$4
   local outdir="$OUT_ROOT/bucket_$bucket/worker_$widx"
@@ -57,7 +78,7 @@ export OUT_ROOT SHARD_SIZE MULTIPV LABEL_MULTIPV TAU_LABEL LABEL_DEPTH STOCKFISH
 seed=$SEED_BASE
 for bi in "${!BUCKETS[@]}"; do
   bucket="${BUCKETS[$bi]}"
-  have_games=$(( $(find "$OUT_ROOT/bucket_$bucket" -name '*.pkl' 2>/dev/null | wc -l) * 500 ))
+  have_games=$(count_games "$OUT_ROOT/bucket_$bucket")
   remaining=$((TARGET_PER_BUCKET - have_games))
   if (( remaining <= 0 )); then echo "bucket $bucket at target ($have_games)"; continue; fi
   share=$(( (remaining + N_WORKERS - 1) / N_WORKERS ))
