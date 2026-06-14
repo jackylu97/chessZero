@@ -132,7 +132,7 @@ def _action_to_move(action: int, board: chess.Board) -> chess.Move | None:
 class ChessGame(Game):
     board_size = (8, 8)
     action_space_size = ACTION_SPACE  # 4672
-    num_planes = 19  # 6 piece types × 2 colors + castling (4) + en passant (1) + turn (1) + move count (1)
+    num_planes = 22  # 6 piece types × 2 colors + castling (4) + en passant (1) + turn (1) + move count (1) + repetition (2) + no-progress (1)
     max_plies = 1024  # force draw after 1024 plies (512 fullmoves). Was 400 — bumped 2026-05-08 after observing avg game length=347 plies (87% of cap) in cold-start self-play, meaning the cap was forcing artificial draws on games that would otherwise hit a real terminal (50-move rule, 3-fold rep, mate). The buffer was filling with cap-hit pseudo-draws masking the true natural termination distribution. Real chess never goes 1024 plies in practice; if a game reaches it, both sides are pathological.
 
     def reset(self) -> GameState:
@@ -220,6 +220,21 @@ class ChessGame(Game):
 
         # Move count (normalized)
         planes[18, :, :] = min(board.fullmove_number / 200.0, 1.0)
+
+        # Repetition planes (AlphaZero, Silver 2018 Table S1). STM-invariant
+        # scalars broadcast over the board — NOT rank-flipped for black.
+        #   plane 19: current position has occurred >= 2 times total (>= 1 before)
+        #   plane 20: current position has occurred >= 3 times total (>= 2 before)
+        # is_repetition(n) walks the board's move stack; on a stackless board
+        # (built from a bare FEN) python-chess returns False, so these degrade
+        # gracefully to 0.0.
+        planes[19, :, :] = 1.0 if board.is_repetition(2) else 0.0
+        planes[20, :, :] = 1.0 if board.is_repetition(3) else 0.0
+
+        # No-progress / 50-move clock = halfmove_clock / 100. At the 50-move
+        # boundary this is 1.0; left UNCLAMPED so the net sees beyond it (up to
+        # ~1.5 at the 75-move auto-draw). STM-invariant broadcast.
+        planes[21, :, :] = board.halfmove_clock / 100.0
 
         return torch.from_numpy(planes)
 

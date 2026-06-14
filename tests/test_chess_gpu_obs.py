@@ -41,20 +41,34 @@ def _oracle_tensor(board: chess.Board) -> torch.Tensor:
 
 
 
+# Planes whose value depends on the board's move-stack history rather than the
+# static position. `from_python_chess` carries no rep history (rep_count=1), so
+# the GPU repetition planes (19, 20) cannot match the CPU oracle's
+# `board.is_repetition()` on positions reconstructed from a bare board. These
+# planes are validated step-by-step in tests/test_repetition_planes.py instead.
+_HISTORY_PLANES = (19, 20)
+_STATIC_PLANES = [p for p in range(GpuChessGame.num_planes) if p not in _HISTORY_PLANES]
+
+
 def test_to_tensor_batch_matches_single_state_random():
     boards = _random_positions(10_000, seed=42)
-    oracle = torch.stack([_oracle_tensor(b) for b in boards])  # (N, 19, 8, 8)
+    oracle = torch.stack([_oracle_tensor(b) for b in boards])  # (N, 22, 8, 8)
 
     gg = GpuChessGame()
     state = gg.from_python_chess(boards)
     batched = gg.to_tensor_batch(state)
 
     assert batched.shape == oracle.shape
-    if not torch.equal(batched, oracle):
-        diff = (batched != oracle).any(dim=(1, 2, 3))
+    # Compare all static (history-independent) planes byte-for-byte.
+    b_static = batched[:, _STATIC_PLANES]
+    o_static = oracle[:, _STATIC_PLANES]
+    if not torch.equal(b_static, o_static):
+        diff = (b_static != o_static).any(dim=(1, 2, 3))
         first = int(diff.nonzero(as_tuple=True)[0][0].item())
-        # Identify which planes diverged for diagnostic noise reduction.
-        plane_diff = (batched[first] != oracle[first]).any(dim=(1, 2)).nonzero(as_tuple=True)[0].tolist()
+        plane_diff = [
+            _STATIC_PLANES[p]
+            for p in (b_static[first] != o_static[first]).any(dim=(1, 2)).nonzero(as_tuple=True)[0].tolist()
+        ]
         raise AssertionError(
             f"to_tensor_batch differs from to_tensor at position {first}; "
             f"FEN={boards[first].fen()}; planes diverged: {plane_diff}"

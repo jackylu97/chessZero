@@ -25,7 +25,7 @@ from .chess import ACTION_SPACE
 
 # -- piece / plane indexing --------------------------------------------------
 # Plane-layout constants must match `ChessGame.to_tensor`. See chess.py:163-197.
-NUM_PLANES = 19
+NUM_PLANES = 22
 
 # Castling-rights bit positions in the (N, 4) bool tensor.
 CR_WK, CR_WQ, CR_BK, CR_BQ = 0, 1, 2, 3
@@ -1304,7 +1304,7 @@ class GpuChessGame(BatchedGame):
         return state
 
     def to_tensor_batch(self, state: ChessBatchedState) -> torch.Tensor:
-        """Return `(N, 19, 8, 8)` observation tensor in STM-relative encoding.
+        """Return `(N, 22, 8, 8)` observation tensor in STM-relative encoding.
 
         Plane layout (must match `ChessGame.to_tensor`):
           0..5   : own P, N, B, R, Q, K (side-to-move's pieces)
@@ -1314,9 +1314,14 @@ class GpuChessGame(BatchedGame):
           16     : en-passant target square (one-hot, zeros if no ep)
           17     : turn (1.0 white-to-move, 0.0 black-to-move) (broadcast)
           18     : fullmove_number / 200 clipped to 1.0 (broadcast)
+          19     : current position occurred >= 2 times total (broadcast)
+          20     : current position occurred >= 3 times total (broadcast)
+          21     : halfmove_clock / 100 — no-progress, UNCLAMPED (broadcast)
 
         For black-to-move: ranks are flipped (row 0 = black's back rank),
-        own/opponent planes are swapped, castling planes reordered.
+        own/opponent planes are swapped, castling planes reordered. The
+        repetition + no-progress planes (19-21) are STM-invariant scalars and
+        are NOT flipped (matches AlphaZero, Silver 2018 Table S1).
         """
         n = state.n
         device = state.device
@@ -1361,8 +1366,29 @@ class GpuChessGame(BatchedGame):
         mc = (state.fullmove.to(torch.float32) / 200.0).clamp(0.0, 1.0)
         mc_plane = mc.view(n, 1, 1, 1).expand(n, 1, 8, 8)
 
+        # Repetition planes (STM-invariant, no flip). Count how many entries in
+        # the rep-hash ring equal the CURRENT position's hash, masking invalid
+        # slots — mirrors the threefold-detection logic in _step_batch_impl.
+        # state.rep_hashes already includes the current position's hash, so the
+        # count is the number of times the current position has occurred.
+        cur_hash = _zobrist_hash(state)                                       # (N,)
+        if state.rep_hashes is None or state.rep_count is None:
+            matches_count = torch.ones((n,), dtype=torch.int64, device=device)
+        else:
+            rep_pos = torch.arange(REP_HISTORY_K, device=device).unsqueeze(0).expand(n, REP_HISTORY_K)
+            valid = rep_pos < state.rep_count.to(torch.int64).unsqueeze(1)
+            matches = (state.rep_hashes == cur_hash.unsqueeze(1)) & valid
+            matches_count = matches.sum(dim=1)                                # (N,)
+        rep2_plane = (matches_count >= 2).to(torch.float32).view(n, 1, 1, 1).expand(n, 1, 8, 8)
+        rep3_plane = (matches_count >= 3).to(torch.float32).view(n, 1, 1, 1).expand(n, 1, 8, 8)
+
+        # No-progress / 50-move clock = halfmove / 100, UNCLAMPED (STM-invariant).
+        np_clock = (state.halfmove.to(torch.float32) / 100.0)
+        np_plane = np_clock.view(n, 1, 1, 1).expand(n, 1, 8, 8)
+
         return torch.cat(
-            [piece_planes, castle_planes, ep_plane, turn_plane, mc_plane], dim=1
+            [piece_planes, castle_planes, ep_plane, turn_plane, mc_plane,
+             rep2_plane, rep3_plane, np_plane], dim=1
         )
 
     def legal_mask(self, state: ChessBatchedState) -> torch.Tensor:
