@@ -1225,6 +1225,12 @@ class ChessBatchedState(BatchedGameState):
     rep_hashes: torch.Tensor | None = None   # (N, REP_HISTORY_K) int64.
     rep_count: torch.Tensor | None = None    # (N,) int16 — # valid entries.
 
+    # Sticky per-game flag: True iff the game terminated specifically by
+    # threefold repetition (NOT other draw types). Set once at termination and
+    # frozen thereafter, parallel to `winner`. Used by the training pipeline to
+    # apply a small loss-tilt to repetition-draw value targets.
+    terminal_threefold: torch.Tensor | None = None   # (N,) bool.
+
     @property
     def n(self) -> int:
         return self.pieces.shape[0]
@@ -1301,6 +1307,7 @@ class GpuChessGame(BatchedGame):
         rep_count = torch.ones((n,), dtype=torch.int16, device=device)
         state.rep_hashes = rep_hashes
         state.rep_count = rep_count
+        state.terminal_threefold = torch.zeros((n,), dtype=torch.bool, device=device)
         return state
 
     def to_tensor_batch(self, state: ChessBatchedState) -> torch.Tensor:
@@ -1870,6 +1877,18 @@ def _step_batch_impl(
 
     new_state.done = state.done | done  # sticky once a game is done
     new_state.winner = torch.where(state.done, state.winner, winner)
+
+    # Sticky threefold-termination flag (parallel to winner). Only the threefold
+    # draw component — not stalemate / 75-move / insufficient-material. Frozen
+    # once a game is already done so a later sentinel step can't flip it.
+    prev_terminal_threefold = (
+        state.terminal_threefold
+        if state.terminal_threefold is not None
+        else torch.zeros(N, dtype=torch.bool, device=device)
+    )
+    new_state.terminal_threefold = torch.where(
+        state.done, prev_terminal_threefold, threefold
+    )
 
     # Return new_legal alongside — step_batch's terminal detection just
     # computed it, and the caller (self-play loop) needs it again at the

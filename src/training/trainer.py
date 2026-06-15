@@ -658,6 +658,7 @@ class MuZeroTrainer:
             q_ratio=getattr(self.config, "q_ratio", 0.0),
             warmstart_q_ratio=getattr(self.config, "warmstart_q_ratio", None),
             selfplay_q_ratio=getattr(self.config, "selfplay_q_ratio", None),
+            repetition_penalty=getattr(self.config, "repetition_penalty", 0.0),
         )
 
         obs = batch["observations"].to(self.device)

@@ -332,6 +332,11 @@ def play_games_parallel_gpu(
         rewards_cpu = rewards.cpu().tolist()
         done_cpu = state.done.cpu().tolist()
         winner_cpu = state.winner.cpu().tolist()
+        threefold_cpu = (
+            state.terminal_threefold.cpu().tolist()
+            if state.terminal_threefold is not None
+            else [False] * len(done_cpu)
+        )
 
         still_active: list[int] = []
         terminal_indices: list[int] = []
@@ -339,6 +344,7 @@ def play_games_parallel_gpu(
             histories[g].rewards.append(rewards_cpu[g])
             if done_cpu[g]:
                 histories[g].game_outcome = winner_cpu[g]
+                histories[g].draw_by_repetition = bool(threefold_cpu[g])
                 terminal_indices.append(g)
             else:
                 still_active.append(g)
@@ -461,6 +467,7 @@ def play_games_parallel_gpu_resident(
 
     alive_mask = torch.ones(num_games, dtype=torch.bool, device=device)
     game_outcome = torch.zeros(num_games, dtype=torch.int32, device=device)
+    terminal_threefold = torch.zeros(num_games, dtype=torch.bool, device=device)
     game_length = torch.zeros(num_games, dtype=torch.int32, device=device)
     move_count = torch.zeros(num_games, dtype=torch.int32, device=device)
 
@@ -543,6 +550,10 @@ def play_games_parallel_gpu_resident(
         # 9. Update accounting (sticky-done semantics).
         newly_done = state.done & alive_mask
         game_outcome = torch.where(newly_done, state.winner.to(torch.int32), game_outcome)
+        if state.terminal_threefold is not None:
+            terminal_threefold = torch.where(
+                newly_done, state.terminal_threefold, terminal_threefold
+            )
         game_length = torch.where(alive_mask, game_length + 1, game_length)
         move_count = move_count + alive_mask.to(torch.int32)
         alive_mask = alive_mask & ~state.done
@@ -581,6 +592,7 @@ def play_games_parallel_gpu_resident(
     final_obs_cpu = final_obs.cpu().numpy()
     game_length_cpu = game_length.cpu().numpy()
     game_outcome_cpu = game_outcome.cpu().numpy()
+    terminal_threefold_cpu = terminal_threefold.cpu().numpy()
 
     # 11. Build GameHistory objects.
     histories: list[GameHistory] = []
@@ -601,6 +613,7 @@ def play_games_parallel_gpu_resident(
             h_g.legal_actions_list.append(legal_idx)
             h_g.rewards.append(float(rewards_cpu[g, t]))
         h_g.game_outcome = int(game_outcome_cpu[g])
+        h_g.draw_by_repetition = bool(terminal_threefold_cpu[g])
         h_g.observations.append(torch.from_numpy(final_obs_cpu[g]).clone())
         histories.append(h_g)
 

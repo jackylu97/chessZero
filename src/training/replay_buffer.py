@@ -23,6 +23,9 @@ class GameHistory:
     # converted to side-to-move POV in [-1, +1]. Empty for self-play games (default).
     # When populated, make_target prefers these over the td_steps/game_outcome paths.
     external_values: list[float] = field(default_factory=list)
+    # True iff this self-play game ended specifically by threefold repetition.
+    # Used by make_target to tilt the (draw) value target slightly toward LOSS.
+    draw_by_repetition: bool = False
 
     def __len__(self) -> int:
         return len(self.observations)
@@ -79,6 +82,7 @@ class GameHistory:
             "game_outcome": float(self.game_outcome),
             "policies_mode": policies_mode,
             "policies_data": policies_data,
+            "draw_by_repetition": bool(self.draw_by_repetition),
         }
         if self.external_values:
             d["external_values"] = np.asarray(self.external_values, dtype=np.float32)
@@ -105,6 +109,7 @@ class GameHistory:
         ev = d.get("external_values")
         if ev is not None and len(ev) > 0:
             gh.external_values = [float(v) for v in ev]
+        gh.draw_by_repetition = bool(d.get("draw_by_repetition", False))
 
         state = game.reset()
         gh.observations.append(game.to_tensor(state))
@@ -170,7 +175,8 @@ class GameHistory:
                     eval_to_wdl_beta: float = 2.0,
                     q_ratio: float = 0.0,
                     warmstart_q_ratio: float | None = None,
-                    selfplay_q_ratio: float | None = None):
+                    selfplay_q_ratio: float | None = None,
+                    repetition_penalty: float = 0.0):
         """Create training target for a given position.
 
         Args:
@@ -223,6 +229,11 @@ class GameHistory:
         # back to the single ``q_ratio`` when not explicitly split.
         q_warm = float(warmstart_q_ratio if warmstart_q_ratio is not None else q_ratio)
         q_self = float(selfplay_q_ratio if selfplay_q_ratio is not None else q_ratio)
+        # Threefold-repetition value-target penalty (self-play only). When a
+        # self-play game drew by repetition, move δ mass from Draw → Loss in the
+        # legacy outcome target: [0, 1, 0] → [0, 1-δ, δ]. STM-symmetric (same for
+        # both sides). δ=0 reproduces exact prior behavior.
+        rep_delta = float(min(max(repetition_penalty, 0.0), 1.0))
 
         def _wdl_target_at(ply_idx: int) -> np.ndarray:
             """WDL target at ply_idx from side-to-move's POV, with q_ratio blend.
@@ -264,6 +275,11 @@ class GameHistory:
             # Self-play phase: legacy target is the outcome one-hot.
             q = q_self
             legacy = _outcome_onehot(ply_idx)
+            # Repetition penalty: tilt a draw target toward LOSS before blending.
+            # Only for repetition draws (game_outcome == 0.0); decisive games and
+            # non-repetition draws are untouched. STM-symmetric.
+            if rep_delta > 0.0 and self.draw_by_repetition and self.game_outcome == 0.0:
+                legacy = np.array([0.0, 1.0 - rep_delta, rep_delta], dtype=np.float32)
             if q == 0.0:
                 return legacy
             # Blend in the MCTS root value (STM POV scalar) mapped to WDL.
@@ -534,6 +550,7 @@ class ReplayBuffer:
         q_ratio: float = 0.0,
         warmstart_q_ratio: float | None = None,
         selfplay_q_ratio: float | None = None,
+        repetition_penalty: float = 0.0,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -629,6 +646,7 @@ class ReplayBuffer:
                 q_ratio=q_ratio,
                 warmstart_q_ratio=warmstart_q_ratio,
                 selfplay_q_ratio=selfplay_q_ratio,
+                repetition_penalty=repetition_penalty,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)
