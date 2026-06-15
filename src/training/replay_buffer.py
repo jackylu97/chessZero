@@ -168,7 +168,9 @@ class GameHistory:
                     history_frames: int = 1,
                     eval_to_wdl_alpha: float = 4.0,
                     eval_to_wdl_beta: float = 2.0,
-                    q_ratio: float = 0.0):
+                    q_ratio: float = 0.0,
+                    warmstart_q_ratio: float | None = None,
+                    selfplay_q_ratio: float | None = None):
         """Create training target for a given position.
 
         Args:
@@ -213,30 +215,39 @@ class GameHistory:
             stm_won = (self.game_outcome > 0.0) == stm_is_white
             return wdl_w if stm_won else wdl_l
 
+        # Separate blend weights for the two phases. Warmstart blends in the
+        # GAME OUTCOME against an EXTERNAL teacher eval (safe — not self-
+        # referential), so it can run hot; self-play blends in the network's
+        # OWN MCTS root value (self-referential — a feedback loop risk), so it
+        # should run cool, matching AlphaZero/Lc0's near-zero default. Both fall
+        # back to the single ``q_ratio`` when not explicitly split.
+        q_warm = float(warmstart_q_ratio if warmstart_q_ratio is not None else q_ratio)
+        q_self = float(selfplay_q_ratio if selfplay_q_ratio is not None else q_ratio)
+
         def _wdl_target_at(ply_idx: int) -> np.ndarray:
             """WDL target at ply_idx from side-to-move's POV, with q_ratio blend.
 
-            q_ratio (q) weights the "blended-in" signal; (1-q) weights the
-            phase's legacy target. Blending two probability distributions with
-            weights summing to 1 yields a valid distribution.
+            q (q_warm or q_self) weights the "blended-in" signal; (1-q) weights
+            the phase's legacy target. Blending two probability distributions
+            with weights summing to 1 yields a valid distribution.
 
             Two phases:
             (1) Warmstart games (external_values present at this ply): the legacy
                 target is the soft WDL from Stockfish's per-position eval via
-                eval_to_wdl(); q blends in the GAME OUTCOME one-hot.
-                    target = (1-q)·eval_to_wdl(external)  +  q·outcome_onehot
+                eval_to_wdl(); q_warm blends in the GAME OUTCOME one-hot.
+                    target = (1-q_warm)·eval_to_wdl(external) + q_warm·outcome_onehot
             (2) Self-play games (no external_values, or ply past their end): the
                 legacy target is the STM-relative outcome one-hot (Lc0 pure-z);
-                q blends in the MCTS ROOT VALUE mapped to WDL via eval_to_wdl().
-                    target = (1-q)·outcome_onehot  +  q·eval_to_wdl(root_value)
+                q_self blends in the MCTS ROOT VALUE mapped to WDL via eval_to_wdl().
+                    target = (1-q_self)·outcome_onehot + q_self·eval_to_wdl(root_value)
                 If root_values is missing/short for this ply, fall back to pure
                 outcome_onehot (q effectively 0).
 
-            At q_ratio == 0.0 both phases reduce exactly to the legacy target.
+            At q == 0.0 both phases reduce exactly to the legacy target.
             """
-            q = float(q_ratio)
             # Per-position eval available → warmstart phase.
             if self.external_values and ply_idx < len(self.external_values):
+                q = q_warm
                 stm_eval = float(self.external_values[ply_idx])
                 # external_values is already side-to-move-relative (per the
                 # generate_stockfish_games convention) so no parity flip needed.
@@ -251,6 +262,7 @@ class GameHistory:
                 assert abs(float(target.sum()) - 1.0) < 1e-5, target
                 return target.astype(np.float32)
             # Self-play phase: legacy target is the outcome one-hot.
+            q = q_self
             legacy = _outcome_onehot(ply_idx)
             if q == 0.0:
                 return legacy
@@ -501,6 +513,8 @@ class ReplayBuffer:
         warmstart_sample_frac: float = 0.0,
         decisive_sample_frac: float = 0.0,
         q_ratio: float = 0.0,
+        warmstart_q_ratio: float | None = None,
+        selfplay_q_ratio: float | None = None,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -594,6 +608,8 @@ class ReplayBuffer:
                 eval_to_wdl_alpha=eval_to_wdl_alpha,
                 eval_to_wdl_beta=eval_to_wdl_beta,
                 q_ratio=q_ratio,
+                warmstart_q_ratio=warmstart_q_ratio,
+                selfplay_q_ratio=selfplay_q_ratio,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)

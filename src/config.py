@@ -82,6 +82,14 @@ class MuZeroConfig:
     # Self-play
     num_self_play_games: int = 100  # games per self-play batch
     self_play_interval: int = 100  # training steps between self-play rounds
+    # Two-phase (Option A) curriculum. For the first ``self_play_warmup_steps``
+    # training steps, self-play and reanalyze are gated OFF and the network
+    # trains purely on the supervised Stockfish stream (a fixed-length warmstart
+    # pretrain). At/after this step they flip on for the rest of training. The
+    # warmstart anchor (two-pool ``warmstart_buffer_size``) persists into the
+    # self-play phase. 0 = disabled → fall back to the legacy pool-exhaustion
+    # gate (self-play turns on when the injection pool runs dry).
+    self_play_warmup_steps: int = 0
     num_parallel_games: int = 1    # games to run simultaneously in batched MCTS (1 = serial)
     random_opening_plies: int = 0  # play N random legal moves before MCTS; 0 = disabled
 
@@ -192,6 +200,18 @@ class MuZeroConfig:
     # Lc0 default 0.0. Higher values mitigate the credit-assignment problem on
     # noisy self-play outcomes.
     q_ratio: float = 0.0
+
+    # Split q_ratio per phase (override the single q_ratio above when set).
+    # The two phases blend in DIFFERENT signals and carry different risk:
+    #   warmstart_q_ratio — blends the GAME OUTCOME into an EXTERNAL Stockfish
+    #     eval target. Not self-referential, so it can run hot (≈0.5) to
+    #     de-saturate the eval's draw zone with decisive results.
+    #   selfplay_q_ratio  — blends the network's OWN MCTS root value into the
+    #     outcome (the literal Lc0 q-blend). Self-referential → a feedback-loop
+    #     risk, so keep it cool (≈0.1; AlphaZero/Lc0 default 0.0).
+    # When None, the phase falls back to the single ``q_ratio`` above.
+    warmstart_q_ratio: float | None = None
+    selfplay_q_ratio: float | None = None
 
     # eval_to_wdl conversion (warmstart-only, value_head_type="wdl"): convert
     # Stockfish per-position eval (in [-1,+1] STM POV) into a soft (P_W, P_D,
@@ -469,11 +489,15 @@ def get_config(game: str) -> MuZeroConfig:
                                         # positions get a small negative push during search,
                                         # encouraging decisive moves over solid draws. Doesn't
                                         # affect training targets.
-            q_ratio=0.5,                # 50/50 q-blend: warmstart targets blend game
-                                        # outcome into the Stockfish-eval WDL (de-saturates
-                                        # the value head on won positions); self-play targets
-                                        # blend the MCTS root value into the outcome one-hot
-                                        # (Lc0 q-blend). q=0 reproduces legacy behavior.
+            q_ratio=0.5,                # Fallback when the split knobs below are None.
+            warmstart_q_ratio=0.5,      # HOT: blend 50% game outcome into the Stockfish-eval
+                                        # WDL — de-saturates the value head on won positions.
+                                        # Safe to run hot: the teacher signal is EXTERNAL, not
+                                        # self-referential.
+            selfplay_q_ratio=0.1,       # COOL: only 10% MCTS-root-value blended into the
+                                        # outcome one-hot. The root value is the network's OWN
+                                        # estimate (self-referential → feedback-loop risk), so
+                                        # keep near the AlphaZero/Lc0 pure-outcome default (0.0).
             warmstart_sample_frac=0.0,  # Cold-start mode (2026-05-07): no warmstart anchor.
                                         # Bump back to 0.4 when re-enabling the Stockfish pool.
             decisive_sample_frac=0.5,   # 2026-06-02: decisive-game resampling seed for the value

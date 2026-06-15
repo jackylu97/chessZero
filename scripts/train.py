@@ -99,6 +99,23 @@ def main():
                              "for a pure-self-play run with no warmstart anchor "
                              "(also pass --stockfish-injection-games 0 + "
                              "--stockfish-injection-interval 0 to disable injection).")
+    parser.add_argument("--self-play-warmup-steps", type=int, default=None,
+                        help="Override config.self_play_warmup_steps. Two-phase "
+                             "(Option A) curriculum: self-play + reanalyze are gated "
+                             "OFF for this many steps (pure supervised Stockfish "
+                             "warmstart pretrain), then flip on for the rest of "
+                             "training. The warmstart anchor persists into phase 2. "
+                             "0 = legacy pool-exhaustion gate.")
+    parser.add_argument("--warmstart-q-ratio", type=float, default=None,
+                        help="Override config.warmstart_q_ratio. Weight on the "
+                             "GAME-OUTCOME blend into the Stockfish-eval WDL target "
+                             "for warmstart positions (external teacher → safe to run "
+                             "hot, e.g. 0.5).")
+    parser.add_argument("--selfplay-q-ratio", type=float, default=None,
+                        help="Override config.selfplay_q_ratio. Weight on the "
+                             "MCTS-root-value blend into the outcome one-hot for "
+                             "self-play positions (self-referential → keep cool, "
+                             "e.g. 0.1; AlphaZero/Lc0 default 0.0).")
     parser.add_argument("--warmstart-buffer-size", type=int, default=None,
                         help="Override config.warmstart_buffer_size. Enables the "
                              "TWO-POOL buffer: this many slots are reserved for "
@@ -182,6 +199,12 @@ def main():
         config.num_parallel_games = args.num_parallel_games
     if args.warmstart_sample_frac is not None:
         config.warmstart_sample_frac = args.warmstart_sample_frac
+    if args.self_play_warmup_steps is not None:
+        config.self_play_warmup_steps = args.self_play_warmup_steps
+    if args.warmstart_q_ratio is not None:
+        config.warmstart_q_ratio = args.warmstart_q_ratio
+    if args.selfplay_q_ratio is not None:
+        config.selfplay_q_ratio = args.selfplay_q_ratio
     if args.warmstart_buffer_size is not None:
         if args.warmstart_buffer_size >= config.replay_buffer_size:
             parser.error(

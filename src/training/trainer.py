@@ -193,14 +193,23 @@ class MuZeroTrainer:
             ):
                 self._inject_stockfish_games(self.config.stockfish_injection_games)
 
-            # Self-play and reanalyze are gated off while the pool is alive.
-            # When it exhausts, both flip on automatically for the rest of training.
-            pool_alive = bool(self._injection_shards)
+            # Self-play / reanalyze gating. Two modes:
+            #   (A) Explicit two-phase: if ``self_play_warmup_steps`` is set,
+            #       both are OFF until that step (pure supervised warmstart
+            #       pretrain), then ON for the rest of training — regardless of
+            #       whether the injection pool still has games.
+            #   (legacy) Pool gate: otherwise, both are OFF while the injection
+            #       pool is alive and flip on when it exhausts.
+            warmup = getattr(self.config, "self_play_warmup_steps", 0)
+            if warmup > 0:
+                selfplay_on = step >= warmup
+            else:
+                selfplay_on = not bool(self._injection_shards)
 
             if (
                 step > 0
                 and step % self.config.self_play_interval == 0
-                and not pool_alive
+                and selfplay_on
             ):
                 self._run_self_play()
 
@@ -208,7 +217,7 @@ class MuZeroTrainer:
                 self.config.reanalyze_interval > 0
                 and step % self.config.reanalyze_interval == 0
                 and len(self.replay_buffer) >= self.config.min_buffer_size
-                and not pool_alive
+                and selfplay_on
             ):
                 self._reanalyze()
 
@@ -617,6 +626,8 @@ class MuZeroTrainer:
             warmstart_sample_frac=getattr(self.config, "warmstart_sample_frac", 0.0),
             decisive_sample_frac=getattr(self.config, "decisive_sample_frac", 0.0),
             q_ratio=getattr(self.config, "q_ratio", 0.0),
+            warmstart_q_ratio=getattr(self.config, "warmstart_q_ratio", None),
+            selfplay_q_ratio=getattr(self.config, "selfplay_q_ratio", None),
         )
 
         obs = batch["observations"].to(self.device)
