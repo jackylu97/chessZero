@@ -383,6 +383,14 @@ class MuZeroTrainer:
         if sp_secs > 0:
             self.writer.add_scalar("self_play/games_per_sec", len(games) / sp_secs, self.global_step)
             self.writer.add_scalar("self_play/plies_per_sec", total_plies / sp_secs, self.global_step)
+        # Console summary of the self-play batch — draw rate is the key
+        # draw-basin health signal; surface it in the log, not just TensorBoard.
+        tqdm.write(
+            f"Step {self.global_step}: self-play batch — "
+            f"draw_rate={draws / len(games):.3f} "
+            f"(p1_win={p1_wins / len(games):.3f}, p2_win={p2_wins / len(games):.3f}), "
+            f"avg_len={avg_length:.0f}, {len(games)} games in {sp_secs:.0f}s"
+        )
         self.writer.add_scalar("memory/rss_gb_before_selfplay", rss_before, self.global_step)
         self.writer.add_scalar("memory/rss_gb_after_selfplay", rss_after, self.global_step)
         self.writer.add_scalar("memory/rss_delta_gb_selfplay", rss_delta, self.global_step)
