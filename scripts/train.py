@@ -118,9 +118,11 @@ def main():
                              "e.g. 0.1; AlphaZero/Lc0 default 0.0).")
     parser.add_argument("--repetition-penalty", type=float, default=None,
                         help="Override config.repetition_penalty. δ in [0,1]: tilts "
-                             "the value target of a self-play threefold-repetition "
-                             "draw from [0,1,0] to [0,1-δ,δ] (Draw→Loss mass), "
-                             "teaching the value head that repetition is mildly bad. "
+                             "the value target of a self-play NO-PROGRESS draw "
+                             "(threefold repetition OR 75-move rule) from [0,1,0] to "
+                             "[0,1-δ,δ] (Draw→Loss mass), teaching the value head that "
+                             "shuffling with no progress is mildly bad. Stalemate / "
+                             "insufficient-material / ply-cap draws are untouched. "
                              "0.0 (default) = off / legacy behavior.")
     parser.add_argument("--warmstart-buffer-size", type=int, default=None,
                         help="Override config.warmstart_buffer_size. Enables the "

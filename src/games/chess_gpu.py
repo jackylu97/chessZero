@@ -1225,11 +1225,13 @@ class ChessBatchedState(BatchedGameState):
     rep_hashes: torch.Tensor | None = None   # (N, REP_HISTORY_K) int64.
     rep_count: torch.Tensor | None = None    # (N,) int16 — # valid entries.
 
-    # Sticky per-game flag: True iff the game terminated specifically by
-    # threefold repetition (NOT other draw types). Set once at termination and
-    # frozen thereafter, parallel to `winner`. Used by the training pipeline to
-    # apply a small loss-tilt to repetition-draw value targets.
-    terminal_threefold: torch.Tensor | None = None   # (N,) bool.
+    # Sticky per-game flags, set once at termination and frozen thereafter
+    # (parallel to `winner`). Both feed the no-progress shuffle penalty:
+    #   terminal_threefold    — drew by threefold repetition
+    #   terminal_no_progress  — drew by the 75-move rule (halfmove>=150)
+    # NOT set for stalemate / insufficient-material / ply-cap draws.
+    terminal_threefold: torch.Tensor | None = None     # (N,) bool.
+    terminal_no_progress: torch.Tensor | None = None   # (N,) bool.
 
     @property
     def n(self) -> int:
@@ -1308,6 +1310,7 @@ class GpuChessGame(BatchedGame):
         state.rep_hashes = rep_hashes
         state.rep_count = rep_count
         state.terminal_threefold = torch.zeros((n,), dtype=torch.bool, device=device)
+        state.terminal_no_progress = torch.zeros((n,), dtype=torch.bool, device=device)
         return state
 
     def to_tensor_batch(self, state: ChessBatchedState) -> torch.Tensor:
@@ -1878,9 +1881,10 @@ def _step_batch_impl(
     new_state.done = state.done | done  # sticky once a game is done
     new_state.winner = torch.where(state.done, state.winner, winner)
 
-    # Sticky threefold-termination flag (parallel to winner). Only the threefold
-    # draw component — not stalemate / 75-move / insufficient-material. Frozen
-    # once a game is already done so a later sentinel step can't flip it.
+    # Sticky no-progress-draw flags (parallel to winner), frozen once a game is
+    # already done. Two distinct draw types, both penalized by the no-progress
+    # shuffle penalty: threefold repetition and the 75-move (halfmove>=150) rule.
+    # NOT stalemate / insufficient-material / ply-cap.
     prev_terminal_threefold = (
         state.terminal_threefold
         if state.terminal_threefold is not None
@@ -1888,6 +1892,14 @@ def _step_batch_impl(
     )
     new_state.terminal_threefold = torch.where(
         state.done, prev_terminal_threefold, threefold
+    )
+    prev_terminal_no_progress = (
+        state.terminal_no_progress
+        if state.terminal_no_progress is not None
+        else torch.zeros(N, dtype=torch.bool, device=device)
+    )
+    new_state.terminal_no_progress = torch.where(
+        state.done, prev_terminal_no_progress, seventy_five_move
     )
 
     # Return new_legal alongside — step_batch's terminal detection just

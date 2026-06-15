@@ -19,11 +19,12 @@ A = 9  # action space (irrelevant to the value target)
 DRAW = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 
-def _draw_selfplay_game(n=4, draw_by_repetition=False):
+def _draw_selfplay_game(n=4, draw_by_repetition=False, draw_by_no_progress=False):
     """Self-play game (no external_values) that drew (game_outcome=0)."""
     g = GameHistory(game_name="tictactoe")
     g.game_outcome = 0.0
     g.draw_by_repetition = draw_by_repetition
+    g.draw_by_no_progress = draw_by_no_progress
     for i in range(n):
         g.observations.append(torch.zeros(1, 3, 3))
         g.actions.append(i % A)
@@ -69,8 +70,20 @@ def test_repetition_draw_tilts_toward_loss_both_stm():
                                    err_msg=f"ply {ply} not loss-tilted")
 
 
-def test_non_repetition_draw_unaffected():
-    g = _draw_selfplay_game(n=4, draw_by_repetition=False)
+def test_no_progress_draw_tilts_toward_loss():
+    """75-move / no-progress draws get the same loss-tilt as threefold."""
+    g = _draw_selfplay_game(n=4, draw_by_no_progress=True)
+    tilted = np.array([0.0, 0.8, 0.2], dtype=np.float32)
+    for ply in (0, 1, 2, 3):
+        v = _value_at(g, ply, repetition_penalty=0.2, selfplay_q_ratio=0.0)
+        np.testing.assert_allclose(v, tilted, atol=1e-6,
+                                   err_msg=f"no-progress ply {ply} not loss-tilted")
+
+
+def test_neither_flag_draw_unaffected():
+    """A draw that is neither threefold nor no-progress (stalemate / insufficient
+    material / ply-cap) keeps the pure draw target."""
+    g = _draw_selfplay_game(n=4, draw_by_repetition=False, draw_by_no_progress=False)
     for ply in (0, 1):
         v = _value_at(g, ply, repetition_penalty=0.2, selfplay_q_ratio=0.0)
         np.testing.assert_allclose(v, DRAW, atol=1e-6)

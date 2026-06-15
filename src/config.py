@@ -213,12 +213,13 @@ class MuZeroConfig:
     warmstart_q_ratio: float | None = None
     selfplay_q_ratio: float | None = None
 
-    # Threefold-repetition value-target penalty (self-play WDL only). When a
-    # self-play game draws by threefold repetition, its (draw) value target is
-    # tilted from [0, 1, 0] to [0, 1-δ, δ] — moving δ mass from Draw to Loss —
-    # teaching the value head that shuffling into a repetition is mildly bad.
-    # STM-symmetric. Applied to the LEGACY outcome target before the selfplay_q
-    # blend. δ clamped to [0, 1]; 0.0 reproduces exact prior behavior. Opt-in
+    # No-progress shuffle penalty (self-play WDL only). When a self-play game
+    # draws by threefold repetition OR by the 75-move no-progress rule, its
+    # (draw) value target is tilted from [0, 1, 0] to [0, 1-δ, δ] — moving δ mass
+    # from Draw to Loss — teaching the value head that shuffling with no progress
+    # is mildly bad. NOT applied to stalemate / insufficient-material / ply-cap
+    # draws. STM-symmetric; applied to the LEGACY outcome target before the
+    # selfplay_q blend. δ clamped to [0, 1]; 0.0 reproduces prior behavior. Opt-in
     # via --repetition-penalty (presets stay at 0.0).
     repetition_penalty: float = 0.0
 
