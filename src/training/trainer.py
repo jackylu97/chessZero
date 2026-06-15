@@ -373,11 +373,13 @@ class MuZeroTrainer:
         p2_wins = sum(1 for o in outcomes if o == -1)
         draws = sum(1 for o in outcomes if o == 0)
 
-        # Draw-type breakdown (chess only): threefold vs no-progress (50/75-move)
-        # vs other (stalemate / insufficient material / ply-cap = "computer draw").
-        # Threefold uses the engine flag (consistent with the repetition penalty);
-        # the rest are read off the halfmove clock by replaying the game.
-        threefold_draws = no_progress_draws = other_draws = 0
+        # Draw-type breakdown (chess only), by replaying each drawn game through
+        # python-chess and inspecting the final position:
+        #   threefold     — is_repetition(3)
+        #   no_progress   — halfmove_clock >= 100 (50/75-move)
+        #   computer      — stalemate OR insufficient material (natural engine draw)
+        #   plycap        — none of the above: game hit the ply cap (or replay-fail)
+        threefold_draws = no_progress_draws = computer_draws = plycap_draws = 0
         if getattr(self.config, "game", None) == "chess" and draws > 0:
             import chess as _chess
             from ..games.chess import _action_to_move as _a2m
@@ -394,21 +396,24 @@ class MuZeroTrainer:
                 except Exception:
                     ok = False
                 if ok and b.is_repetition(3):
-                    threefold_draws += 1          # threefold repetition
+                    threefold_draws += 1
                 elif ok and b.halfmove_clock >= 100:
-                    no_progress_draws += 1         # 50/75-move no-progress
+                    no_progress_draws += 1
+                elif ok and (b.is_stalemate() or b.is_insufficient_material()):
+                    computer_draws += 1
                 else:
-                    other_draws += 1               # stalemate / insufficient / ply-cap / replay-fail
+                    plycap_draws += 1              # ply-cap / forced-draw / replay-fail residual
 
         total_plies = sum(len(g) - 1 for g in games)
         self.writer.add_scalar("self_play/avg_game_length", avg_length, self.global_step)
         self.writer.add_scalar("self_play/p1_win_rate", p1_wins / n_games, self.global_step)
         self.writer.add_scalar("self_play/p2_win_rate", p2_wins / n_games, self.global_step)
         self.writer.add_scalar("self_play/draw_rate", draws / n_games, self.global_step)
-        # Draw-type breakdown (these three + p1_win + p2_win sum to 1.0).
+        # Draw-type breakdown (these four + p1_win + p2_win sum to 1.0).
         self.writer.add_scalar("self_play/draw_threefold_rate", threefold_draws / n_games, self.global_step)
         self.writer.add_scalar("self_play/draw_no_progress_rate", no_progress_draws / n_games, self.global_step)
-        self.writer.add_scalar("self_play/draw_other_rate", other_draws / n_games, self.global_step)
+        self.writer.add_scalar("self_play/draw_computer_rate", computer_draws / n_games, self.global_step)
+        self.writer.add_scalar("self_play/draw_plycap_rate", plycap_draws / n_games, self.global_step)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
         # Throughput — self-play is the wall-clock bottleneck; track it explicitly.
         self.writer.add_scalar("self_play/seconds", sp_secs, self.global_step)
@@ -422,7 +427,7 @@ class MuZeroTrainer:
             f"Wwin={p1_wins / n_games:.2f} Bwin={p2_wins / n_games:.2f} "
             f"draw={draws / n_games:.2f} "
             f"[3fold={threefold_draws / n_games:.2f} 50mv={no_progress_draws / n_games:.2f} "
-            f"other={other_draws / n_games:.2f}], "
+            f"comp={computer_draws / n_games:.2f} plycap={plycap_draws / n_games:.2f}], "
             f"avg_len={avg_length:.0f}, {n_games} games in {sp_secs:.0f}s"
         )
         self.writer.add_scalar("memory/rss_gb_before_selfplay", rss_before, self.global_step)
