@@ -497,6 +497,25 @@ class ReplayBuffer:
         self._priorities.append(max_p)
         self.total_games += 1
 
+    def trim_warmstart_to(self, n: int) -> int:
+        """Evict oldest warmstart games until at most ``n`` remain.
+
+        Used at the two-phase boundary: Phase 1 fills the buffer with warmstart
+        games (no self-play to crowd out → no anchor cap needed), then this
+        trims the warmstart pool down to the persistent anchor size right before
+        self-play begins — otherwise the buffer would balloon past ``max_size``
+        once self-play games start arriving (two-pool eviction never drops
+        warmstart for self-play). Keeps the ``n`` most-recently-added warmstart
+        games. Returns the number evicted.
+        """
+        warm_idxs = [i for i, g in enumerate(self.buffer) if bool(g.external_values)]
+        drop = set(warm_idxs[: max(0, len(warm_idxs) - n)])
+        if not drop:
+            return 0
+        self.buffer = [g for i, g in enumerate(self.buffer) if i not in drop]
+        self._priorities = [p for i, p in enumerate(self._priorities) if i not in drop]
+        return len(drop)
+
     def sample_batch(
         self,
         batch_size: int,

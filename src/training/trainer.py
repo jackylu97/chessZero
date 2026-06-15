@@ -129,6 +129,14 @@ class MuZeroTrainer:
             config.replay_buffer_size,
             warmstart_max_size=getattr(config, "warmstart_buffer_size", None),
         )
+        # Two-phase buffer sizing: during the supervised warmstart phase there is
+        # no self-play to protect the anchor from, so let warmstart games fill the
+        # WHOLE buffer (single-pool) for maximum supervised diversity. The
+        # training loop trims the warmstart pool back to ``warmstart_buffer_size``
+        # and re-enables the two-pool anchor at the self-play boundary. (On resume
+        # past the boundary the loop immediately restores the anchor cap below.)
+        if getattr(config, "self_play_warmup_steps", 0) > 0:
+            self.replay_buffer.warmstart_max_size = None
 
         self.writer = SummaryWriter(log_dir=os.path.join(log_dir, config.game, run_id))
         self.global_step = 0
@@ -203,6 +211,20 @@ class MuZeroTrainer:
             warmup = getattr(self.config, "self_play_warmup_steps", 0)
             if warmup > 0:
                 selfplay_on = step >= warmup
+                # Phase-dependent buffer cap. Phase 1 (selfplay_on False): no cap
+                # → warmstart fills the whole buffer. Phase 2: trim to the anchor
+                # size and switch on the two-pool so self-play can't displace it.
+                anchor = getattr(self.config, "warmstart_buffer_size", None)
+                desired_cap = anchor if selfplay_on else None
+                if self.replay_buffer.warmstart_max_size != desired_cap:
+                    if desired_cap is not None:
+                        n_trimmed = self.replay_buffer.trim_warmstart_to(desired_cap)
+                        tqdm.write(
+                            f"Step {step}: warmstart phase complete — trimmed "
+                            f"{n_trimmed} warmstart games to anchor={desired_cap}, "
+                            f"two-pool enabled, self-play ON."
+                        )
+                    self.replay_buffer.warmstart_max_size = desired_cap
             else:
                 selfplay_on = not bool(self._injection_shards)
 
