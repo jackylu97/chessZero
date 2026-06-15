@@ -347,17 +347,21 @@ def test_policy_target_zero_visits_falls_back_to_uniform():
     assert np.isfinite(probs).all()
 
 
-def test_policy_target_temperature_zero_is_one_hot_argmax_visits():
-    """Temperature=0: action = argmax(visits), policy = one-hot on that action."""
+def test_policy_target_temperature_zero_selects_argmax_target_is_raw_visits():
+    """Temperature=0 selects the argmax-visits ACTION, but the returned policy
+    TARGET is always the raw visit fractions N(a)/ΣN(a) — temperature affects
+    only which action is sampled, never the stored target (bug_hunt_2026_06_13
+    §B / commit 0280aec)."""
     root = MCTSNode()
     root.child_actions = np.array([0, 1, 2], dtype=np.int64)
     root.child_visits = np.array([2.0, 5.0, 1.0], dtype=np.float64)
     action, probs = select_action(root, temperature=0)
-    assert action == 1
+    assert action == 1  # argmax(visits)
     probs = np.asarray(probs)
-    assert probs[1] == pytest.approx(1.0)
-    assert probs[0] == 0.0
-    assert probs[2] == 0.0
+    total = 8.0  # 2 + 5 + 1
+    assert probs[0] == pytest.approx(2.0 / total)
+    assert probs[1] == pytest.approx(5.0 / total)
+    assert probs[2] == pytest.approx(1.0 / total)
 
 
 def test_policy_target_single_child_is_deterministic():

@@ -28,6 +28,10 @@ def _make_small_chess_config():
     cfg.sample_k = 50
     cfg.use_gumbel = False
     cfg.use_consistency_loss = False     # don't need projection heads for this test
+    # The chess preset selects the 'triton' PUCT backend, which requires CUDA.
+    # These tests run on CPU (device="cpu"), so use the CPU-compatible 'eager'
+    # backend — this test checks history/replay equivalence, not search speed.
+    cfg.tensor_mcts_select_backend = "eager"
     return cfg
 
 

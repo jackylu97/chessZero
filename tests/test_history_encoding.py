@@ -93,7 +93,7 @@ def test_gamehistory_stack_history_full_window_no_pad():
     gh = _build_chess_history(n_plies=10)
     # idx=5 with T=4 → newest first: obs[5], obs[4], obs[3], obs[2]
     out = gh._stack_history(idx=5, n_frames=4)
-    n_planes = 19
+    n_planes = ChessGame().num_planes
     assert out.shape == (n_planes * 4, 8, 8)
     assert torch.all(out[0:n_planes] == 5.0)
     assert torch.all(out[n_planes:2*n_planes] == 4.0)
@@ -105,7 +105,7 @@ def test_gamehistory_stack_history_partial_pad():
     gh = _build_chess_history(n_plies=10)
     # idx=2 with T=8 → newest=obs[2], then obs[1], obs[0], 0, 0, 0, 0, 0
     out = gh._stack_history(idx=2, n_frames=8)
-    n = 19
+    n = ChessGame().num_planes  # 22 (was 19 before repetition/no-progress planes)
     assert out.shape == (n * 8, 8, 8)
     assert torch.all(out[0:n] == 2.0)
     assert torch.all(out[n:2*n] == 1.0)
@@ -125,7 +125,7 @@ def test_make_target_history_8_target_obs_shape():
         action_space_size=ChessGame().action_space_size,
         history_frames=8,
     )
-    n = 19
+    n = ChessGame().num_planes  # 22 (was 19 before repetition/no-progress planes)
     # K+1=4 observations, each shape (n*8, 8, 8)
     assert len(obs) == 4
     for o in obs:
@@ -142,7 +142,7 @@ def test_make_target_history_window_correct_at_root():
         history_frames=4,
     )
     root_stack = obs[0]
-    n = 19
+    n = ChessGame().num_planes  # 22 (was 19 before repetition/no-progress planes)
     assert torch.all(root_stack[0:n] == 10.0)
     assert torch.all(root_stack[n:2*n] == 9.0)
     assert torch.all(root_stack[2*n:3*n] == 8.0)
@@ -159,7 +159,7 @@ def test_make_target_default_history_unchanged():
         action_space_size=ChessGame().action_space_size,
         # history_frames defaults to 1
     )
-    n = 19
+    n = ChessGame().num_planes  # 22 (was 19 before repetition/no-progress planes)
     for o in obs:
         # Single frame: shape (n, 8, 8), not (n*T, 8, 8)
         assert o.shape == (n, 8, 8)
@@ -175,7 +175,7 @@ def test_plane_order_newest_first_consistency():
     # stack_with_history at inference
     cur = torch.full_like(gh.observations[0], 99.0)
     inference_stack = stack_with_history(cur, list(gh.observations), n_frames=4)
-    n = 19
+    n = ChessGame().num_planes  # 22 (was 19 before repetition/no-progress planes)
     assert torch.all(inference_stack[0:n] == 99.0)  # cur is newest
     assert torch.all(inference_stack[n:2*n] == 8.0)  # then most recent prior
 
