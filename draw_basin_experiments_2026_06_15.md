@@ -112,6 +112,29 @@ loop is being reinforced into the policy over time.
 
 ---
 
+## Experiment F — Value head on the model's OWN won positions (the capstone)
+
+**Method.** 120 repetition-decision positions from self-play where Stockfish says
+STM is clearly winning (>+3 pawns), reconstructed in-distribution with full
+8-frame history, evaluated by the **model's own value head** (55k).
+
+**Result.**
+| | value |
+|---|---|
+| Stockfish eval (STM) | **+9.0 pawns** (clearly won) |
+| Model value head (STM) | **V = +0.03** (says draw) |
+| Model WDL | P(W)=0.04, **P(D)=0.95**, P(L)=0.01 |
+| corr(model V, Stockfish) | **−0.03** (zero) |
+| reads as ~draw (\|V\|<0.2) | 96% |
+
+**Conclusion.** Up ~9 pawns, the value head outputs 95% draw, uncorrelated with
+the truth. Reconciles the "healthy value head" paradox: the probe's 0.89 was on
+**teacher** positions; on the model's **own** positions V predicts **Vᵖ = draw**.
+Combined with the frozen-rep probe (win/loss decodable at AUC≈1.0), this is a
+**labeling/target problem, not a representation problem** — the network knows
+it's winning; the head, trained on draw outcomes, calls it a draw. ⇒ the fix is
+value-target relabeling toward V* / decisive-signal generation, NOT search.
+
 ## Synthesis — why MCTS doesn't fix this, and why it's a fixed point
 
 MCTS is a policy-*improvement* operator: it amplifies the value signal over the
