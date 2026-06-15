@@ -366,30 +366,64 @@ class MuZeroTrainer:
             gpu_after = torch.cuda.memory_allocated() / 1e9
             gpu_peak = torch.cuda.max_memory_allocated() / 1e9
 
-        avg_length = sum(len(g) - 1 for g in games) / len(games)
+        n_games = len(games)
+        avg_length = sum(len(g) - 1 for g in games) / n_games
         outcomes = [g.game_outcome for g in games]
         p1_wins = sum(1 for o in outcomes if o == 1)
         p2_wins = sum(1 for o in outcomes if o == -1)
         draws = sum(1 for o in outcomes if o == 0)
 
+        # Draw-type breakdown (chess only): threefold vs no-progress (50/75-move)
+        # vs other (stalemate / insufficient material / ply-cap = "computer draw").
+        # Threefold uses the engine flag (consistent with the repetition penalty);
+        # the rest are read off the halfmove clock by replaying the game.
+        threefold_draws = no_progress_draws = other_draws = 0
+        if getattr(self.config, "game", None) == "chess" and draws > 0:
+            import chess as _chess
+            from ..games.chess import _action_to_move as _a2m
+            for g in games:
+                if g.game_outcome != 0:
+                    continue
+                b = _chess.Board(); ok = True
+                try:
+                    for a in g.actions:
+                        mv = _a2m(int(a), b)
+                        if mv is None or mv not in b.legal_moves:
+                            ok = False; break
+                        b.push(mv)
+                except Exception:
+                    ok = False
+                if ok and b.is_repetition(3):
+                    threefold_draws += 1          # threefold repetition
+                elif ok and b.halfmove_clock >= 100:
+                    no_progress_draws += 1         # 50/75-move no-progress
+                else:
+                    other_draws += 1               # stalemate / insufficient / ply-cap / replay-fail
+
         total_plies = sum(len(g) - 1 for g in games)
         self.writer.add_scalar("self_play/avg_game_length", avg_length, self.global_step)
-        self.writer.add_scalar("self_play/p1_win_rate", p1_wins / len(games), self.global_step)
-        self.writer.add_scalar("self_play/p2_win_rate", p2_wins / len(games), self.global_step)
-        self.writer.add_scalar("self_play/draw_rate", draws / len(games), self.global_step)
+        self.writer.add_scalar("self_play/p1_win_rate", p1_wins / n_games, self.global_step)
+        self.writer.add_scalar("self_play/p2_win_rate", p2_wins / n_games, self.global_step)
+        self.writer.add_scalar("self_play/draw_rate", draws / n_games, self.global_step)
+        # Draw-type breakdown (these three + p1_win + p2_win sum to 1.0).
+        self.writer.add_scalar("self_play/draw_threefold_rate", threefold_draws / n_games, self.global_step)
+        self.writer.add_scalar("self_play/draw_no_progress_rate", no_progress_draws / n_games, self.global_step)
+        self.writer.add_scalar("self_play/draw_other_rate", other_draws / n_games, self.global_step)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
         # Throughput — self-play is the wall-clock bottleneck; track it explicitly.
         self.writer.add_scalar("self_play/seconds", sp_secs, self.global_step)
         if sp_secs > 0:
-            self.writer.add_scalar("self_play/games_per_sec", len(games) / sp_secs, self.global_step)
+            self.writer.add_scalar("self_play/games_per_sec", n_games / sp_secs, self.global_step)
             self.writer.add_scalar("self_play/plies_per_sec", total_plies / sp_secs, self.global_step)
-        # Console summary of the self-play batch — draw rate is the key
+        # Console summary of the self-play batch — outcome breakdown is the key
         # draw-basin health signal; surface it in the log, not just TensorBoard.
         tqdm.write(
             f"Step {self.global_step}: self-play batch — "
-            f"draw_rate={draws / len(games):.3f} "
-            f"(p1_win={p1_wins / len(games):.3f}, p2_win={p2_wins / len(games):.3f}), "
-            f"avg_len={avg_length:.0f}, {len(games)} games in {sp_secs:.0f}s"
+            f"Wwin={p1_wins / n_games:.2f} Bwin={p2_wins / n_games:.2f} "
+            f"draw={draws / n_games:.2f} "
+            f"[3fold={threefold_draws / n_games:.2f} 50mv={no_progress_draws / n_games:.2f} "
+            f"other={other_draws / n_games:.2f}], "
+            f"avg_len={avg_length:.0f}, {n_games} games in {sp_secs:.0f}s"
         )
         self.writer.add_scalar("memory/rss_gb_before_selfplay", rss_before, self.global_step)
         self.writer.add_scalar("memory/rss_gb_after_selfplay", rss_after, self.global_step)
