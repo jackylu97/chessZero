@@ -698,6 +698,7 @@ class MuZeroTrainer:
             warmstart_q_ratio=getattr(self.config, "warmstart_q_ratio", None),
             selfplay_q_ratio=getattr(self.config, "selfplay_q_ratio", None),
             repetition_penalty=getattr(self.config, "repetition_penalty", 0.0),
+            build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
         )
 
         obs = batch["observations"].to(self.device)
@@ -724,6 +725,15 @@ class MuZeroTrainer:
             self._policy_loss_kl if bool(getattr(self.config, "use_gumbel", False))
             else self._policy_loss
         )
+
+        # Legal-move policy masking (chess: 99% of the action space is illegal).
+        # When enabled, the policy CE is renormalized over legal moves and an
+        # illegal-mass penalty is added. See config.mask_illegal_policy.
+        mask_illegal = (bool(getattr(self.config, "mask_illegal_policy", False))
+                        and "target_legal_masks" in batch)
+        illegal_pen_w = float(getattr(self.config, "illegal_policy_penalty", 1.0))
+        target_legal_masks = (batch["target_legal_masks"].to(self.device)  # (B, K+1, A)
+                              if mask_illegal else None)
 
         is_warm = batch["is_warmstart"].to(self.device)
 
@@ -754,7 +764,10 @@ class MuZeroTrainer:
             root_hidden_k0 = hidden  # save for in-loop cross-action-cos probe (detached later)
 
             # Per-sample losses at root (k=0) — always full weight
-            policy_loss = policy_loss_fn(policy_logits, target_policies[:, 0])
+            lm0 = target_legal_masks[:, 0] if mask_illegal else None
+            policy_loss, illegal_loss = self._policy_terms(
+                policy_logits, target_policies[:, 0], lm0, policy_loss_fn)
+            illegal_mass_root = illegal_loss.detach().mean().item()  # for logging
             value_loss = self._value_loss(value_logits, target_values[:, 0],
                                           self.network.value_support_size)
             reward_loss = torch.zeros(obs.shape[0], device=self.device)
@@ -769,7 +782,11 @@ class MuZeroTrainer:
                 hidden.register_hook(lambda grad: grad * 0.5)
 
                 mask_k = target_obs_mask[:, k + 1]
-                policy_loss = policy_loss + unroll_scale * policy_loss_fn(policy_logits, target_policies[:, k + 1]) * mask_k
+                lm_k = target_legal_masks[:, k + 1] if mask_illegal else None
+                pl_k, im_k = self._policy_terms(
+                    policy_logits, target_policies[:, k + 1], lm_k, policy_loss_fn)
+                policy_loss = policy_loss + unroll_scale * pl_k * mask_k
+                illegal_loss = illegal_loss + unroll_scale * im_k * mask_k
                 value_loss = value_loss + unroll_scale * self._value_loss(value_logits, target_values[:, k + 1],
                                                                           self.network.value_support_size) * mask_k
                 reward_loss = reward_loss + unroll_scale * self._reward_loss(reward_logits, target_rewards[:, k + 1],
@@ -810,6 +827,7 @@ class MuZeroTrainer:
                 + reward_loss
                 + self.config.consistency_loss_weight * consistency_loss
                 + inverse_weight * inverse_loss
+                + illegal_pen_w * illegal_loss
             )
             total_loss = (is_weights_t * per_sample_loss).mean()
 
@@ -959,6 +977,9 @@ class MuZeroTrainer:
             "value_loss_selfplay": value_loss_self,
             "batch_warmstart_frac": (n_warm / max(1, is_warm.numel())),
             "cross_action_cos": cross_action_cos,
+            # Mean full-softmax probability mass on ILLEGAL moves at the root.
+            # The thing legal-masking drives toward 0; ~0.17 unmasked at 22k.
+            "policy_illegal_mass": illegal_mass_root,
         }
         # Per-sub-network grad norms (present only on log steps) → grad/<group>.
         for k, v in subnet_grad.items():
@@ -1074,6 +1095,30 @@ class MuZeroTrainer:
         """Per-sample cross-entropy between predicted policy and MCTS visit distribution."""
         return -(targets * F.log_softmax(logits, dim=1)).sum(dim=1)
 
+    def _policy_terms(self, logits, targets, legal_mask, base_loss_fn):
+        """Per-sample (policy_ce, illegal_mass) for one unroll step.
+
+        legal_mask is None  -> standard full-softmax CE (reference behavior),
+                                illegal_mass = 0.
+        legal_mask (B, A)   -> CE with the softmax renormalized over LEGAL moves
+                                only (sharpens the legal distribution), plus the
+                                FULL-softmax probability mass on illegal moves
+                                returned separately as a penalty signal that keeps
+                                illegal logits suppressed everywhere (incl. latent
+                                leaves we cannot mask). Targets are already zero on
+                                illegal moves.
+        """
+        if legal_mask is None:
+            return base_loss_fn(logits, targets), logits.new_zeros(logits.shape[0])
+        # Renormalize the softmax over legal moves: push illegal logits to the
+        # dtype min (finite, so 0*log_softmax = 0 at illegal entries — no NaN).
+        neg = torch.finfo(logits.dtype).min
+        masked_logits = logits.masked_fill(legal_mask == 0, neg)
+        ce = -(targets * F.log_softmax(masked_logits, dim=1)).sum(dim=1)
+        # Illegal mass from the UNMASKED softmax — this is what we penalize.
+        illegal_mass = (F.softmax(logits, dim=1) * (1.0 - legal_mask)).sum(dim=1)
+        return ce, illegal_mass
+
     def _policy_loss_kl(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Per-sample KL(π'_target || π_net) — paper Eq. 12.
 
@@ -1117,7 +1162,7 @@ class MuZeroTrainer:
         # Route loss/grad/scale scalars to their own namespaces so TensorBoard
         # groups them sensibly.
         value_keys = {"value_mae", "value_target_std", "value_loss_weight"}
-        policy_keys = {"policy_entropy_pred", "policy_entropy_target"}
+        policy_keys = {"policy_entropy_pred", "policy_entropy_target", "policy_illegal_mass"}
         train_keys = {"batch_warmstart_frac"}
         for key, value in loss_info.items():
             # Skip NaN universally (TB grays curves on NaN; e.g. cross_action_cos /

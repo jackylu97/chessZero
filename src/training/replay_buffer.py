@@ -559,6 +559,7 @@ class ReplayBuffer:
         warmstart_q_ratio: float | None = None,
         selfplay_q_ratio: float | None = None,
         repetition_penalty: float = 0.0,
+        build_legal_masks: bool = False,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -641,6 +642,7 @@ class ReplayBuffer:
         values_batch = []
         rewards_batch = []
         policies_batch = []
+        legal_masks_batch = []
 
         for g_idx in game_indices:
             game = self.buffer[g_idx]
@@ -662,6 +664,23 @@ class ReplayBuffer:
             values_batch.append(values)
             rewards_batch.append(rewards)
             policies_batch.append(policies)
+            if build_legal_masks:
+                # (K+1, A) legal-move mask aligned with policies/actions: 1.0 on
+                # legal moves at ply (pos + i), 0.0 on illegal. Mirrors make_target's
+                # idx = pos + i. Where legality is unknown (past game end, or a ply
+                # without a recorded legal set — e.g. some warmstart games), fall
+                # back to all-ones so that ply behaves exactly like the unmasked
+                # (standard) path rather than masking everything out.
+                lm = np.ones((num_unroll_steps + 1, action_space_size), dtype=np.float32)
+                for i in range(num_unroll_steps + 1):
+                    idx = pos + i
+                    if idx < len(game) and idx < len(game.legal_actions_list):
+                        legal = game.legal_actions_list[idx]
+                        if legal:
+                            row = np.zeros(action_space_size, dtype=np.float32)
+                            row[np.asarray(legal, dtype=np.int64)] = 1.0
+                            lm[i] = row
+                legal_masks_batch.append(lm)
 
         target_observations_t = torch.stack(target_observations)  # (B, K+1, C, H, W)
 
@@ -689,6 +708,10 @@ class ReplayBuffer:
             "target_policies": torch.from_numpy(np.stack(policies_batch)),
             "is_warmstart": torch.from_numpy(is_warmstart),
         }
+        if build_legal_masks:
+            # (B, K+1, A) — 1.0 legal, 0.0 illegal. Consumed by the trainer's
+            # masked policy loss + illegal-mass penalty.
+            batch["target_legal_masks"] = torch.from_numpy(np.stack(legal_masks_batch))
         return batch, game_indices, weights
 
     def update_priorities(self, game_indices: np.ndarray, td_errors: np.ndarray, epsilon: float = 1e-6):

@@ -177,3 +177,42 @@ reachable search horizon; it does not create one. The trap:
 ## Open / not yet run
 - 68k-vs-29k head-to-head (Stockfish-free skill check) — offered, not run.
 - Short fine-tune A/B of the repetition penalty — deferred.
+
+## Findings 2026-06-16 (run `2026_06_15_2phase_noprogpen`, phase 2)
+
+### Legal-move policy masking — IMPLEMENTED (this branch)
+On-policy probe at 22k (`scripts/probe_policy_value_consistency.py`):
+- Policy leaks **17% of mass onto illegal moves** (deferred bug #1, measured).
+- Legal-only entropy 2.83 vs log(33)=3.50 → diffuse but not uniform; top legal
+  move only 0.15–0.19.
+- **Value/dynamics HAS signal**: per-position Q-spread 0.22, best move +0.12,
+  root value std 0.24 (NOT collapsed). The bottleneck is the **policy**, only
+  0.19-correlated with the model's own Q, picking moves ~0.08 Q worse than its
+  value-best.
+Reference impls (muzero-general, LightZero, DeepMind pseudocode) do NOT mask the
+policy loss — fine when ~all actions are legal (Atari/small boards), weak for
+chess (99% illegal). Fix: `config.mask_illegal_policy` — masked-softmax CE over
+legal moves + illegal-mass penalty, using stored `legal_actions_list`. Logs
+`policy/illegal_mass`. Opt-in `--mask-illegal-policy`.
+
+### The penalty RELOCATES draws, doesn't reduce them
+Phase-2 trajectory (15k→23k): no-progress draws 0.08→**0.00** (δ penalty worked),
+but threefold draws 0.56→**0.84** and overall draw rate 0.81→**0.90**; p1_win
+0.09→0.04; value/target_std 0.72→**0.51**. The penalty changed draw *composition*
+but the rate ROSE and decisiveness FELL — the policy still can't convert, so
+draws relocate (no-progress → threefold) and multiply. ⇒ More contempt/δ = more
+relabeling, not more conversion. The lever is the policy (masking + warmstart
+fade), not the value-side knobs.
+
+## Potential follow-up: treat threefold repetition as an ILLEGAL move
+Mask the 3rd-repetition-completing move during self-play generation (natural
+extension of the legal-mask machinery). Steelman: Exp A says 90% of repetition
+draws are winnable, so forcing play on mostly yields *correct* decisive data.
+Risks: (1) changes the rules — fortress / perpetual-check positions become forced
+losses → value head mislabels them vs real chess; (2) RELOCATION — masking only
+the threefold move lets a diffuse policy drift to the 50-move drain instead (the
+phase-2 data above is direct evidence of this relocation effect). If tried: do it
+in self-play GENERATION only, keep eval + value targets on honest rules, and
+watch whether decisive-game fraction actually rises and whether the health probe
+shows over-pessimism on known-drawn endgames. Sequence AFTER the masking fix —
+masking attacks the cause (policy can't convert); illegal-repetition the symptom.

@@ -223,6 +223,26 @@ class MuZeroConfig:
     # via --repetition-penalty (presets stay at 0.0).
     repetition_penalty: float = 0.0
 
+    # Legal-move policy masking. Chess exposes a 4672-action space of which only
+    # ~33 are legal at any position (99% illegal). Reference MuZero impls
+    # (muzero-general, LightZero, DeepMind pseudocode) mask only at the MCTS root
+    # and rely on the full-softmax CE to suppress illegal moves implicitly — fine
+    # when almost every action is legal (Atari, tictactoe/connect4) but weak for
+    # chess: we measured ~17% of policy mass leaking onto illegal moves at 22k.
+    # When True, the policy loss instead (a) renormalizes the softmax over the
+    # LEGAL moves only — directly sharpening the legal distribution rather than
+    # spending normalizer budget on dead moves — and (b) adds an explicit penalty
+    # on the FULL-softmax probability mass that lands on illegal moves, which
+    # keeps illegal logits suppressed everywhere, including the latent search
+    # leaves we cannot mask (a pure masked-softmax gives illegal logits zero
+    # gradient, letting them drift and pollute leaf priors). Uses the
+    # legal_actions_list already stored per ply. Default off (keeps the standard
+    # path for small games); opt-in for chess via --mask-illegal-policy.
+    mask_illegal_policy: bool = False
+    # Weight on the illegal-mass penalty (part b above). Only active when
+    # mask_illegal_policy is True.
+    illegal_policy_penalty: float = 1.0
+
     # eval_to_wdl conversion (warmstart-only, value_head_type="wdl"): convert
     # Stockfish per-position eval (in [-1,+1] STM POV) into a soft (P_W, P_D,
     # P_L) target via parameterized 3-way logistic. ``alpha`` controls

@@ -124,6 +124,15 @@ def main():
                              "shuffling with no progress is mildly bad. Stalemate / "
                              "insufficient-material / ply-cap draws are untouched. "
                              "0.0 (default) = off / legacy behavior.")
+    parser.add_argument("--mask-illegal-policy", action="store_true", default=False,
+                        help="Enable legal-move policy masking (config.mask_illegal_policy). "
+                             "The policy CE is renormalized over LEGAL moves only and an "
+                             "illegal-mass penalty is added, instead of the reference "
+                             "full-softmax CE that leaks mass onto illegal moves (~17% at "
+                             "22k for chess). Recommended for chess; default off.")
+    parser.add_argument("--illegal-policy-penalty", type=float, default=None,
+                        help="Override config.illegal_policy_penalty (weight on the "
+                             "illegal-mass penalty; only active with --mask-illegal-policy).")
     parser.add_argument("--warmstart-buffer-size", type=int, default=None,
                         help="Override config.warmstart_buffer_size. Enables the "
                              "TWO-POOL buffer: this many slots are reserved for "
@@ -215,6 +224,10 @@ def main():
         config.selfplay_q_ratio = args.selfplay_q_ratio
     if args.repetition_penalty is not None:
         config.repetition_penalty = args.repetition_penalty
+    if args.mask_illegal_policy:
+        config.mask_illegal_policy = True
+    if args.illegal_policy_penalty is not None:
+        config.illegal_policy_penalty = args.illegal_policy_penalty
     if args.warmstart_buffer_size is not None:
         if args.warmstart_buffer_size >= config.replay_buffer_size:
             parser.error(
