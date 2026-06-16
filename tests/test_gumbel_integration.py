@@ -326,6 +326,9 @@ def test_reanalyze_rewrites_policies_as_pi_prime(ttt, gumbel_cfg):
             for i in range(len(g.policies)):
                 g.policies[i] = [0.0] * ttt.action_space_size
 
+        # Gumbel reanalyze must run through BatchedMCTS — TensorMCTS has no Gumbel
+        # root, and the trainer now guards that combo. Pin the legacy reanalyze path.
+        tr.config.reanalyze_use_tensor_mcts = False
         tr._reanalyze()
         tr.writer.close()
 

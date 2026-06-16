@@ -120,10 +120,12 @@ def test_warmup_then_decay_milestones_fire(tmp_path):
     )
 
 
-def test_chess_preset_has_warmup_and_doubled_lr():
-    """Sanity: the chess preset actually ships with lr=2e-3 and 500-step warmup."""
+def test_chess_preset_has_warmup_and_base_lr():
+    """Sanity: the chess preset ships with lr=1e-3 and a 500-step warmup.
+    (The 2e-3 doubling from the next-run config was reverted 2026-06-12 back to
+    the paper value — see config.py.)"""
     from src.config import get_config
     cfg = get_config("chess")
-    assert cfg.lr == pytest.approx(2e-3), f"expected 2e-3, got {cfg.lr}"
+    assert cfg.lr == pytest.approx(1e-3), f"expected 1e-3, got {cfg.lr}"
     assert cfg.lr_warmup_steps == 500, f"expected 500, got {cfg.lr_warmup_steps}"
     assert cfg.use_gumbel is False, "chess should default to PUCT, not Gumbel"

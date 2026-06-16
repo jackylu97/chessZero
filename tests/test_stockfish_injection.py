@@ -417,8 +417,11 @@ def test_value_loss_weight_falls_back_when_phase_fields_unset(tmp_path):
 
 
 def test_chess_preset_has_phase_value_weights():
-    """Sanity: next-run chess preset ships with 1.0 / 0.25 split."""
+    """Sanity: chess preset ships with value-loss weights 1.0 / 1.0. (The 0.25
+    self-play down-weight was superseded — under MC returns (td_steps=-1) the
+    self-play value targets carry no bootstrap noise, so they're not down-weighted.
+    See config.py.)"""
     from src.config import get_config
     cfg = get_config("chess")
     assert cfg.value_loss_weight_warmstart == pytest.approx(1.0)
-    assert cfg.value_loss_weight_selfplay == pytest.approx(0.25)
+    assert cfg.value_loss_weight_selfplay == pytest.approx(1.0)

@@ -255,6 +255,7 @@ def test_play_games_parallel_gpu_with_tensor_mcts_runs():
 
     cfg = _make_small_chess_config()
     cfg.use_tensor_mcts = True
+    cfg.tensor_mcts_select_backend = "eager"  # triton requires CUDA; this test runs on CPU
     chess_game = ChessGame()
     network = _build_chess_network(cfg, chess_game)
     torch.manual_seed(0)
