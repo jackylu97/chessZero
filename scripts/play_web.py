@@ -21,6 +21,7 @@ from src.games.chess import ChessGame
 from src.mcts.mcts import MCTS, BatchedMCTS, select_action, select_action_gumbel
 from src.model.muzero_net import MuZeroNetwork
 from src.model.utils import support_to_scalar, inverse_scalar_transform
+from src.training.replay_buffer import stack_with_history
 
 
 HTML = """<!DOCTYPE html>
@@ -172,8 +173,12 @@ class GameSession:
             self.mcts = BatchedMCTS(network, game, config, device)
         else:
             self.mcts = MCTS(network, game, config, device)
+        self.history_frames = getattr(config, "history_frames", 1)
         self.state = None
         self.san_history: list[str] = []
+        # Single-frame observations of PRIOR plies (chronological, newest last), used
+        # to build the T-frame history stack the network was trained on.
+        self.frame_history: list = []
         # Last MCTS root value from White's POV; updated only when the model moves
         # (user moves don't trigger search). None until the first model move of a game.
         self.last_mcts_value: float | None = None
@@ -182,7 +187,14 @@ class GameSession:
     def reset(self):
         self.state = self.game.reset()
         self.san_history = []
+        self.frame_history = []
         self.last_mcts_value = None
+
+    def _stacked_obs(self):
+        """T-frame history-stacked observation for the current position (matches
+        training-time GameHistory._stack_history: newest frame first)."""
+        cur = self.game.to_tensor(self.state)
+        return stack_with_history(cur, self.frame_history, self.history_frames)
 
     @torch.no_grad()
     def _raw_value_white_pov(self) -> float | None:
@@ -193,17 +205,12 @@ class GameSession:
         """
         if self.state.done:
             return None
-        obs = self.game.to_tensor(self.state).unsqueeze(0).to(self.device)
-        _, _, value_logits = self.network.initial_inference_logits(obs)
-        v_trans = support_to_scalar(
-            value_logits.float(), self.network.value_support_size
-        ).squeeze(-1)
-        if self.config.use_scalar_transform:
-            v_scalar = inverse_scalar_transform(v_trans)
-        else:
-            scale = self.config.value_target_scale
-            v_scalar = v_trans / scale if scale != 1.0 else v_trans
-        v_stm = float(v_scalar.item())
+        # initial_inference returns the already-decoded scalar value, handling the
+        # WDL head (wdl_to_scalar) or the support head transparently — so this works
+        # for both current and legacy checkpoints. Feed the history stack.
+        obs = self._stacked_obs().unsqueeze(0).to(self.device)
+        _, _, value = self.network.initial_inference(obs)
+        v_stm = float(value.item())
         return v_stm if self.state.current_player == 1 else -v_stm
 
     def to_json(self):
@@ -237,13 +244,15 @@ class GameSession:
         if action is None:
             return False
         self.san_history.append(self.game.action_to_san(self.state, action))
+        # Record this ply's frame before stepping, so it becomes history for later plies.
+        self.frame_history.append(self.game.to_tensor(self.state))
         self.state, _, _ = self.game.step(self.state, action)
         return True
 
     def apply_model_move(self):
         if self.state.done or self.state.current_player != 1:
             return
-        obs = self.game.to_tensor(self.state)
+        obs = self._stacked_obs()
         legal = self.game.legal_actions(self.state)
         if self.use_gumbel:
             root = self.mcts.run_batch([obs], [legal], add_noise=False)[0]
@@ -254,6 +263,8 @@ class GameSession:
         # root.value is STM POV — STM at root is White (the model). No sign flip needed.
         self.last_mcts_value = float(root.value)
         self.san_history.append(self.game.action_to_san(self.state, action))
+        # Record this ply's frame before stepping.
+        self.frame_history.append(self.game.to_tensor(self.state))
         self.state, _, _ = self.game.step(self.state, action)
 
 
@@ -296,8 +307,11 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
     # (projection + prediction_head). Back-compat with pre-EZ chess checkpoints.
     has_consistency = any(k.startswith("projection.") for k in state_dict)
 
+    has_inverse = any(k.startswith("inverse_dynamics_head.") for k in state_dict)
+
     network = MuZeroNetwork(
-        observation_channels=game.num_planes,
+        # Input is the T-frame history stack (num_planes * history_frames), matching training.
+        observation_channels=game.num_planes * getattr(config, "history_frames", 1),
         action_space_size=game.action_space_size,
         hidden_planes=config.hidden_planes,
         num_blocks=config.num_residual_blocks,
@@ -315,6 +329,12 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
         pred_out=config.pred_out,
         use_scalar_transform=config.use_scalar_transform,
         value_target_scale=config.value_target_scale,
+        # Detect from the checkpoint so old (support, no-inverse) and current
+        # (WDL + inverse head) checkpoints both load.
+        value_head_type=getattr(config, "value_head_type", "support"),
+        draw_score=getattr(config, "draw_score", 0.0),
+        use_inverse_dynamics_loss=has_inverse,
+        inverse_dynamics_hidden=getattr(config, "inverse_dynamics_hidden", 256),
     )
     network.load_state_dict(state_dict)
     network.to(device)
