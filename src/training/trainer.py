@@ -729,8 +729,8 @@ class MuZeroTrainer:
         )
 
         # Legal-move policy masking (chess: 99% of the action space is illegal).
-        # When enabled, the policy CE is renormalized over legal moves and an
-        # illegal-mass penalty is added. See config.mask_illegal_policy.
+        # When enabled, the standard full-softmax policy CE is kept and an
+        # illegal-mass penalty is added on top. See config.mask_illegal_policy.
         mask_illegal = (bool(getattr(self.config, "mask_illegal_policy", False))
                         and "target_legal_masks" in batch)
         illegal_pen_w = float(getattr(self.config, "illegal_policy_penalty", 1.0))
@@ -1100,24 +1100,25 @@ class MuZeroTrainer:
     def _policy_terms(self, logits, targets, legal_mask, base_loss_fn):
         """Per-sample (policy_ce, illegal_mass) for one unroll step.
 
-        legal_mask is None  -> standard full-softmax CE (reference behavior),
-                                illegal_mass = 0.
-        legal_mask (B, A)   -> CE with the softmax renormalized over LEGAL moves
-                                only (sharpens the legal distribution), plus the
-                                FULL-softmax probability mass on illegal moves
-                                returned separately as a penalty signal that keeps
-                                illegal logits suppressed everywhere (incl. latent
-                                leaves we cannot mask). Targets are already zero on
-                                illegal moves.
+        legal_mask is None  -> standard full-softmax CE, illegal_mass = 0.
+        legal_mask (B, A)   -> the SAME standard full-softmax CE (which learns
+                                legality for free via the shared normalizer:
+                                raising legal logits drains probability off illegal
+                                ones), PLUS the full-softmax probability mass on
+                                illegal moves returned separately as a penalty
+                                signal that drives illegal_mass below the CE's
+                                natural floor — incl. at latent leaves we can't mask.
+
+        We deliberately do NOT renormalize the softmax over legal moves: that is
+        shift-invariant over the legal logits (adding a constant to all of them
+        leaves the loss unchanged) and gives illegal logits zero gradient, so it
+        cannot teach legality. Formally full_CE = masked_CE - log P(legal), i.e.
+        renormalizing just drops the -log P(legal) legality term; the penalty here
+        is extra suppression on top of the full CE's own legality learning.
         """
+        ce = base_loss_fn(logits, targets)
         if legal_mask is None:
-            return base_loss_fn(logits, targets), logits.new_zeros(logits.shape[0])
-        # Renormalize the softmax over legal moves: push illegal logits to the
-        # dtype min (finite, so 0*log_softmax = 0 at illegal entries — no NaN).
-        neg = torch.finfo(logits.dtype).min
-        masked_logits = logits.masked_fill(legal_mask == 0, neg)
-        ce = -(targets * F.log_softmax(masked_logits, dim=1)).sum(dim=1)
-        # Illegal mass from the UNMASKED softmax — this is what we penalize.
+            return ce, logits.new_zeros(logits.shape[0])
         illegal_mass = (F.softmax(logits, dim=1) * (1.0 - legal_mask)).sum(dim=1)
         return ce, illegal_mass
 

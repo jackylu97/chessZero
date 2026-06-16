@@ -138,10 +138,10 @@ def main():
                              "γ=0.93 ≈ half-strength 9.5 plies back. 0 (default) = inactive.")
     parser.add_argument("--mask-illegal-policy", action="store_true", default=False,
                         help="Enable legal-move policy masking (config.mask_illegal_policy). "
-                             "The policy CE is renormalized over LEGAL moves only and an "
-                             "illegal-mass penalty is added, instead of the reference "
-                             "full-softmax CE that leaks mass onto illegal moves (~17% at "
-                             "22k for chess). Recommended for chess; default off.")
+                             "Keeps the standard full-softmax policy CE and ADDS a penalty "
+                             "on the full-softmax probability mass landing on illegal moves, "
+                             "driving it below the CE's natural floor (~17% at 22k for chess). "
+                             "Recommended for chess; default off.")
     parser.add_argument("--illegal-policy-penalty", type=float, default=None,
                         help="Override config.illegal_policy_penalty (weight on the "
                              "illegal-mass penalty; only active with --mask-illegal-policy).")

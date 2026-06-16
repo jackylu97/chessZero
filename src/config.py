@@ -260,15 +260,17 @@ class MuZeroConfig:
     # and rely on the full-softmax CE to suppress illegal moves implicitly — fine
     # when almost every action is legal (Atari, tictactoe/connect4) but weak for
     # chess: we measured ~17% of policy mass leaking onto illegal moves at 22k.
-    # When True, the policy loss instead (a) renormalizes the softmax over the
-    # LEGAL moves only — directly sharpening the legal distribution rather than
-    # spending normalizer budget on dead moves — and (b) adds an explicit penalty
-    # on the FULL-softmax probability mass that lands on illegal moves, which
-    # keeps illegal logits suppressed everywhere, including the latent search
-    # leaves we cannot mask (a pure masked-softmax gives illegal logits zero
-    # gradient, letting them drift and pollute leaf priors). Uses the
-    # legal_actions_list already stored per ply. Default off (keeps the standard
-    # path for small games); opt-in for chess via --mask-illegal-policy.
+    # When True, the policy loss keeps the standard full-softmax CE (which learns
+    # legality for free — raising legal logits drains probability off illegal ones
+    # through the shared softmax normalizer) and ADDS an explicit penalty on the
+    # full-softmax probability mass landing on illegal moves, driving it below the
+    # CE's natural floor (~17% at 22k for chess) — incl. at the latent search
+    # leaves we cannot mask. We do NOT renormalize the softmax over legal moves:
+    # that is shift-invariant over the legal logits and exerts no pressure to
+    # raise legal above illegal, so it cannot teach legality (formally
+    # full_CE = masked_CE - log P(legal) — renormalizing drops the legality term).
+    # Uses the legal_actions_list already stored per ply. Default off (keeps the
+    # standard path for small games); opt-in for chess via --mask-illegal-policy.
     mask_illegal_policy: bool = False
     # Weight on the illegal-mass penalty (part b above). Only active when
     # mask_illegal_policy is True.

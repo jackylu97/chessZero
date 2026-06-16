@@ -249,10 +249,12 @@ Full command (swap run-id):
   --stockfish-injection-path data/stockfish_injection \
   --stockfish-injection-games 300 --stockfish-injection-interval 256 \
   --self-play-warmup-steps 15000 --warmstart-buffer-size 300 \
-  --warmstart-sample-frac 0.3 --repetition-penalty 0.35 \
+  --warmstart-sample-frac 0.2 --repetition-penalty 0.35 \
   --repetition-penalty-decay 0.93 \
   --mask-illegal-policy
 ```
+(warmstart-sample-frac set to 0.2 at launch 2026-06-16 — user opted for the
+stronger fade over the 0.3 compromise; watch value/target_std for collapse risk.)
 Watch: `policy/illegal_mass` (→0), `policy/entropy_pred` (should drop below
 noprogpen's ~3.5 if masking sharpens the policy), `value/target_std` (must NOT
 crater from the 0.3 fade — the anchor's protective job), and the draw/decisiveness

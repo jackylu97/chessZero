@@ -1,9 +1,11 @@
 """Legal-move policy masking (config.mask_illegal_policy).
 
-When enabled, the policy loss renormalizes the cross-entropy softmax over LEGAL
-moves only (sharpening the legal distribution) and returns the full-softmax
-probability mass on illegal moves as a separate penalty signal. Disabled, it
-reproduces the reference full-softmax CE exactly with a zero penalty.
+When enabled, the policy loss keeps the standard full-softmax cross-entropy (which
+learns legality for free via the shared normalizer) and ADDS the full-softmax
+probability mass on illegal moves as a separate penalty signal driving it below
+the CE's natural floor. Disabled, it is exactly the reference CE with zero penalty.
+We do NOT renormalize the softmax over legal moves — that is shift-invariant over
+the legal logits and cannot teach legality: full_CE = masked_CE - log P(legal).
 
 `_policy_terms` does not use `self`, so we call it unbound with self=None.
 """
@@ -42,7 +44,9 @@ def test_mask_none_reproduces_reference_ce_and_zero_penalty():
     torch.testing.assert_close(pen, torch.zeros(4))
 
 
-def test_masked_ce_equals_renormalized_legal_softmax():
+def test_masking_uses_full_softmax_ce_plus_illegal_penalty():
+    """With a mask, the CE is the SAME standard full-softmax CE (NOT renormalized
+    over legal); the mask only produces the illegal-mass penalty."""
     torch.manual_seed(1)
     A = 30
     logits = torch.randn(3, A)
@@ -53,33 +57,30 @@ def test_masked_ce_equals_renormalized_legal_softmax():
 
     ce, pen = PT(None, logits, targets, mask, _BASE)
 
-    # Reference: log-softmax restricted to the legal sublogits.
-    sub_logp = F.log_softmax(logits[:, legal], dim=1)
-    expected_ce = -(targets[:, legal] * sub_logp).sum(dim=1)
-    torch.testing.assert_close(ce, expected_ce, atol=1e-5, rtol=1e-4)
-
-    # Penalty = full-softmax mass on illegal moves.
+    # CE == the plain full-softmax CE (masking does NOT change it).
+    torch.testing.assert_close(ce, _BASE(logits, targets), atol=1e-6, rtol=1e-4)
+    # Penalty == full-softmax probability mass on illegal moves (positive).
     full = F.softmax(logits, dim=1)
     expected_pen = full.sum(dim=1) - full[:, legal].sum(dim=1)
     torch.testing.assert_close(pen, expected_pen, atol=1e-6, rtol=1e-4)
+    assert (pen > 0).all()
 
 
-def test_masked_ce_is_lower_when_illegal_carries_mass():
-    """Renormalizing over legal removes the illegal-mass dilution → lower CE."""
-    torch.manual_seed(2)
-    A = 40
-    logits = torch.randn(8, A)
-    legal = [0, 3, 8, 21, 30]
-    mask = torch.stack([_legal_mask(A, legal)] * 8)
-    targets = torch.zeros(8, A)
-    targets[:, legal] = torch.softmax(torch.randn(8, len(legal)), dim=1)
+def test_full_ce_equals_masked_ce_minus_log_p_legal():
+    """The decomposition that motivates (a): full_CE = masked_CE - log P(legal).
+    Renormalizing the CE over legal moves drops the -log P(legal) legality term,
+    which is exactly the signal that teaches the head to suppress illegal moves."""
+    torch.manual_seed(3)
+    A = 24
+    logits = torch.randn(5, A)
+    legal = [1, 4, 9, 15, 20]
+    targets = torch.zeros(5, A)
+    targets[:, legal] = torch.softmax(torch.randn(5, len(legal)), dim=1)
 
-    masked_ce, pen = PT(None, logits, targets, mask, _BASE)
-    full_ce = PL(None, logits, targets)
-    # With ~all logits random, illegal moves hold real mass → full CE is larger.
-    assert (masked_ce <= full_ce + 1e-6).all()
-    assert masked_ce.mean() < full_ce.mean()
-    assert (pen > 0).all()  # illegal mass is nonzero under a full softmax
+    full_ce = _BASE(logits, targets)
+    masked_ce = -(targets[:, legal] * F.log_softmax(logits[:, legal], dim=1)).sum(dim=1)
+    log_p_legal = torch.log(F.softmax(logits, dim=1)[:, legal].sum(dim=1))
+    torch.testing.assert_close(full_ce, masked_ce - log_p_legal, atol=1e-5, rtol=1e-4)
 
 
 def test_no_nan_with_extreme_logits():
