@@ -124,6 +124,38 @@ def test_per_ply_window_ramps_delta_toward_the_draw():
     np.testing.assert_allclose(v_far, DRAW, atol=1e-6)  # window plies back → no tilt
 
 
+def test_per_ply_exponential_decay():
+    """decay>0: δ weighted by γ**plies_to_end — full δ at the draw, geometric tail."""
+    g = _draw_selfplay_game(n=6, draw_by_repetition=True)  # L=7, terminal idx 6
+    L = len(g)
+    end = L - 1
+    gamma = 0.9
+    delta = 0.4
+    for p in range(L):
+        plies_to_end = end - p
+        expect_d = delta * (gamma ** plies_to_end)
+        v = _value_at(g, p, repetition_penalty=delta,
+                      repetition_penalty_decay=gamma, selfplay_q_ratio=0.0)
+        np.testing.assert_allclose(
+            v, [0.0, 1.0 - expect_d, expect_d], atol=1e-6,
+            err_msg=f"ply {p}: plies_to_end={plies_to_end}")
+    # Terminal ply gets full δ (γ**0 = 1).
+    v_end = _value_at(g, end, repetition_penalty=delta, repetition_penalty_decay=gamma,
+                      selfplay_q_ratio=0.0)
+    np.testing.assert_allclose(v_end, [0.0, 0.6, 0.4], atol=1e-6)
+
+
+def test_decay_takes_precedence_over_window():
+    """When both set, exponential decay wins (no hard cutoff)."""
+    g = _draw_selfplay_game(n=4, draw_by_repetition=True)  # L=5, terminal idx 4
+    end = len(g) - 1
+    # window=1 would zero everything >1 ply back; decay=0.9 must override that.
+    v = _value_at(g, 0, repetition_penalty=0.5, repetition_penalty_window=1,
+                  repetition_penalty_decay=0.9, selfplay_q_ratio=0.0)
+    expect_d = 0.5 * (0.9 ** end)  # 4 plies back, geometric (not zero)
+    np.testing.assert_allclose(v, [0.0, 1.0 - expect_d, expect_d], atol=1e-6)
+
+
 def test_window_zero_is_uniform_legacy():
     """window=0 reproduces the uniform full-δ tilt on every ply."""
     g = _draw_selfplay_game(n=5, draw_by_repetition=True)

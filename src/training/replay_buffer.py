@@ -182,7 +182,8 @@ class GameHistory:
                     warmstart_q_ratio: float | None = None,
                     selfplay_q_ratio: float | None = None,
                     repetition_penalty: float = 0.0,
-                    repetition_penalty_window: int = 0):
+                    repetition_penalty_window: int = 0,
+                    repetition_penalty_decay: float = 0.0):
         """Create training target for a given position.
 
         Args:
@@ -242,6 +243,7 @@ class GameHistory:
         # insufficient-material / ply-cap draws. δ=0 reproduces prior behavior.
         rep_delta = float(min(max(repetition_penalty, 0.0), 1.0))
         rep_window = int(max(repetition_penalty_window, 0))
+        rep_decay = float(min(max(repetition_penalty_decay, 0.0), 1.0))
         # Final ply index (terminal/drawn position is at len-1) for per-ply ramp.
         rep_end_idx = len(self) - 1
 
@@ -292,9 +294,13 @@ class GameHistory:
             if (rep_delta > 0.0 and self.game_outcome == 0.0
                     and (self.draw_by_repetition or self.draw_by_no_progress)):
                 # Per-ply shuffle-depth weighting: full δ at the drawn position,
-                # ramping linearly to 0 over `rep_window` plies before it. window=0
-                # ⇒ weight 1 everywhere (uniform/legacy).
-                if rep_window > 0:
+                # decaying backward. Exponential (decay**plies_to_end, preferred —
+                # discount-style soft tail) takes precedence over the linear window;
+                # both off ⇒ weight 1 everywhere (uniform/legacy).
+                if rep_decay > 0.0:
+                    plies_to_end = rep_end_idx - ply_idx
+                    weight = rep_decay ** plies_to_end
+                elif rep_window > 0:
                     plies_to_end = rep_end_idx - ply_idx
                     weight = max(0.0, 1.0 - plies_to_end / float(rep_window))
                 else:
@@ -573,6 +579,7 @@ class ReplayBuffer:
         selfplay_q_ratio: float | None = None,
         repetition_penalty: float = 0.0,
         repetition_penalty_window: int = 0,
+        repetition_penalty_decay: float = 0.0,
         build_legal_masks: bool = False,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
@@ -672,6 +679,7 @@ class ReplayBuffer:
                 selfplay_q_ratio=selfplay_q_ratio,
                 repetition_penalty=repetition_penalty,
                 repetition_penalty_window=repetition_penalty_window,
+                repetition_penalty_decay=repetition_penalty_decay,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)

@@ -217,25 +217,30 @@ watch whether decisive-game fraction actually rises and whether the health probe
 shows over-pessimism on known-drawn endgames. Sequence AFTER the masking fix —
 masking attacks the cause (policy can't convert); illegal-repetition the symptom.
 
-## PROPOSED next run (queued — not yet launched, 2026-06-16)
-Three changes vs the current `noprogpen` run, all justified above:
-1. `--mask-illegal-policy` — the policy fix (reclaim 17% illegal mass, sharpen the
-   legal policy). Headline change; untested → the high-leverage one.
-2. `--warmstart-sample-frac 0.2` (down from 0.4) — fade the diffuse Stockfish-soft
-   anchor in phase 2 so MCTS drives the policy (only affects phase 2; phase 1 is
-   100% warmstart by construction). Keep at 0.2 not 0 → retain value anchoring.
-3. `--repetition-penalty 0.35` (up from 0.2) — crank the SURGICAL knob (threefold
-   + 75-move only). Between-run data (noprogpen δ=.2 vs fillbuf baseline) showed
-   ~0.05–0.10 lower draws and ~3× more white wins at 20–22k → weak-but-real
-   effect, worth cranking. Stay ≤~0.4 to avoid mislabeling genuine draws.
-   PLUS `--repetition-penalty-window 20` (NEW, IMPLEMENTED) — per-ply shuffle-depth
-   weighting: the δ tilt is no longer uniform across the whole game but RAMPED by
-   proximity to the draw (full δ=0.35 at the terminal draw position, linearly → 0
-   for plies ≥20 before the end). Better credit assignment — blames the shuffle,
-   not the opening — without dropping the 0.35 strength where it matters.
-HOLD fixed for attribution: `draw_score=-0.05` (global contempt — surgical δ is
-safer than cranking global contempt), `selfplay_q_ratio=0.1`, warmup 15000,
-warmstart-buffer-size 300.
+## PROPOSED next run (queued — not yet launched; revised 2026-06-16 post 3-run comparison)
+Revised after `run_comparison_2026_06_16.md`, which corrected the framing: (a) BOTH
+noprog & fillbuf carry `draw_score=-0.05` (we never tested contempt=0); (b) the
+penalty effect is WITHIN NOISE; (c) the two-pool anchor DECISIVELY prevents value
+collapse (qratio, no anchor, collapsed to a constant near-draw predictor by 24k;
+both anchored runs stayed calibrated); (d) draining the anchor did NOT genuinely
+sharpen the policy (qratio's lower entropy was a value-collapse artifact) — the
+diffuse policy is universal and untouched in all three runs.
+1. `--mask-illegal-policy` — THE headline change. The diffuse-policy bottleneck is
+   universal (legal-only entropy 2.4–2.9, 10–17% illegal mass, policy↔Q ≤0.15) and
+   untouched by anything tried; masking is the only lever aimed at it.
+2. `--warmstart-sample-frac 0.3` (down from 0.4) — GENTLE fade only. The anchor is
+   what protects the value head (proven), and draining it does NOT sharpen the
+   policy, so this is a cautious half-step, not the policy fix it was framed as.
+   Monitor `value/target_std` — if it slips, the fade went too far.
+3. `--repetition-penalty 0.35` + `--repetition-penalty-decay 0.93` (NEW) — surgical
+   δ (threefold + 75-move) with EXPONENTIAL per-ply weighting (discount-style):
+   full δ=0.35 at the drawn position, γ=0.93 geometric decay backward (half-strength
+   ~9.6 plies back, soft tail — penalizes a long no-progress shuffle over its whole
+   length, unlike the linear window's hard cutoff). Expectations TEMPERED: the
+   penalty effect is within noise; per-ply weighting makes it better-targeted, not
+   guaranteed-effective. Low-cost secondary test riding the masking run.
+HOLD fixed: `draw_score=-0.05`, `selfplay_q_ratio=0.1`, warmup 15000,
+warmstart-buffer-size 300. (Net: masking is the one big variable → clean attribution.)
 
 Full command (swap run-id):
 ```
@@ -244,21 +249,20 @@ Full command (swap run-id):
   --stockfish-injection-path data/stockfish_injection \
   --stockfish-injection-games 300 --stockfish-injection-interval 256 \
   --self-play-warmup-steps 15000 --warmstart-buffer-size 300 \
-  --warmstart-sample-frac 0.2 --repetition-penalty 0.35 \
-  --repetition-penalty-window 20 \
+  --warmstart-sample-frac 0.3 --repetition-penalty 0.35 \
+  --repetition-penalty-decay 0.93 \
   --mask-illegal-policy
 ```
-Watch: `policy/illegal_mass` (should fall toward 0), `policy/entropy_pred`
-(should drop below noprogpen's ~3.5 as the policy sharpens), `value/target_std`
-(must NOT crater from the warmstart fade — the masking bet is that a sharper
-policy → decisive self-play → value signal replaces the fading anchor), and the
-draw-rate/decisiveness trend vs noprogpen at matched steps.
+Watch: `policy/illegal_mass` (→0), `policy/entropy_pred` (should drop below
+noprogpen's ~3.5 if masking sharpens the policy), `value/target_std` (must NOT
+crater from the 0.3 fade — the anchor's protective job), and the draw/decisiveness
+trend vs noprogpen at matched steps.
 Optional fast sanity check first: fine-tune from `noprogpen` ~24k+ checkpoint with
 `--mask-illegal-policy` for a few k steps — if illegal_mass drops and entropy_pred
 falls, the mechanism is confirmed cheaply before the full fresh 2-phase run.
 
-(δ=0.35 is my proposed crank — adjust if the overnight `noprogpen` eval trend
-changes the picture.)
+δ exponential schedule (δ=0.35, γ=0.93): plies-before-draw → δ: 0→.350, 2→.303,
+5→.243, 10→.169, 20→.082, 30→.040, 50→.009.
 
 ## Follow-up: per-MOVE reward-head shaping (sequenced escalation after per-ply δ)
 The per-ply δ weighting (above, implemented) localizes credit to shuffle

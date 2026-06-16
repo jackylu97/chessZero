@@ -138,14 +138,17 @@ the policy is still diffuse everywhere). qratio@24k would fail value gates.
 | qratio @16k | 2.68 | 0.176 | 0.229 | 0.126 | 0.187 | 0.103 |
 | **qratio @24k** | 2.39 | 0.101 | 0.283 | **0.042** | **0.046** | **0.054** |
 | fillbuf @24k | 2.78 | 0.166 | 0.202 | 0.066 | 0.141 | 0.146 |
-| noprog @24k | <NOPROG_ENT> | <NOPROG_ILL> | <NOPROG_TOP> | <NOPROG_QSPREAD> | <NOPROG_ROOTSTD> | <NOPROG_CORR> |
+| noprog @24k | 2.86 | 0.174 | 0.187 | **0.201** | **0.218** | **0.154** |
 
 Confirms the value-collapse story from the other side: qratio@24k Q-spread 0.042 and root-V std
 0.046 mean "every move looks identically drawish" — the dynamics/value has **no signal left** to
-distill, and policy↔Q corr 0.054 ≈ 0. fillbuf@24k retains Q-spread/root-V-std an order of
-magnitude larger and a higher (still weak) policy↔Q corr 0.146. **Across the board the policy is
+distill, and policy↔Q corr 0.054 ≈ 0. Both anchored runs retain Q-spread/root-V-std several×
+larger and a higher (still weak) policy↔Q corr. **noprog@24k has the *strongest* value signal of
+the three** (Q-spread 0.201, root-V std 0.218, corr 0.154 — vs fillbuf 0.066/0.141/0.146), a mild
+edge consistent with the repetition penalty keeping more decisive value gradient, though it is a
+single-checkpoint n and within the broader run-to-run noise. **Across the board the policy is
 diffuse and barely value-correlated in every run** (corr ≤ 0.15, illegal mass 10-17%, top-legal
-prob 0.20-0.28) — the known policy bottleneck — but only qratio has *also* lost the value signal
+prob 0.19-0.28) — the known policy bottleneck — but only qratio has *also* lost the value signal
 the policy would distill.
 
 ---
@@ -169,15 +172,18 @@ warmup length are minor; the buffer-composition (`batch_warmstart_frac` 0.0 vs 0
 mechanism that maps directly onto the value-collapse divergence.
 
 ### Contrast B — repetition penalty δ=0.2 (noprog vs fillbuf)
-**No measurable improvement at matched steps; inconclusive / within noise.** Draw rate
-0.885 vs 0.911 and p1_win 0.064 vs 0.047 are inside the ±0.07 eval band. Value health is
-comparable (corr 0.863 vs 0.890; noprog's midgame V-spread is actually a bit *lower*, 0.085 vs
-0.214 — noisy n=4). noprog's threefold-draw share *rises* to 0.93 by 24k. The penalty is doing
-what it mechanically should (re-weighting threefold/75-move draw targets) but has **not** yet
-produced fewer draws or more decisive play in the 16-24k window. There is **no evidence** δ=0.2
-improved policy/value learning over plain fillbuf; equally no evidence it hurt. (Note: the
-intended "contempt" knob `draw_score=-0.05` is on in *both* runs, so this contrast does **not**
-test contempt.)
+**Mixed / mostly within noise, with one weak positive signal.** On *outcomes* there is no
+measurable improvement: draw rate 0.885 vs 0.911 and p1_win 0.064 vs 0.047 are inside the ±0.07
+eval band, and noprog's threefold-draw share actually *rises* to 0.93 by 24k. On *value-signal
+sharpness* the on-policy probe gives noprog the **best** Q-spread/root-V-std/policy↔Q-corr of all
+three at 24k (0.201 / 0.218 / 0.154 vs fillbuf 0.066 / 0.141 / 0.146) — i.e. the penalty appears
+to preserve a bit more decisive value gradient — but the health-probe midgame V-spread is
+conversely *lower* (0.085 vs 0.214), so on a single-checkpoint n the two value readouts disagree
+and the net effect is **not conclusively positive**. Best read: the penalty is doing what it
+mechanically should (re-weighting threefold/75-move draw targets, slightly more value contrast)
+but has **not** translated into fewer draws or more decisive self-play in the 16-24k window. No
+evidence it hurt. (Note: the intended "contempt" knob `draw_score=-0.05` is on in *both* runs, so
+this contrast tests the repetition penalty **alone**, not contempt.)
 
 ### Overall verdict
 **Policy/value learning improved in exactly one dimension — value-head health — and the

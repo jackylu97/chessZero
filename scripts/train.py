@@ -130,6 +130,12 @@ def main():
                              "terminal drawn position, linearly →0 for plies >= window "
                              "before it (per-ply shuffle-depth credit assignment). "
                              "0 (default) = uniform δ on every ply (legacy).")
+    parser.add_argument("--repetition-penalty-decay", type=float, default=None,
+                        help="Override config.repetition_penalty_decay (γ). >0 weights "
+                             "the repetition δ by γ**plies_to_end — full δ at the drawn "
+                             "position, geometric soft-tail decay backward (discount-style; "
+                             "takes precedence over --repetition-penalty-window). "
+                             "γ=0.93 ≈ half-strength 9.5 plies back. 0 (default) = inactive.")
     parser.add_argument("--mask-illegal-policy", action="store_true", default=False,
                         help="Enable legal-move policy masking (config.mask_illegal_policy). "
                              "The policy CE is renormalized over LEGAL moves only and an "
@@ -232,6 +238,8 @@ def main():
         config.repetition_penalty = args.repetition_penalty
     if args.repetition_penalty_window is not None:
         config.repetition_penalty_window = args.repetition_penalty_window
+    if args.repetition_penalty_decay is not None:
+        config.repetition_penalty_decay = args.repetition_penalty_decay
     if args.mask_illegal_policy:
         config.mask_illegal_policy = True
     if args.illegal_policy_penalty is not None:

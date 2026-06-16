@@ -240,6 +240,20 @@ class MuZeroConfig:
     # symmetric (weight depends only on ply position, not side to move).
     repetition_penalty_window: int = 0
 
+    # Exponential variant of the per-ply weighting (preferred — matches the RL
+    # discount factor, the textbook way to concentrate a terminal outcome near the
+    # terminal; AlphaZero's pure-z uses γ=1 i.e. no concentration). When > 0, δ is
+    # weighted by repetition_penalty_decay ** plies_to_end:
+    #     plies_to_end = (L - 1) - p
+    #     weight       = repetition_penalty_decay ** plies_to_end
+    #     δ_p          = repetition_penalty * weight
+    # Full δ at the drawn position, geometric soft-tail decay backward (no hard
+    # cutoff — so a long no-progress shuffle still gets a decaying penalty over its
+    # whole length, unlike the linear window). γ=0.93 → half-strength ~9.5 plies
+    # (≈5 moves) back, ~0.23 at 20 plies. Takes precedence over the linear window
+    # when both are set. 0.0 (default) = inactive. Clamped to [0, 1].
+    repetition_penalty_decay: float = 0.0
+
     # Legal-move policy masking. Chess exposes a 4672-action space of which only
     # ~33 are legal at any position (99% illegal). Reference MuZero impls
     # (muzero-general, LightZero, DeepMind pseudocode) mask only at the MCTS root
