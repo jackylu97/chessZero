@@ -170,7 +170,13 @@ def test_tensor_mcts_root_breadth_matches_batched(add_noise):
 
     bm_mean_breadth = float(np.mean(bm_breadths))
     tm_mean_breadth = float(np.mean(tm_breadths))
-    tm_max_share = float(np.max(tm_shares))
+    # Per-position EXCESS of TensorMCTS's top-share over the oracle's. The bug
+    # signature is TM near-one-hot (~90%) while the oracle spreads (~30%). A
+    # legitimately-sharp network peaks on BOTH engines, so compare to the oracle
+    # rather than an absolute cap — an absolute 0.85 cap is sensitive to how sharp
+    # the loaded `cands[-1]` checkpoint happens to be, which made this test flaky
+    # across training progress (it tripped on a sharper checkpoint, passed on others).
+    tm_share_excess = float(np.max(np.array(tm_shares) - np.array(bm_shares)))
 
     # Sanity: the oracle itself must actually be exploring broadly on these
     # positions, otherwise the comparison is vacuous.
@@ -190,9 +196,10 @@ def test_tensor_mcts_root_breadth_matches_batched(add_noise):
         f"actions while BatchedMCTS explored {bm_mean_breadth:.1f}"
     )
 
-    # (2) TensorMCTS must NOT dump >85% of visits onto a single action on any
-    #     position where the oracle spreads them.
-    assert tm_max_share <= 0.85, (
-        f"TensorMCTS put {tm_max_share:.0%} of visits on one action on some "
-        "position (near-one-hot collapse — the prior-fragmentation bug)"
+    # (2) TensorMCTS must NOT peak FAR more than the oracle on any position
+    #     (the prior-fragmentation signature: TM near-one-hot while BM spreads).
+    #     Relative to the oracle so a legitimately-sharp checkpoint doesn't trip it.
+    assert tm_share_excess <= 0.40, (
+        f"TensorMCTS top-share exceeds the oracle's by {tm_share_excess:.0%} on "
+        "some position (TM peaking far more than BatchedMCTS — prior-fragmentation)"
     )
