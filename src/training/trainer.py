@@ -128,6 +128,7 @@ class MuZeroTrainer:
         self.replay_buffer = ReplayBuffer(
             config.replay_buffer_size,
             warmstart_max_size=getattr(config, "warmstart_buffer_size", None),
+            decisive_retention_multiplier=getattr(config, "decisive_retention_multiplier", 1.0),
         )
         # Two-phase buffer sizing: during the supervised warmstart phase there is
         # no self-play to protect the anchor from, so let warmstart games fill the

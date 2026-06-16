@@ -29,6 +29,10 @@ class GameHistory:
     # shuffle penalty). NOT set for stalemate / insufficient-material / ply-cap.
     draw_by_repetition: bool = False
     draw_by_no_progress: bool = False
+    # Monotonic insertion counter, stamped by ReplayBuffer.save_game and used by
+    # the buffer's retention-weighted eviction (decisive games age slower).
+    # Runtime-only — not serialized in the compact dict; reassigned on load().
+    birth: int = 0
 
     def __len__(self) -> int:
         return len(self.observations)
@@ -495,8 +499,17 @@ class ReplayBuffer:
     With alpha=0 or beta=1, degrades gracefully to uniform sampling.
     """
 
-    def __init__(self, max_size: int, warmstart_max_size: int | None = None):
+    def __init__(self, max_size: int, warmstart_max_size: int | None = None,
+                 decisive_retention_multiplier: float = 1.0):
         self.max_size = max_size
+        # Retention "lives": when > 1, a DECISIVE game's age counts this many times
+        # slower for eviction, so it survives ~M× longer than a drawn game (lifting
+        # the buffer's decisive-game density). 1.0 = plain oldest-first FIFO.
+        # Steady-state decisive buffer fraction with decisive inflow d:
+        #   d*M / (d*M + (1-d))   → at d=0.05: M=3→14%, M=7→27%, M=14→42%.
+        self.decisive_retention_multiplier = float(decisive_retention_multiplier)
+        # Monotonic counter stamped onto each game's `birth` for age-based eviction.
+        self._save_counter = 0
         # Two-pool FIFO mode. When ``warmstart_max_size`` is set, the buffer is
         # logically partitioned by ``external_values``: warmstart games (set)
         # vs self-play games (unset). Each pool evicts independently within its
@@ -510,15 +523,39 @@ class ReplayBuffer:
         self._priorities: list[float] = []
         self.total_games = 0
 
+    def _eviction_victim(self, is_warm: bool | None) -> int | None:
+        """Index of the game to evict among the candidate pool.
+
+        Evicts the game with the largest ``age / retention_weight`` — i.e. the one
+        that has overstayed its allowance the most. ``age`` = saves since insertion;
+        ``weight`` = decisive_retention_multiplier for DECISIVE games, 1 for draws.
+        So decisive games are evicted only once they're ~M× older than a draw would
+        be → they persist ~M× longer. With multiplier 1.0 this is plain oldest-first.
+
+        ``is_warm`` selects the pool (True/False); None = legacy single pool.
+        """
+        M = self.decisive_retention_multiplier
+        best_i, best_score = None, -1.0
+        for i, g in enumerate(self.buffer):
+            if is_warm is not None and bool(g.external_values) != is_warm:
+                continue
+            age = self._save_counter - g.birth
+            weight = M if (M > 1.0 and g.game_outcome != 0.0) else 1.0
+            score = age / weight
+            if score > best_score:
+                best_score, best_i = score, i
+        return best_i
+
     def save_game(self, game_history: GameHistory):
         # New games get max current priority so they're sampled at least once
         max_p = max(self._priorities) if self._priorities else 1.0
+        game_history.birth = self._save_counter
+        self._save_counter += 1
         is_warm = bool(game_history.external_values)
         if self.warmstart_max_size is not None:
-            # Two-pool eviction: count games in the relevant pool; if at cap,
-            # evict the oldest game in THAT pool only. Cross-pool eviction
-            # never happens, so a warmstart game cannot be displaced by an
-            # incoming self-play game (or vice versa).
+            # Two-pool eviction: if the relevant pool is at cap, evict within THAT
+            # pool only (warmstart games can never be displaced by self-play). The
+            # victim is retention-weighted (decisive games persist M× longer).
             sp_max = self.max_size - self.warmstart_max_size
             cap = self.warmstart_max_size if is_warm else sp_max
             cur = sum(
@@ -526,16 +563,17 @@ class ReplayBuffer:
                 if bool(g.external_values) == is_warm
             )
             if cur >= cap:
-                for i, g in enumerate(self.buffer):
-                    if bool(g.external_values) == is_warm:
-                        self.buffer.pop(i)
-                        self._priorities.pop(i)
-                        break
+                victim = self._eviction_victim(is_warm)
+                if victim is not None:
+                    self.buffer.pop(victim)
+                    self._priorities.pop(victim)
         else:
-            # Legacy single-pool FIFO eviction.
+            # Legacy single-pool eviction (retention-weighted; M=1 ⇒ FIFO).
             if len(self.buffer) >= self.max_size:
-                self.buffer.pop(0)
-                self._priorities.pop(0)
+                victim = self._eviction_victim(None)
+                if victim is not None:
+                    self.buffer.pop(victim)
+                    self._priorities.pop(victim)
         self.buffer.append(game_history)
         self._priorities.append(max_p)
         self.total_games += 1
@@ -822,6 +860,11 @@ class ReplayBuffer:
                     record = GameHistory.from_compact_dict(record, game)
                 self.buffer.append(record)
                 self._priorities.append(priority)
+            # Reassign monotonic birth stamps in load order (relative age preserved)
+            # so retention-weighted eviction works after a resume.
+            for i, g in enumerate(self.buffer):
+                g.birth = i
+            self._save_counter = len(self.buffer)
 
     def load_warmstart_games(self, paths: list[Path | str], game=None) -> int:
         """Load pickled shards of GameHistory objects into the buffer.

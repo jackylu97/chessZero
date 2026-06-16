@@ -145,6 +145,11 @@ def main():
     parser.add_argument("--illegal-policy-penalty", type=float, default=None,
                         help="Override config.illegal_policy_penalty (weight on the "
                              "illegal-mass penalty; only active with --mask-illegal-policy).")
+    parser.add_argument("--decisive-retention-multiplier", type=float, default=None,
+                        help="Override config.decisive_retention_multiplier (M). >1 keeps "
+                             "DECISIVE games in the replay buffer ~M× longer than draws "
+                             "(retention-weighted eviction), raising decisive density. "
+                             "1.0 = FIFO. At ~5%% decisive inflow: M=7 → ~27%% of buffer decisive.")
     parser.add_argument("--warmstart-buffer-size", type=int, default=None,
                         help="Override config.warmstart_buffer_size. Enables the "
                              "TWO-POOL buffer: this many slots are reserved for "
@@ -240,6 +245,8 @@ def main():
         config.repetition_penalty_window = args.repetition_penalty_window
     if args.repetition_penalty_decay is not None:
         config.repetition_penalty_decay = args.repetition_penalty_decay
+    if args.decisive_retention_multiplier is not None:
+        config.decisive_retention_multiplier = args.decisive_retention_multiplier
     if args.mask_illegal_policy:
         config.mask_illegal_policy = True
     if args.illegal_policy_penalty is not None:

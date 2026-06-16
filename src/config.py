@@ -308,6 +308,17 @@ class MuZeroConfig:
     # overfits the small decisive-game set. See deferred_decisive_game_prioritization.
     decisive_sample_frac: float = 0.0
 
+    # Retention "lives" for decisive games in the replay buffer. When > 1, a
+    # DECISIVE game's age counts this many times slower for eviction, so it stays
+    # in the buffer ~M× longer than a drawn game — raising the buffer's decisive
+    # density at the RETENTION level (complements decisive_sample_frac, which acts
+    # at SAMPLE time, and the warmstart anchor, which acts at GENERATION time).
+    # Steady-state decisive buffer fraction with decisive inflow d:
+    #   d*M / (d*M + (1-d))  → at d=0.05: M=3→14%, M=7→27%, M=14→42%.
+    # 1.0 (default) = plain oldest-first FIFO. Tune down if the value overfits the
+    # retained decisive set; tune up for more decisive density.
+    decisive_retention_multiplier: float = 1.0
+
     # AlphaZero-style history encoding: stack the last N ply observations
     # along the channel dimension before passing to the network. Newest
     # frame first. Missing frames (early game) zero-padded.
