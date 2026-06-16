@@ -19,7 +19,7 @@ from ..config import MuZeroConfig
 from ..games.base import Game
 from ..model.muzero_net import MuZeroNetwork
 from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar, inverse_scalar_transform
-from .replay_buffer import ReplayBuffer, _iter_shard_games
+from .replay_buffer import ReplayBuffer, _iter_shard_games, _shard_record_count
 from .representation_probe import compute_repr_metrics
 from .self_play import run_self_play
 
@@ -563,18 +563,28 @@ class MuZeroTrainer:
         need to discard already-consumed games. Loads and throws away whole
         shards; the final partial shard is retained in ``_injection_shard_games``.
         """
+        # Skip whole already-consumed shards CHEAPLY via their header record-count
+        # (no per-game reconstruction). Only the final partial shard is loaded and
+        # reconstructed. Previously this loaded+reconstructed every skipped shard —
+        # replaying ~19k games' moves through the CPU engine on resume, which
+        # looked like a multi-minute hang (GPU idle, CPU pegged).
         skipped = 0
         target = self._injection_loaded
         while skipped < target:
-            if not self._advance_injection_shard():
+            if self._injection_shard_idx >= len(self._injection_shards):
                 # Cursor exceeds pool — shard list shrank between runs. Give up.
                 self._injection_shards = []
                 return
-            shard_size = len(self._injection_shard_games)
-            if skipped + shard_size <= target:
-                skipped += shard_size
-                self._injection_shard_games = []
+            path = self._injection_shards[self._injection_shard_idx]
+            count = _shard_record_count(path)
+            if skipped + count <= target:
+                # Whole shard already consumed — advance index, no reconstruction.
+                skipped += count
+                self._injection_shard_idx += 1
             else:
+                # Partial shard straddles the cursor: reconstruct THIS one (advances
+                # the index) and drop the already-consumed prefix.
+                self._advance_injection_shard()
                 drop = target - skipped
                 self._injection_shard_games = self._injection_shard_games[drop:]
                 return

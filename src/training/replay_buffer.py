@@ -489,6 +489,28 @@ def _iter_shard_games(path: str | Path, game=None):
             )
 
 
+def _shard_record_count(path: "str | Path") -> int:
+    """Number of games in a shard, read CHEAPLY — no per-game reconstruction.
+
+    Used by injection fast-forward on resume to skip already-consumed shards
+    without replaying every game's moves through the engine (the cause of the
+    resume hang: reconstructing ~19k games just to discard them).
+
+    v2 compact shard: returns only the header's ``n_records`` (one pickle read).
+    Legacy list shard: loads the list (no move-replay) and returns its length.
+    """
+    with open(path, "rb") as f:
+        first = pickle.load(f)
+        if isinstance(first, list):
+            return len(first)
+        if isinstance(first, dict) and first.get("version") == 2:
+            return int(first["n_records"])
+        raise TypeError(
+            f"{path}: unrecognized shard format "
+            f"(got {type(first).__name__}, expected list or version-2 header dict)"
+        )
+
+
 class ReplayBuffer:
     """Fixed-size replay buffer with Prioritized Experience Replay (PER).
 
