@@ -698,6 +698,7 @@ class MuZeroTrainer:
             warmstart_q_ratio=getattr(self.config, "warmstart_q_ratio", None),
             selfplay_q_ratio=getattr(self.config, "selfplay_q_ratio", None),
             repetition_penalty=getattr(self.config, "repetition_penalty", 0.0),
+            repetition_penalty_window=int(getattr(self.config, "repetition_penalty_window", 0)),
             build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
         )
 

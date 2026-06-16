@@ -223,6 +223,23 @@ class MuZeroConfig:
     # via --repetition-penalty (presets stay at 0.0).
     repetition_penalty: float = 0.0
 
+    # Per-ply shuffle-depth weighting for the repetition penalty. The uniform δ
+    # tilt blames every ply of a 3fold/no-progress game equally — including the
+    # opening, which did not cause the shuffle (poor credit assignment, slow to
+    # learn). When repetition_penalty_window > 0, δ is instead RAMPED by proximity
+    # to the draw: full δ at the terminal (drawn) position, decaying LINEARLY to 0
+    # for plies `repetition_penalty_window` or more before the end. Concretely, at
+    # ply p in a game of length L (= len(observations), terminal at L-1):
+    #     plies_to_end = (L - 1) - p
+    #     weight       = max(0, 1 - plies_to_end / window)
+    #     δ_p          = repetition_penalty * weight
+    # so the per-ply decay is repetition_penalty/window of δ removed per ply moved
+    # back from the draw. window=20 → full δ at the draw, 0 at 20 plies before it
+    # (≈ the last 10 full moves — covers a 3fold cycle and the tail of a no-progress
+    # run). 0 (default) = uniform/legacy behavior (every ply gets full δ). STM-
+    # symmetric (weight depends only on ply position, not side to move).
+    repetition_penalty_window: int = 0
+
     # Legal-move policy masking. Chess exposes a 4672-action space of which only
     # ~33 are legal at any position (99% illegal). Reference MuZero impls
     # (muzero-general, LightZero, DeepMind pseudocode) mask only at the MCTS root

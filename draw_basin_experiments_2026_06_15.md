@@ -228,6 +228,11 @@ Three changes vs the current `noprogpen` run, all justified above:
    + 75-move only). Between-run data (noprogpen δ=.2 vs fillbuf baseline) showed
    ~0.05–0.10 lower draws and ~3× more white wins at 20–22k → weak-but-real
    effect, worth cranking. Stay ≤~0.4 to avoid mislabeling genuine draws.
+   PLUS `--repetition-penalty-window 20` (NEW, IMPLEMENTED) — per-ply shuffle-depth
+   weighting: the δ tilt is no longer uniform across the whole game but RAMPED by
+   proximity to the draw (full δ=0.35 at the terminal draw position, linearly → 0
+   for plies ≥20 before the end). Better credit assignment — blames the shuffle,
+   not the opening — without dropping the 0.35 strength where it matters.
 HOLD fixed for attribution: `draw_score=-0.05` (global contempt — surgical δ is
 safer than cranking global contempt), `selfplay_q_ratio=0.1`, warmup 15000,
 warmstart-buffer-size 300.
@@ -240,6 +245,7 @@ Full command (swap run-id):
   --stockfish-injection-games 300 --stockfish-injection-interval 256 \
   --self-play-warmup-steps 15000 --warmstart-buffer-size 300 \
   --warmstart-sample-frac 0.2 --repetition-penalty 0.35 \
+  --repetition-penalty-window 20 \
   --mask-illegal-policy
 ```
 Watch: `policy/illegal_mass` (should fall toward 0), `policy/entropy_pred`
@@ -253,3 +259,28 @@ falls, the mechanism is confirmed cheaply before the full fresh 2-phase run.
 
 (δ=0.35 is my proposed crank — adjust if the overnight `noprogpen` eval trend
 changes the picture.)
+
+## Follow-up: per-MOVE reward-head shaping (sequenced escalation after per-ply δ)
+The per-ply δ weighting (above, implemented) localizes credit to shuffle
+*positions* but is still a VALUE target, gated by the value→MCTS→policy uptake.
+The reward head is the per-MOVE version and is WDL-compatible (corrected: it does
+NOT conflict with the WDL value head): MCTS already computes
+`Q(a) = reward(s,a) − γ·V(next)`, so a reward head trained to predict a small
+negative reward on shuffle / no-progress transitions would steer the SEARCH
+directly at decision time, while the value head stays WDL/pure-z. "Did this move
+repeat / fail to progress?" is a local, easy prediction → should learn FASTER
+than the value head learns the outcome tilt (directly addresses the "won't see it
+until later" timescale concern).
+
+Cost / why it's sequenced (not bundled): requires enabling `reward_support_size>1`
+(currently 1 = off), defining per-transition reward targets, and tuning the
+shaping scale (too strong → reward hacking / value distortion). Deserves an
+ISOLATED run for attribution + scale tuning — do NOT bundle with masking + fade +
+per-ply δ.
+
+DECISION RULE (after the masking + per-ply-δ run, probe the value head):
+- value devalues shuffle positions AND draws fall → done, reward head not needed.
+- value devalues shuffle positions BUT draws persist → not a credit-assignment
+  problem; denser signal won't help either — look elsewhere (policy capacity, sims).
+- value STILL can't learn the shuffle signal fast enough to matter → per-move
+  density is justified → reward head becomes the isolated next experiment.
