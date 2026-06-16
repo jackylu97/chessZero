@@ -191,9 +191,19 @@ On-policy probe at 22k (`scripts/probe_policy_value_consistency.py`):
   value-best.
 Reference impls (muzero-general, LightZero, DeepMind pseudocode) do NOT mask the
 policy loss — fine when ~all actions are legal (Atari/small boards), weak for
-chess (99% illegal). Fix: `config.mask_illegal_policy` — masked-softmax CE over
-legal moves + illegal-mass penalty, using stored `legal_actions_list`. Logs
-`policy/illegal_mass`. Opt-in `--mask-illegal-policy`.
+chess (99% illegal). Fix: `config.mask_illegal_policy` — keep the standard
+FULL-softmax CE (which learns legality for free via the shared normalizer) and
+ADD an illegal-mass penalty on top, driving illegal_mass below the CE's ~17%
+floor; uses stored `legal_actions_list`. Logs `policy/illegal_mass`. Opt-in
+`--mask-illegal-policy`.
+
+IMPORTANT (fix 2026-06-16, commit 93f0b30): the first implementation RENORMALIZED
+the CE softmax over legal moves — that is shift-invariant over the legal logits
+and gives illegal logits zero gradient, so it CANNOT teach legality (caught live:
+`policy/illegal_mass` frozen at ~0.98, `entropy_pred` pinned at log(4672) for 700
+steps). Root cause is exact: full_CE = masked_CE − log P(legal); renormalizing
+drops the −log P(legal) legality term. Corrected to full-softmax CE + penalty,
+which immediately drops illegal_mass (0.99→0.90 by step 300, accelerating).
 
 ### The penalty RELOCATES draws, doesn't reduce them
 Phase-2 trajectory (15k→23k): no-progress draws 0.08→**0.00** (δ penalty worked),
