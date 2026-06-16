@@ -416,6 +416,16 @@ class MuZeroTrainer:
         self.writer.add_scalar("self_play/draw_computer_rate", computer_draws / n_games, self.global_step)
         self.writer.add_scalar("self_play/draw_plycap_rate", plycap_draws / n_games, self.global_step)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
+        # Buffer composition: fraction of self-play (non-warmstart) games in the
+        # buffer that are decisive — the quantity decisive_retention_multiplier is
+        # meant to lift (vs the ~self-play draw rate it would otherwise track).
+        _sp = [g for g in self.replay_buffer.buffer if not g.external_values]
+        if _sp:
+            self.writer.add_scalar(
+                "self_play/buffer_decisive_frac",
+                sum(1 for g in _sp if g.game_outcome != 0.0) / len(_sp),
+                self.global_step,
+            )
         # Throughput — self-play is the wall-clock bottleneck; track it explicitly.
         self.writer.add_scalar("self_play/seconds", sp_secs, self.global_step)
         if sp_secs > 0:
