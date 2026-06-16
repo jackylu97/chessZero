@@ -216,3 +216,40 @@ in self-play GENERATION only, keep eval + value targets on honest rules, and
 watch whether decisive-game fraction actually rises and whether the health probe
 shows over-pessimism on known-drawn endgames. Sequence AFTER the masking fix —
 masking attacks the cause (policy can't convert); illegal-repetition the symptom.
+
+## PROPOSED next run (queued — not yet launched, 2026-06-16)
+Three changes vs the current `noprogpen` run, all justified above:
+1. `--mask-illegal-policy` — the policy fix (reclaim 17% illegal mass, sharpen the
+   legal policy). Headline change; untested → the high-leverage one.
+2. `--warmstart-sample-frac 0.2` (down from 0.4) — fade the diffuse Stockfish-soft
+   anchor in phase 2 so MCTS drives the policy (only affects phase 2; phase 1 is
+   100% warmstart by construction). Keep at 0.2 not 0 → retain value anchoring.
+3. `--repetition-penalty 0.35` (up from 0.2) — crank the SURGICAL knob (threefold
+   + 75-move only). Between-run data (noprogpen δ=.2 vs fillbuf baseline) showed
+   ~0.05–0.10 lower draws and ~3× more white wins at 20–22k → weak-but-real
+   effect, worth cranking. Stay ≤~0.4 to avoid mislabeling genuine draws.
+HOLD fixed for attribution: `draw_score=-0.05` (global contempt — surgical δ is
+safer than cranking global contempt), `selfplay_q_ratio=0.1`, warmup 15000,
+warmstart-buffer-size 300.
+
+Full command (swap run-id):
+```
+.venv/bin/python -u scripts/train.py \
+  --game chess --run-id 2026_06_16_maskpolicy_fade \
+  --stockfish-injection-path data/stockfish_injection \
+  --stockfish-injection-games 300 --stockfish-injection-interval 256 \
+  --self-play-warmup-steps 15000 --warmstart-buffer-size 300 \
+  --warmstart-sample-frac 0.2 --repetition-penalty 0.35 \
+  --mask-illegal-policy
+```
+Watch: `policy/illegal_mass` (should fall toward 0), `policy/entropy_pred`
+(should drop below noprogpen's ~3.5 as the policy sharpens), `value/target_std`
+(must NOT crater from the warmstart fade — the masking bet is that a sharper
+policy → decisive self-play → value signal replaces the fading anchor), and the
+draw-rate/decisiveness trend vs noprogpen at matched steps.
+Optional fast sanity check first: fine-tune from `noprogpen` ~24k+ checkpoint with
+`--mask-illegal-policy` for a few k steps — if illegal_mass drops and entropy_pred
+falls, the mechanism is confirmed cheaply before the full fresh 2-phase run.
+
+(δ=0.35 is my proposed crank — adjust if the overnight `noprogpen` eval trend
+changes the picture.)
