@@ -276,27 +276,56 @@ falls, the mechanism is confirmed cheaply before the full fresh 2-phase run.
 δ exponential schedule (δ=0.35, γ=0.93): plies-before-draw → δ: 0→.350, 2→.303,
 5→.243, 10→.169, 20→.082, 30→.040, 50→.009.
 
-## Follow-up: per-MOVE reward-head shaping (sequenced escalation after per-ply δ)
-The per-ply δ weighting (above, implemented) localizes credit to shuffle
-*positions* but is still a VALUE target, gated by the value→MCTS→policy uptake.
-The reward head is the per-MOVE version and is WDL-compatible (corrected: it does
-NOT conflict with the WDL value head): MCTS already computes
-`Q(a) = reward(s,a) − γ·V(next)`, so a reward head trained to predict a small
-negative reward on shuffle / no-progress transitions would steer the SEARCH
-directly at decision time, while the value head stays WDL/pure-z. "Did this move
-repeat / fail to progress?" is a local, easy prediction → should learn FASTER
-than the value head learns the outcome tilt (directly addresses the "won't see it
-until later" timescale concern).
+## Follow-up: POTENTIAL-BASED reward shaping (PBRS) — the principled spec
+Sequenced escalation after the masking+anchor run, if draws persist. Research
+brief 2026-06-16 (Ng/Harada/Russell 1999, "Policy Invariance Under Reward
+Transformations").
 
-Cost / why it's sequenced (not bundled): requires enabling `reward_support_size>1`
-(currently 1 = off), defining per-transition reward targets, and tuning the
-shaping scale (too strong → reward hacking / value distortion). Deserves an
-ISOLATED run for attribution + scale tuning — do NOT bundle with masking + fade +
-per-ply δ.
+REFRAME (important): PBRS does NOT "penalize draws." Our draws are CONVERSION
+FAILURES (Exp A: ~90% winnable), not genuine draws. PBRS gives the search a dense
+per-move gradient toward PROGRESS so the model CONVERTS winnable positions → draws
+fall because wins RISE, not because draws are punished. It is policy-invariant, so
+it provably will NOT bias against genuinely-drawn positions (that would be
+contempt — non-potential-based, objective-distorting, and our δ penalty already
+showed that's a weak/within-noise lever). So PBRS is the right tool for (a)
+convert-winnable; it is NOT a tool for (b) avoid-genuine-draws.
 
-DECISION RULE (after the masking + per-ply-δ run, probe the value head):
-- value devalues shuffle positions AND draws fall → done, reward head not needed.
-- value devalues shuffle positions BUT draws persist → not a credit-assignment
-  problem; denser signal won't help either — look elsewhere (policy capacity, sims).
-- value STILL can't learn the shuffle signal fast enough to matter → per-move
-  density is justified → reward head becomes the isolated next experiment.
+FORM: shaping reward F(s,s') = γ·Φ(s') − Φ(s), Φ a state potential. Ng et al.
+proved this is the necessary+sufficient form for the optimal-policy set to be
+UNCHANGED (telescopes to a trajectory-constant → cannot be hacked / cannot distort
+the optimum). Only naive shaping (r' = r + arbitrary F) hacks/distorts.
+
+CONCRETE (anti-shuffle): Φ(s) = −λ·(no_progress_clock(s)/100) — 0 at a fresh
+position, more negative as shuffling drags on (we already track the halfmove clock
++ repetition count in planes 19–21, so Φ is a valid Markov state fn). Then a
+shuffling move (clock climbs) → small NEGATIVE F (discouraged); a progress move
+(pawn push / capture resets clock) → POSITIVE F (rewarded). Broader alternative if
+too narrow: Φ = material balance (same PBRS form, denser "toward winning"). The
+potential MUST be external (clock/material) — a LEARNED potential (model's own
+value, cf. "Bootstrapped Reward Shaping" arXiv:2501.00989) re-introduces the
+self-referential drift we rejected.
+
+HOW IT BITES: shaped reward → reward head → MCTS Q = reward − γ·V; MCTS sums
+rewards along simulated lines, so it shapes the search over its lookahead.
+CORRECTION to the earlier note: this does NOT require changing reward_support_size
+— at K=1 the head is already 3 bins over {−1,0,+1} and represents fractional
+rewards exactly (verified), so NO architecture change / NO checkpoint
+incompatibility. Work is just: populate GameHistory.rewards with F in self-play +
+tune λ. LIMIT: WDL value does not bootstrap the shaped reward, so shaping reaches
+only as deep as the search tree (plain outcome at leaves) — a real WDL+shaping cap.
+
+WHY BETTER THAN THE δ PENALTY: dense (every move) vs sparse (terminal); per-move
+credit vs smeared; policy-invariant (genuine draws untouched) vs contempt-like
+mislabeling; no objective distortion vs distortion.
+
+CAVEAT: PBRS policy-invariance is proven for standard MDPs; in MuZero (learned
+dynamics, MCTS, WDL value) it's APPROXIMATE — treat as a well-motivated heuristic.
+Still the most paper-defensible shaping (preserves the optimum → a learning
+accelerator, not a new objective; vanilla AlphaZero uses no shaping at all).
+
+DECISION RULE (after the masking + anchor run):
+- draws fall (value/Q gains spread, conversion improves) → done, no shaping needed.
+- draws persist BUT value/target_std healthy + policy sharp → conversion-depth
+  problem → PBRS no-progress (or material) potential is the justified next step.
+- value/target_std collapses despite the 0.4 anchor → value-stability problem
+  first (anchor/architecture), shaping won't help yet.
