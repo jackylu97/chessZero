@@ -38,6 +38,21 @@ must INJECT decisive signal — win adjudication (don't play won positions out t
 draws), persistent Stockfish value supervision, and/or TD bootstrap targets
 (root_value tracks SF better, corr 0.47 vs z 0.18). See [[value-sibling-ranking]].
 
+### Repetition-draw mechanism + MCTS audit (2026-06-17, `mcts_audit_2026_06_17.md`)
+Traced 11 threefold self-play games (`scripts/trace_threefold.py`) + audited BOTH search
+engines (`mcts.py` numpy, `tensor_mcts.py` live). Findings: repetition draws are won K+P
+endgames the policy can't convert; the search has NO repetition awareness (value from the
+latent net only — no terminal/draw branch in select/expand/backprop, both engines), so the
+shuffle keeps full winning value (root_value RISES into the repetition) and is the top-Q
+move → MCTS banks a phantom win into the draw. **MCTS math is CORRECT** (PUCT/backup/MinMax
+identical numpy↔tensor to ~1e-16; no divergence). Three exploration issues, none a math bug:
+(1) `dirichlet_alpha=0.1` too peaked → a prior-0.06 converting move starved ~half the
+searches; **raise to 0.3**. (2) leaf nodes expand the FULL unmasked action space, both
+engines (`mcts.py:146-147,640`, `tensor_mcts.py:1195-1197`) — known deferred issue #1;
+**add leaf legal masking**. (3) no in-search repetition penalty (structural MuZero limit) —
+**add MCTS-level repetition penalty + win adjudication**. More sims HURT (800 sims → 75%
+threefold vs 200 sims → 46%). See [[repetition-draw-mechanism]], [[value-sibling-ranking]].
+
 ### Draw-basin pipeline bugs — 2026-06-13 (see `bug_hunt_2026_06_13.md`), now mostly FIXED
 - **(FIXED) `select_action_gpu` / policy targets** (`src/mcts/tensor_mcts.py`,
   `src/mcts/mcts.py`): targets are now deduped raw visit fractions, temperature-
