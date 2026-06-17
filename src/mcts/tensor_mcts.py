@@ -631,6 +631,39 @@ class TensorMCTS:
         priors = counts / float(K)                                       # [N, K]
         return actions, priors
 
+    def _enumerate_legal(
+        self, legal_mask: torch.Tensor, root_probs: torch.Tensor
+    ):
+        """Pack each game's legal actions into the K root slots with their EXACT
+        softmax prior — the no-sampling expansion used when a game has <= K legal
+        actions. Returns ``(actions [N, K] int32, priors [N, K] float32)`` with
+        unused slots = -1 / 0. Games with more than K legal actions get only
+        their first K legal indices here (those games use the sampled path
+        instead, so this truncated result is never read for them)."""
+        n, A = legal_mask.shape
+        K = self.K
+        dev = self.device
+        # rank[g, a] = 0-indexed slot for the a-th legal action in row g
+        # (cumsum of the legal mask, minus 1). Illegal entries also get a rank
+        # but are dropped by ``valid`` below.
+        rank = torch.cumsum(legal_mask.to(torch.int64), dim=1) - 1       # [N, A]
+        a_idx = torch.arange(A, device=dev).unsqueeze(0).expand(n, A)    # [N, A]
+        valid = legal_mask & (rank >= 0) & (rank < K)                    # [N, A]
+        # Scatter each legal action index into its rank slot. Invalid entries
+        # are routed to a throwaway column K (sliced off after) so they never
+        # collide with a real slot; legal ranks are unique within a row, so no
+        # two valid entries target the same slot.
+        slot = torch.where(valid, rank, torch.full_like(rank, K))        # [N, A] in [0, K]
+        actions_ext = torch.full((n, K + 1), -1, dtype=torch.int32, device=dev)
+        actions_ext.scatter_(1, slot, a_idx.to(torch.int32))
+        enum_actions = actions_ext[:, :K].contiguous()                   # [N, K] int32, -1 pad
+        gather_idx = enum_actions.clamp(min=0).long()
+        enum_priors = torch.gather(root_probs, 1, gather_idx)            # [N, K]
+        enum_priors = torch.where(
+            enum_actions >= 0, enum_priors, torch.zeros_like(enum_priors)
+        )
+        return enum_actions, enum_priors
+
     def _initialize_root_from_mask(
         self,
         hidden_batch: torch.Tensor,
@@ -648,13 +681,25 @@ class TensorMCTS:
 
         # Sampled MuZero §5.1: K i.i.d. samples with replacement from β = π,
         # deduped to UNIQUE actions with PUCT prior β̂(a) = count(a)/K on one
-        # slot each (padding actions = -1 / prior = 0). Mirrors the numpy oracle
-        # (mcts.py BatchedMCTS root + _sample_iid_with_replacement). Summing an
-        # action's mass onto ONE slot (vs Option (b)'s 1/K-per-duplicate-slot)
-        # is required so PUCT's prior_score isn't fragmented and swamped by the
-        # value term after the first visit.
+        # slot each (padding actions = -1 / prior = 0). Summing an action's mass
+        # onto ONE slot (vs Option (b)'s 1/K-per-duplicate-slot) is required so
+        # PUCT's prior_score isn't fragmented and swamped by the value term
+        # after the first visit.
         sampled_actions = torch.multinomial(root_probs, K, replacement=True)  # [N, K] int64
         actions_dedup, priors_root = self._dedup_sampled(sampled_actions)
+
+        # Per-game guard mirroring the numpy oracle (mcts.py: sample only when
+        # ``len(legals) > sample_k``, else expand ALL legal moves with the exact
+        # prior). When a game has <= K legal actions (the common case in chess —
+        # most positions have ~30 legal moves, K=50), sampling K-with-replacement
+        # would waste draws on duplicates, leave some legal moves unexpanded
+        # (zero visits -> zero policy-target mass), and replace the exact prior
+        # with a noisy count estimate. Expand all legal actions instead. Batched
+        # over games of differing legal-move counts via a vectorized select.
+        enum_actions, enum_priors = self._enumerate_legal(legal_mask, root_probs)
+        use_enum = legal_mask.sum(dim=1, keepdim=True) <= K              # [N, 1] bool
+        actions_dedup = torch.where(use_enum, enum_actions, actions_dedup)
+        priors_root = torch.where(use_enum, enum_priors, priors_root)
 
         if add_noise and self.config.dirichlet_epsilon > 0:
             alpha = float(self.config.dirichlet_alpha)
