@@ -1,14 +1,21 @@
 """Play chess against a trained MuZero checkpoint in the browser.
 
 Usage:
+    # explicit checkpoint
     python scripts/play_web.py --checkpoint checkpoints/chess/checkpoint_2500.pt
+    # latest checkpoint of the most-recently-active run (no args needed)
+    python scripts/play_web.py
+    # latest checkpoint of a specific run
+    python scripts/play_web.py --run-id 2026_06_17_convhead
 
 Then open http://localhost:5000 in a browser. You play Black; the model plays White.
 Promotions default to queen.
 """
 
 import argparse
+import glob
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -298,6 +305,42 @@ def model_move():
     return jsonify(session.to_json())
 
 
+def _checkpoint_step(path: str) -> int:
+    m = re.search(r"checkpoint_(\d+)\.pt$", os.path.basename(path))
+    return int(m.group(1)) if m else -1
+
+
+def resolve_checkpoint(checkpoint: str, run_id: str, game_dir: str = "checkpoints/chess") -> str:
+    """Return an explicit checkpoint path, or auto-select the latest one.
+
+    Precedence: explicit --checkpoint > latest in --run-id > latest in the
+    most-recently-modified run dir under ``game_dir``. "Latest" = highest
+    ``checkpoint_<step>.pt`` step in the chosen run directory.
+    """
+    if checkpoint:
+        return checkpoint
+
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), game_dir)
+    if run_id:
+        run_dir = os.path.join(root, run_id)
+        if not os.path.isdir(run_dir):
+            raise SystemExit(f"run dir not found: {run_dir}")
+    else:
+        # Most-recently-modified run dir that actually contains a checkpoint.
+        candidates = [d for d in glob.glob(os.path.join(root, "*")) if os.path.isdir(d)
+                      and glob.glob(os.path.join(d, "checkpoint_*.pt"))]
+        if not candidates:
+            raise SystemExit(f"no checkpoints found under {root} — pass --checkpoint explicitly")
+        run_dir = max(candidates, key=os.path.getmtime)
+
+    pts = glob.glob(os.path.join(run_dir, "checkpoint_*.pt"))
+    if not pts:
+        raise SystemExit(f"no checkpoint_*.pt files in {run_dir}")
+    latest = max(pts, key=_checkpoint_step)
+    print(f"Auto-selected latest checkpoint: {latest} (step {_checkpoint_step(latest)})")
+    return latest
+
+
 def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, device: str):
     torch.serialization.add_safe_globals([MuZeroConfig])
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -308,6 +351,13 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
     has_consistency = any(k.startswith("projection.") for k in state_dict)
 
     has_inverse = any(k.startswith("inverse_dynamics_head.") for k in state_dict)
+
+    # Detect the policy head type from the weights so conv-head and flat-head
+    # checkpoints both load: the AlphaZero conv head has policy_head.mix/proj,
+    # the flat (AlphaGo) head is an nn.Sequential (policy_head.0/.1/.4).
+    policy_head_type = "conv" if any(
+        ".policy_head.mix." in k or ".policy_head.proj." in k for k in state_dict
+    ) else "flat"
 
     network = MuZeroNetwork(
         # Input is the T-frame history stack (num_planes * history_frames), matching training.
@@ -333,6 +383,7 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
         # (WDL + inverse head) checkpoints both load.
         value_head_type=getattr(config, "value_head_type", "support"),
         draw_score=getattr(config, "draw_score", 0.0),
+        policy_head_type=policy_head_type,
         use_inverse_dynamics_loss=has_inverse,
         inverse_dynamics_hidden=getattr(config, "inverse_dynamics_hidden", 256),
     )
@@ -345,7 +396,13 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
 def main():
     global session
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True, help="Path to chess checkpoint .pt file")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Path to a chess checkpoint .pt file. If omitted, auto-selects the "
+                             "latest checkpoint (highest step) of --run-id, or of the most "
+                             "recently active run under checkpoints/chess/.")
+    parser.add_argument("--run-id", default=None,
+                        help="Run id under checkpoints/chess/ to pull the latest checkpoint from "
+                             "(ignored if --checkpoint is given).")
     parser.add_argument("--device", default=None)
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", default="127.0.0.1")
@@ -370,8 +427,9 @@ def main():
         config.use_gumbel = args.use_gumbel
     if args.num_simulations is not None:
         config.num_simulations = args.num_simulations
+    checkpoint = resolve_checkpoint(args.checkpoint, args.run_id)
     game = ChessGame()
-    network = load_network(args.checkpoint, game, config, device)
+    network = load_network(checkpoint, game, config, device)
     session = GameSession(game, network, config, device)
 
     print(f"Open http://{args.host}:{args.port} to play "
