@@ -30,16 +30,23 @@ def effective_rank(H):
 
 
 def mean_crosspos_cosine(H, max_pairs=200000, seed=0):
-    """Mean cosine over random distinct position pairs. ->1.0 = collapse."""
-    rng = np.random.default_rng(seed)
+    """Mean cosine over ALL distinct position pairs (exact closed form). ->1.0 = collapse.
+
+    For unit vectors u_i, mean_{i!=j} <u_i,u_j> = (||sum_i u_i||^2 - sum_i||u_i||^2)
+    / (n(n-1)). This is O(n*D) and exact, replacing the old O(max_pairs*D) random
+    sampling — which both approximated the mean AND materialized multi-GB gather
+    temporaries (norm[i], norm[j], their product), the transient that OOM-killed the
+    repr probe at step boundaries. ``max_pairs``/``seed`` are accepted for backward
+    compatibility and ignored.
+    """
     n = len(H)
-    norm = H / (np.linalg.norm(H, axis=1, keepdims=True) + 1e-8)
-    i = rng.integers(0, n, size=max_pairs)
-    j = rng.integers(0, n, size=max_pairs)
-    m = i != j
-    if not m.any():
+    if n < 2:
         return float("nan")
-    return float((norm[i[m]] * norm[j[m]]).sum(1).mean())
+    norm = H / (np.linalg.norm(H, axis=1, keepdims=True) + 1e-8)
+    s = norm.sum(axis=0)
+    total = float(s @ s)               # sum_{i,j} <u_i,u_j> = ||sum_i u_i||^2
+    diag = float((norm * norm).sum())  # sum_i <u_i,u_i>
+    return (total - diag) / (n * (n - 1))
 
 
 def dual_ridge_r2(X, y, lam_grid=(1e1, 1e2, 1e3, 1e4), val_frac=0.3, seed=0):
