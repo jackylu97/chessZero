@@ -173,6 +173,15 @@ class MuZeroConfig:
     #            (canonical class structure: {-1, 0, +1} game outcomes).
     value_head_type: str = "support"
 
+    # Policy-head architecture.
+    #   flat: (default, AlphaGo-style) Conv(C->2) channel squeeze + Linear to the
+    #         full action space. Fine for small/point-move action spaces.
+    #   conv: (AlphaZero-style) spatial move-plane conv head — no channel squeeze,
+    #         weight-shared across from-squares. For chess (4672 = 64×73) the flat
+    #         head's 2-channel/128-dim squeeze is a severe bottleneck; conv removes
+    #         it. Requires an 8×8-aligned latent (chess); keep "flat" for others.
+    policy_head_type: str = "flat"
+
     # Draw shaping for the WDL head's scalar conversion (search-time only):
     #   V = P(W) - P(L) + draw_score · P(D)
     # Lc0 default 0.0. Negative values penalize draws (anti-draw shaping);
@@ -554,6 +563,9 @@ def get_config(game: str) -> MuZeroConfig:
                                                # Bumped from 0.25: AlphaZero/Lc0 reference setpoint;
                                                # value head was stuck in constant-prediction local
                                                # min at 0.25 (pred_std/target_std ≈ 0.03 at step 1k).
+            policy_head_type="conv",    # AlphaZero spatial 73-plane policy head (8×8×73=4672);
+                                        # removes the flat head's 2-channel/128-dim bottleneck that
+                                        # left the policy unable to rank legal moves. Chess-only.
             value_head_type="wdl",      # Lc0-style 3-output W/D/L classifier; replaces
                                         # the 5-bin scalar head. Targets game outcome z directly,
                                         # eliminating the predict-zero collapse failure mode where

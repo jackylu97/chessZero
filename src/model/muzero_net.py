@@ -152,6 +152,59 @@ class DynamicsNetwork(nn.Module):
         return x, reward_logits
 
 
+class ConvPolicyHead(nn.Module):
+    """AlphaZero-style spatial policy head.
+
+    For board games whose action space factorizes as
+    ``(latent_h * latent_w)`` from-squares × ``move_planes`` move-types, with
+    flat index ``from_sq * move_planes + move_type`` (chess: 64 × 73 = 4672).
+
+    A 3×3 conv mixes the body's FULL-width per-square features (no channel
+    bottleneck — contrast the flat head's ``Conv(C->2)`` squeeze), then a 1×1
+    conv projects to ``move_planes`` logits per square. The projection weights
+    are SHARED across all from-squares (the right inductive bias: a move-type's
+    value is computed the same way wherever the piece sits). Board-wide context
+    is already supplied by the deep conv body (receptive field >> 8×8); this
+    head only needs the per-square readout, so a 1×1 projection suffices.
+
+    The ``(B, move_planes, H, W)`` output is permuted to ``(B, H, W, move_planes)``
+    and flattened so the logit index equals ``from_sq * move_planes + move_type``,
+    matching the game's action encoding exactly — no change to legal masks,
+    policy targets, or action decoding. Requires the latent's spatial layout to
+    match ``from_sq = row * latent_w + col`` (true for the 8×8 chess latent);
+    gate behind ``policy_head_type="conv"`` for chess only.
+    """
+
+    def __init__(self, hidden_planes: int, action_space_size: int,
+                 latent_h: int, latent_w: int):
+        super().__init__()
+        n_sq = latent_h * latent_w
+        if action_space_size % n_sq != 0:
+            raise ValueError(
+                f"ConvPolicyHead needs action_space_size ({action_space_size}) "
+                f"divisible by latent_h*latent_w ({n_sq}); got remainder "
+                f"{action_space_size % n_sq}."
+            )
+        self.action_space_size = action_space_size
+        self.move_planes = action_space_size // n_sq
+        self.mix = nn.Conv2d(hidden_planes, hidden_planes, 3, padding=1, bias=False)
+        self.norm = norm_layer(hidden_planes, (latent_h, latent_w))
+        self.proj = nn.Conv2d(hidden_planes, self.move_planes, 1)
+        # Zero-init the output conv -> uniform policy at start (the MuZero
+        # last-layer-zero stability trick; mirrors _zero_init_last_linear on the
+        # flat head).
+        nn.init.zeros_(self.proj.weight)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.norm(self.mix(x)))
+        x = self.proj(x)                                  # (B, move_planes, H, W)
+        b = x.shape[0]
+        # (B, P, H, W) -> (B, H, W, P) -> (B, H*W*P); index = from_sq*P + move_type
+        return x.permute(0, 2, 3, 1).reshape(b, self.action_space_size)
+
+
 class PredictionNetwork(nn.Module):
     """f(hidden_state) -> (policy, value).
 
@@ -176,20 +229,33 @@ class PredictionNetwork(nn.Module):
         value_support_size: int = 1,
         value_head_type: str = "support",
         value_head_init_std: float = 0.0,
+        policy_head_type: str = "flat",
     ):
         super().__init__()
         self.value_support_size = value_support_size
         self.value_head_type = value_head_type
+        self.policy_head_type = policy_head_type
 
-        # Policy head
-        self.policy_head = nn.Sequential(
-            nn.Conv2d(hidden_planes, 2, 1, bias=False),
-            norm_layer(2, (latent_h, latent_w)),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(2 * latent_h * latent_w, action_space_size),
-        )
-        _zero_init_last_linear(self.policy_head)
+        # Policy head. "flat" (default, AlphaGo-style): a Conv(C->2) channel
+        # squeeze + Linear to the full action space — fine for small/point-move
+        # action spaces but a severe bottleneck for chess's structured 4672.
+        # "conv" (AlphaZero-style): a spatial 73-plane conv head with no channel
+        # squeeze and weight-sharing across from-squares (see ConvPolicyHead).
+        if policy_head_type == "conv":
+            self.policy_head = ConvPolicyHead(
+                hidden_planes, action_space_size, latent_h, latent_w
+            )  # zero-inits its own output conv
+        elif policy_head_type == "flat":
+            self.policy_head = nn.Sequential(
+                nn.Conv2d(hidden_planes, 2, 1, bias=False),
+                norm_layer(2, (latent_h, latent_w)),
+                nn.ReLU(),
+                nn.Flatten(),
+                nn.Linear(2 * latent_h * latent_w, action_space_size),
+            )
+            _zero_init_last_linear(self.policy_head)
+        else:
+            raise ValueError(f"Unknown policy_head_type: {policy_head_type!r}")
 
         # Value head: shape depends on the head type.
         if value_head_type == "support":
@@ -340,6 +406,7 @@ class MuZeroNetwork(nn.Module):
         value_head_init_std: float = 0.0,
         use_inverse_dynamics_loss: bool = False,
         inverse_dynamics_hidden: int = 256,
+        policy_head_type: str = "flat",
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -367,6 +434,7 @@ class MuZeroNetwork(nn.Module):
             latent_h, latent_w, fc_hidden, value_support_size,
             value_head_type=value_head_type,
             value_head_init_std=value_head_init_std,
+            policy_head_type=policy_head_type,
         )
 
         # Inverse-dynamics head (ICM): predicts a_k from (h_k, h_{k+1}). Forces the
