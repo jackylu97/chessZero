@@ -575,6 +575,12 @@ def get_config(game: str) -> MuZeroConfig:
                                         # positions get a small negative push during search,
                                         # encouraging decisive moves over solid draws. Doesn't
                                         # affect training targets.
+            repetition_penalty=0.35,    # Training-TARGET anti-repetition (distinct from draw_score
+            repetition_penalty_decay=0.93,  # above, which is tree-only). For games drawn by 3-fold /
+                                        # 50-move, rewrites the value target toward loss
+                                        # ([W=0, D=1-d, L=d], d=0.35·0.93^plies_to_end). Pinned here
+                                        # 2026-06-17 (was CLI-only at 0.35/0.93); default 0.0 silently
+                                        # disables it if a run forgets the flag. See mcts_audit_2026_06_17.md.
             q_ratio=0.5,                # Fallback when the split knobs below are None.
             warmstart_q_ratio=0.5,      # HOT: blend 50% game outcome into the Stockfish-eval
                                         # WDL — de-saturates the value head on won positions.
