@@ -372,6 +372,38 @@ class InverseDynamicsHead(nn.Module):
         return self.net(x)
 
 
+class MovesLeftHead(nn.Module):
+    """Lc0-style moves-left head: predicts plies-remaining-until-game-end as a
+    categorical distribution over the transformed support {-K..K} (the value head's
+    machinery; only the non-negative half is used in practice).
+
+    Purpose: break value *saturation* in won/lost positions. When every winning move
+    reads ~+1 (or, mid-collapse, ~draw), the value gives MCTS no reason to make
+    progress and it shuffles. Moves-left restores a gradient: among equally-winning
+    moves prefer the faster finish (and drag out a loss). POV-independent — game
+    length is the same for both players, so unlike value there is NO negamax flip.
+
+    Trained via cross-entropy on scalar_to_support(scalar_transform(plies_left)).
+    Queried separately (like the inverse/consistency heads), so the main inference
+    tuple signature is unchanged.
+    """
+
+    def __init__(self, hidden_planes: int, latent_h: int, latent_w: int,
+                 fc_hidden: int, support_size: int):
+        super().__init__()
+        self.support_size = support_size
+        self.head = nn.Sequential(
+            nn.Conv2d(hidden_planes, 1, 1, bias=False),
+            norm_layer(1, (latent_h, latent_w)),
+            nn.ReLU(),
+            nn.Flatten(),
+            mlp_head(latent_h * latent_w, fc_hidden, 2 * support_size + 1),
+        )
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        return self.head(hidden_state)  # (B, 2*support_size + 1) logits
+
+
 class MuZeroNetwork(nn.Module):
     """Full MuZero network combining representation, dynamics, prediction.
 
@@ -407,6 +439,8 @@ class MuZeroNetwork(nn.Module):
         use_inverse_dynamics_loss: bool = False,
         inverse_dynamics_hidden: int = 256,
         policy_head_type: str = "flat",
+        use_moves_left: bool = False,
+        moves_left_support_size: int = 10,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -418,6 +452,8 @@ class MuZeroNetwork(nn.Module):
         self.value_head_type = value_head_type
         self.draw_score = draw_score
         self.use_inverse_dynamics_loss = use_inverse_dynamics_loss
+        self.use_moves_left = use_moves_left
+        self.moves_left_support_size = moves_left_support_size
 
         self.representation = RepresentationNetwork(
             observation_channels, hidden_planes, num_blocks,
@@ -446,6 +482,15 @@ class MuZeroNetwork(nn.Module):
             )
         else:
             self.inverse_dynamics_head = None
+
+        # Moves-left head (Lc0): predicts plies-to-end; used to break value
+        # saturation so the search prefers faster wins instead of shuffling.
+        if use_moves_left:
+            self.moves_left_head = MovesLeftHead(
+                hidden_planes, latent_h, latent_w, fc_hidden, moves_left_support_size,
+            )
+        else:
+            self.moves_left_head = None
 
         if use_consistency_loss:
             flat_dim = hidden_planes * latent_h * latent_w
@@ -479,6 +524,13 @@ class MuZeroNetwork(nn.Module):
         assert self.inverse_dynamics_head is not None, \
             "predict_inverse_action() called with use_inverse_dynamics_loss=False"
         return self.inverse_dynamics_head(h_k, h_next)
+
+    def predict_moves_left(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Moves-left logits (B, 2*K+1) from a hidden state. Queried separately
+        (training: CE loss; search: gated utility). POV-independent."""
+        assert self.moves_left_head is not None, \
+            "predict_moves_left() called with use_moves_left=False"
+        return self.moves_left_head(hidden)
 
     def initial_inference(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run representation + prediction on observation.
