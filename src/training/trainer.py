@@ -771,6 +771,14 @@ class MuZeroTrainer:
         else:
             value_weight = self.config.value_loss_weight
 
+        # Moves-left head (Lc0): aux CE on plies-to-end. Inert unless the head
+        # exists AND the config enables it. Target is (B, K+1) plies-remaining.
+        use_moves_left = (bool(getattr(self.config, "use_moves_left", False))
+                          and getattr(self.network, "moves_left_head", None) is not None)
+        moves_left_weight = float(getattr(self.config, "moves_left_loss_weight", 0.0))
+        target_moves_left = (batch["target_moves_left"].to(self.device)
+                             if use_moves_left and "target_moves_left" in batch else None)
+
         # Loss-weighting mode. See config.use_root_heavy_loss docstring.
         K = self.config.num_unroll_steps
         use_root_heavy = bool(getattr(self.config, "use_root_heavy_loss", False))
@@ -796,6 +804,10 @@ class MuZeroTrainer:
             reward_loss = torch.zeros(obs.shape[0], device=self.device)
             consistency_loss = torch.zeros(obs.shape[0], device=self.device)
             inverse_loss = torch.zeros(obs.shape[0], device=self.device)
+            moves_left_loss = torch.zeros(obs.shape[0], device=self.device)
+            if use_moves_left:
+                moves_left_loss = self._moves_left_loss(
+                    self.network.predict_moves_left(hidden), target_moves_left[:, 0])  # root, full weight
 
             for k in range(self.config.num_unroll_steps):
                 hidden_in = hidden  # h_k — the dynamics input at this unroll step
@@ -844,6 +856,13 @@ class MuZeroTrainer:
                         F.cross_entropy(inv_logits, actions[:, k], reduction="none") * mask_k
                     )
 
+                if use_moves_left:
+                    moves_left_loss = moves_left_loss + unroll_scale * (
+                        self._moves_left_loss(
+                            self.network.predict_moves_left(hidden), target_moves_left[:, k + 1])
+                        * mask_k
+                    )
+
             per_sample_loss = outer_scale * (
                 policy_loss
                 + value_weight * value_loss
@@ -851,6 +870,7 @@ class MuZeroTrainer:
                 + self.config.consistency_loss_weight * consistency_loss
                 + inverse_weight * inverse_loss
                 + illegal_pen_w * illegal_loss
+                + moves_left_weight * moves_left_loss
             )
             total_loss = (is_weights_t * per_sample_loss).mean()
 
@@ -866,6 +886,7 @@ class MuZeroTrainer:
                 "reward_loss": float("nan"),
                 "consistency_loss": float("nan"),
                 "inverse_loss": float("nan"),
+                "moves_left_loss": float("nan"),
                 "grad_norm": float("nan"),
                 "amp_scale": float(self.scaler.get_scale()),
                 "value_mae": float("nan"),
@@ -987,6 +1008,7 @@ class MuZeroTrainer:
             "reward_loss": (outer_scale * reward_loss.mean()).item(),
             "consistency_loss": (outer_scale * self.config.consistency_loss_weight * consistency_loss.mean()).item(),
             "inverse_loss": (outer_scale * inverse_weight * inverse_loss.mean()).item(),
+            "moves_left_loss": (outer_scale * moves_left_weight * moves_left_loss.mean()).item() if use_moves_left else float("nan"),
             "grad_norm": float(grad_norm),
             "amp_scale": float(self.scaler.get_scale()),
             "value_mae": value_mae,
@@ -1173,6 +1195,15 @@ class MuZeroTrainer:
         else:
             transformed = target_scalar * self.config.value_target_scale
         target_dist = scalar_to_support(transformed, support_size).to(logits.device)
+        return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1)
+
+    def _moves_left_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor) -> torch.Tensor:
+        """Per-sample CE for the moves-left head. ``target_scalar``: (B,) plies-
+        remaining (>=0). Always applies the scalar_transform (compressed support →
+        fine resolution near 0, where 'win faster' actually matters). POV-independent,
+        so no negamax flip. Mirrors _value_loss's support path."""
+        transformed = scalar_transform(target_scalar)
+        target_dist = scalar_to_support(transformed, self.network.moves_left_support_size).to(logits.device)
         return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1)
 
     def _reward_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,

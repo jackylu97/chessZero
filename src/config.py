@@ -395,6 +395,15 @@ class MuZeroConfig:
     inverse_dynamics_loss_weight: float = 1.0
     inverse_dynamics_hidden: int = 256
 
+    # Moves-left head (Lc0): aux categorical head predicting plies-to-game-end.
+    # Breaks value saturation so search prefers faster wins over shuffling. Default
+    # OFF (head not built → fully inert). support_size 10 ≈ covers ~120 plies with
+    # fine resolution near 0 (where 'win faster' matters). Loss weight ~0.25 like
+    # the other aux heads. The gated MCTS utility is a separate step.
+    use_moves_left: bool = False
+    moves_left_support_size: int = 10
+    moves_left_loss_weight: float = 0.25
+
     # Value-head output-layer init std. 0.0 = zero-init (MuZero/LightZero default;
     # blocks gradient to the body at cold start because Wᵀ·grad_out = 0). A small
     # positive std (e.g. 0.01) lets value-head gradient reach the representation/

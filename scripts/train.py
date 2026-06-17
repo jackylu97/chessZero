@@ -328,6 +328,8 @@ def main():
         use_inverse_dynamics_loss=getattr(config, "use_inverse_dynamics_loss", False),
         inverse_dynamics_hidden=getattr(config, "inverse_dynamics_hidden", 256),
         policy_head_type=getattr(config, "policy_head_type", "flat"),
+        use_moves_left=getattr(config, "use_moves_left", False),
+        moves_left_support_size=getattr(config, "moves_left_support_size", 10),
     )
 
     trainer = MuZeroTrainer(

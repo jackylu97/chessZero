@@ -724,6 +724,7 @@ class ReplayBuffer:
         rewards_batch = []
         policies_batch = []
         legal_masks_batch = []
+        moves_left_batch = []
 
         for g_idx in game_indices:
             game = self.buffer[g_idx]
@@ -747,6 +748,13 @@ class ReplayBuffer:
             values_batch.append(values)
             rewards_batch.append(rewards)
             policies_batch.append(policies)
+            # Moves-left target: plies-remaining at each unroll step. Trivial fn of
+            # position indices (no make_target ripple); POV-independent; past-end
+            # steps clamp to 0 and are zeroed by target_obs_mask in the loss.
+            final_idx = len(game) - 1
+            moves_left_batch.append([
+                float(max(0, final_idx - (pos + i))) for i in range(num_unroll_steps + 1)
+            ])
             if build_legal_masks:
                 # (K+1, A) legal-move mask aligned with policies/actions: 1.0 on
                 # legal moves at ply (pos + i), 0.0 on illegal. Mirrors make_target's
@@ -789,6 +797,7 @@ class ReplayBuffer:
             "target_values": torch.from_numpy(np.asarray(values_batch, dtype=np.float32)),
             "target_rewards": torch.tensor(rewards_batch, dtype=torch.float32),
             "target_policies": torch.from_numpy(np.stack(policies_batch)),
+            "target_moves_left": torch.tensor(moves_left_batch, dtype=torch.float32),  # (B, K+1) plies-to-end
             "is_warmstart": torch.from_numpy(is_warmstart),
         }
         if build_legal_masks:
