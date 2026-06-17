@@ -46,6 +46,41 @@ def root_topk(root, board, k=8):
     return out
 
 
+def _rep_override(root, board, chosen_action, draw_score):
+    """Root-terminal-draws proxy. If `chosen_action` completes a draw-by-repetition
+    or 50-move, return the best NON-drawing child (most visits) whose mover-POV Q
+    exceeds draw_score; else None (keep the draw — correct when no better move exists,
+    e.g. a losing side). Uses only the real board the agent already has at the root."""
+    mv = _action_to_move(int(chosen_action), board)
+    if mv is None:
+        return None
+    board.push(mv)
+    chosen_draws = board.is_repetition(3) or board.halfmove_clock >= 100
+    board.pop()
+    if not chosen_draws:
+        return None
+    acts = np.asarray(root.child_actions)
+    vis = np.asarray(root.child_visits, dtype=float)
+    vs = np.asarray(root.child_value_sums, dtype=float)
+    rw = np.asarray(root.child_rewards, dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        child_v = np.where(vis > 0, vs / np.maximum(vis, 1.0), 0.0)
+    q = rw - child_v  # mover-POV, discount=1
+    best, best_vis = None, -1.0
+    for i, a in enumerate(acts):
+        m = _action_to_move(int(a), board)
+        if m is None:
+            continue
+        board.push(m)
+        d = board.is_repetition(3) or board.halfmove_clock >= 100
+        board.pop()
+        if d:
+            continue
+        if q[i] > draw_score and vis[i] > best_vis:
+            best, best_vis = int(a), vis[i]
+    return best
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -60,6 +95,10 @@ def main():
                     help="Override config.temperature_final (late-game temperature after move 30).")
     ap.add_argument("--dirichlet-alpha", type=float, default=None,
                     help="Override config.dirichlet_alpha (root exploration noise concentration).")
+    ap.add_argument("--root-terminal-draws", action="store_true",
+                    help="Treat draw-by-repetition/50-move as terminal at the root: if the chosen "
+                         "move completes such a draw, switch to the best non-drawing move when one "
+                         "scores above draw_score (winning side plays on; losing side still draws).")
     args = ap.parse_args()
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
@@ -80,6 +119,7 @@ def main():
     obs_hist = [[] for _ in range(args.games)]            # per-game single-frame history
     traces = [[] for _ in range(args.games)]
     mc = [0] * args.games
+    overrides = [0] * args.games
     active = list(range(args.games))
 
     it = 0
@@ -101,6 +141,10 @@ def main():
                 temp = temp_init if mc[g] < cfg.temperature_drop_step else cfg.temperature_final
                 action, _ = select_action(root, temperature=temp)
                 rv = float(root.value)
+                if args.root_terminal_draws:
+                    alt = _rep_override(root, board, action, cfg.draw_score)
+                    if alt is not None:
+                        action = alt; overrides[g] += 1
                 tk = root_topk(root, board, args.topk)
                 mv = _action_to_move(int(action), board)
                 traces[g].append({
@@ -128,7 +172,7 @@ def main():
                ("draw_other" if (states[g].done and outcome == 0) else
                 ("decisive" if states[g].done else "unfinished")))
         summary.append({"game": g, "plies": mc[g], "outcome": outcome, "type": tag,
-                        "final_fen": b.fen()})
+                        "final_fen": b.fen(), "overrides": overrides[g]})
         if is_tf:
             n_tf += 1
             with open(os.path.join(args.out, f"game_{g:04d}.json"), "w") as f:
@@ -145,8 +189,16 @@ def main():
           f"seed={args.seed} -> {args.out}")
     print(f"  TALLY: threefold={tally.get('threefold',0)} draw_other={tally.get('draw_other',0)} "
           f"decisive={decisive} unfinished={tally.get('unfinished',0)} | avg_plies={avg_plies:.0f}")
+    if args.root_terminal_draws:
+        fired = [s for s in summary if s["overrides"] > 0]
+        oc = Counter(s["type"] for s in fired)
+        tot_ov = sum(s["overrides"] for s in summary)
+        print(f"  ROOT-TERMINAL-DRAWS: {tot_ov} move-overrides across {len(fired)}/{args.games} games; "
+              f"outcome of overridden games -> decisive={oc.get('decisive',0)} "
+              f"draw_other={oc.get('draw_other',0)} threefold={oc.get('threefold',0)} "
+              f"unfinished={oc.get('unfinished',0)}")
     for s in summary:
-        print(f"  game {s['game']:2d}: {s['type']:11s} plies={s['plies']:3d} outcome={s['outcome']}")
+        print(f"  game {s['game']:2d}: {s['type']:11s} plies={s['plies']:3d} outcome={s['outcome']} ov={s['overrides']}")
 
 
 if __name__ == "__main__":
