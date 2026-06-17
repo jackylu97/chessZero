@@ -45,12 +45,16 @@ draw. This is V^π≈draw at the endgame-conversion level (see [[value-sibling-r
 
 **Three real exploration-relevant issues (none is a tree-search math bug):**
 
-1. **`dirichlet_alpha=0.1` is too peaked (config).** Dir(0.1) over ~10 endgame moves puts
-   ~0.66 weight on one move (~2 effective moves). A converting move at base prior 0.06 lands
-   at MEDIAN post-noise prior 0.045 (noise usually moves mass AWAY from it) and its noise
-   coordinate is ~0 about 49% of the time → starved ~half the searches. AlphaZero-chess used
-   0.3. **Fix: raise `dirichlet_alpha` 0.1 → 0.3.** (config comment already flags 0.1 as a
-   temporary compromise.)
+1. **`dirichlet_alpha=0.1` is peaked (config) — but TUNING IT DOES NOT HELP (tested).** The
+   static analysis (Dir(0.1) over ~10 moves puts ~0.66 weight on one move; a prior-0.06
+   converting move lands at median post-noise prior 0.045) is correct about the PRIOR, but an
+   α sweep refutes the recommendation to raise it. At sims=200/temp=0.1, varying α∈{0.1,0.3,
+   1.0}: threefold 44%→56%→81% (rose, didn't fall), decisive flat (noise), and — decisively —
+   the chosen-move visit fraction at repetition positions stayed ~0.44 across ALL α (visit
+   entropy ~1.31–1.36, flat). Root noise perturbs only the first few sims; after 200 sims the
+   visit distribution re-converges onto the value verdict, which α doesn't touch. **Do NOT
+   raise α — it's not a lever; the value is binding.** (Was a wrong recommendation in an
+   earlier draft.)
 
 2. **Leaf nodes expand the full UNMASKED action space — both engines** (`mcts.py:146-147,640`;
    `tensor_mcts.py:1195-1197`). Known-deferred issue #1, confirmed live on both paths: the
@@ -71,13 +75,26 @@ chosen shuffle move if enabled — keep off until the value/terminal issue is re
 
 ## Lever experiments (15k checkpoint, scripts/trace_threefold.py)
 
-- Baseline (sims=200, temp_final=0.1): 46% threefold, 12.5% decisive (24 games).
-- sims=800, temp=0.1 (cell B, 16 games): 75% threefold, 6% decisive — MORE search HURT
-  (amplifies miscalibrated value; replicates the sim-scaling probe).
-- temp/alpha sweeps: in progress (see /tmp/tf_C, /tmp/tf_D, /tmp/tf_alpha_*).
+All on checkpoint_15000, 16 games/cell (baseline 24), seed 0. EVERY search-side lever fails
+to fix the repetition → the binding constraint is the value/target, not search.
+- Baseline (sims=200, temp=0.1): 46% threefold, 12.5% decisive (24 games).
+- sims (200→800, temp 0.1): threefold 46%→75%, decisive 12.5%→6%. MORE search HURT (amplifies
+  the miscalibrated value; replicates the sim-scaling probe). Holds at temp 0.75 too
+  (cell C→D: threefold 12%→44%, decisive 31%→6%).
+- temp (0.1→0.75, sims 200): threefold 46%→12%, decisive 12.5%→31% BUT unfinished →31% — temp
+  only scatters the shuffle via late-game randomness/blunders (not skillful conversion); the
+  decisive bump is noise- and blunder-driven, with games wandering to the ply cap.
+- dirichlet_alpha (0.1→0.3→1.0, sims 200, temp 0.1): threefold 44%→56%→81% (rose), decisive
+  flat, chosen-move visit frac at rep positions ~0.44 for ALL α. α is not a lever (see above).
+Conclusion: sims hurt, temp only scatters via blunders, α does nothing — search/exploration
+cannot fix it; the fix is target-side (win adjudication) + structural (in-search repetition
+penalty). A bigger value head or more sims does not help.
 
 ## Implications for the NEXT run (do NOT change mid-isolation on convhead)
 
-Cheap, in config: `dirichlet_alpha` 0.1 → 0.3. Medium: leaf-node legal masking. The real fix
-is still target-side/structural: win adjudication + MCTS-level repetition penalty. A bigger
-value head or more sims does NOT help (more sims hurt). See [[value-sibling-ranking]].
+The real fix is target-side/structural: **win adjudication** (correct decisive labels) +
+**MCTS-level repetition penalty** (the latent model can't see repetition). Medium: leaf-node
+legal masking (stops budget leaking into illegal subtrees). Search/exploration knobs do NOT
+help — tested: more sims hurt, temperature only scatters via blunders, and dirichlet_alpha
+tuning does nothing (chosen-move visit frac at rep positions is ~0.44 for α∈{0.1,0.3,1.0}).
+A bigger value head doesn't help either. See [[value-sibling-ranking]].

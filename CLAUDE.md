@@ -46,12 +46,15 @@ latent net only — no terminal/draw branch in select/expand/backprop, both engi
 shuffle keeps full winning value (root_value RISES into the repetition) and is the top-Q
 move → MCTS banks a phantom win into the draw. **MCTS math is CORRECT** (PUCT/backup/MinMax
 identical numpy↔tensor to ~1e-16; no divergence). Three exploration issues, none a math bug:
-(1) `dirichlet_alpha=0.1` too peaked → a prior-0.06 converting move starved ~half the
-searches; **raise to 0.3**. (2) leaf nodes expand the FULL unmasked action space, both
-engines (`mcts.py:146-147,640`, `tensor_mcts.py:1195-1197`) — known deferred issue #1;
-**add leaf legal masking**. (3) no in-search repetition penalty (structural MuZero limit) —
-**add MCTS-level repetition penalty + win adjudication**. More sims HURT (800 sims → 75%
-threefold vs 200 sims → 46%). See [[repetition-draw-mechanism]], [[value-sibling-ranking]].
+(1) leaf nodes expand the FULL unmasked action space, both engines (`mcts.py:146-147,640`,
+`tensor_mcts.py:1195-1197`) — known deferred issue #1; **add leaf legal masking**. (2) no
+in-search repetition penalty (structural MuZero limit) — **add MCTS-level repetition penalty
++ win adjudication**. ALL search-side levers tested and FAIL: more sims HURT (800→75%
+threefold vs 200→46%), temperature only scatters via blunders (unfinished→31%), and
+`dirichlet_alpha` tuning does NOTHING (threefold 44/56/81% for α=0.1/0.3/1.0; chosen-move
+visit frac at rep positions ~0.44 for all α — root noise is washed out by the value verdict).
+The fix is target-side (win adjudication), not search. See [[repetition-draw-mechanism]],
+[[value-sibling-ranking]].
 
 ### Draw-basin pipeline bugs — 2026-06-13 (see `bug_hunt_2026_06_13.md`), now mostly FIXED
 - **(FIXED) `select_action_gpu` / policy targets** (`src/mcts/tensor_mcts.py`,
