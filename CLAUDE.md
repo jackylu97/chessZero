@@ -23,27 +23,33 @@ MuZero multi-game implementation in PyTorch. Three phases:
 
 ## Known Issues / Deferred Work
 
-### Draw-basin pipeline bugs — CONFIRMED 2026-06-13 (see `bug_hunt_2026_06_13.md`)
-Three verified self-play data-pipeline defects, all draw-basin contributors,
-none yet fixed (pending review — no code changed). Full evidence in the doc.
-- **(HIGH) `select_action_gpu` temperature per-slot, not per-action** (`src/mcts/tensor_mcts.py:88-121`).
-  Duplicate root-sample slots are softmax'd BEFORE being summed, so at T≠1 the
-  GPU production path picks wrong moves (56/64 games) and writes de-sharpened /
-  near-uniform policy training targets. Numpy reference path is correct; tests
-  miss it.
-- **(HIGH) Policy targets use the sampling temperature, not raw visit counts**
-  (`src/mcts/mcts.py:678`, all `self_play.py` loops). At `temperature_final=0.1`
-  every target past ply 30 is ~one-hot(argmax). Docstring + reanalyze (T=1.0)
-  prove intent was `N(a)/ΣN(a)`. Shares a fix with the above: build the target
-  from deduplicated raw visit fractions, decoupled from sampling temperature.
-- **(HIGH) GPU engine never detects insufficient material** (`src/games/chess_gpu.py:1708`).
-  K-vs-K / KB-vs-K / KN-vs-K run to the 75-move clock (~150-230 extra plies)
-  instead of drawing immediately as CPU/python-chess does, flooding the buffer
-  with `[0,1,0]` draw targets and desyncing self-play vs warmstart/eval labels.
-- **(MEDIUM) Mutating terminal observation** (`chess_gpu.py:1636-1722`): board
-  fields aren't frozen for done games, so the end-of-batch `final_obs` is corrupt
-  for every game that finished before the batch's last — poisoning the terminal
-  (decisive-labeled) value sample of those games.
+### Draw-basin ROOT CAUSE — V^π ≈ draw (CONFIRMED 2026-06-17, `scripts/probe_value_target_audit.py`)
+The deepest issue is NOT a code bug: the self-play value target is the game
+OUTCOME under the current (weak) policy. The policy can't convert wins, so
+objectively-winning positions are played out to draws and labeled ~draw. Audit
+of the 76k buffer: positions Stockfish rates >+3 for the side to move get mean
+target z=+0.18 with **67% outright draws** (root_value only +0.26). So the value
+head is trained to call winning positions ≈draw → can't rank positions/moves →
+MCTS gets no signal → policy never improves → self-reinforcing. Sim-scaling
+probe (`probe_sim_scaling.py`) confirms: more MCTS search HELPS at the warmstart
+checkpoint but HURTS at self-play checkpoints (search amplifies the miscalibrated
+value). A bigger value head does NOT fix this (target has no resolution); the fix
+must INJECT decisive signal — win adjudication (don't play won positions out to
+draws), persistent Stockfish value supervision, and/or TD bootstrap targets
+(root_value tracks SF better, corr 0.47 vs z 0.18). See [[value-sibling-ranking]].
+
+### Draw-basin pipeline bugs — 2026-06-13 (see `bug_hunt_2026_06_13.md`), now mostly FIXED
+- **(FIXED) `select_action_gpu` / policy targets** (`src/mcts/tensor_mcts.py`,
+  `src/mcts/mcts.py`): targets are now deduped raw visit fractions, temperature-
+  independent (bug_hunt §A/§B). Plus the root now enumerates all legal moves when
+  `num_legal <= sample_k` instead of always sampling (commit a9906eb).
+- **(FIXED) GPU insufficient-material draw** (`src/games/chess_gpu.py:1864-1866`,
+  commit `0da507f`, `tests/test_chess_gpu_insufficient_material.py`): wired into
+  the `done` mask. NOTE: this only handles DEAD draws (KvK/KBvK/KNvK); it does NOT
+  address winning-but-unconverted positions (that's the V^π issue above).
+- **(MEDIUM, unverified) Mutating terminal observation** (`chess_gpu.py:1636-1722`):
+  board fields may not be frozen for done games, possibly corrupting end-of-batch
+  `final_obs`. Status not re-verified.
 
 ### 1. Illegal moves at MCTS leaf nodes (`src/mcts/mcts.py:127`)
 At the root, legal actions from the game engine are correctly masked (legal_actions_list is now stored in GameHistory and used during reanalyze). At leaf nodes (latent space), all `action_space_size` actions are still treated as legal. Two consequences:
