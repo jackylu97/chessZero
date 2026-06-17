@@ -575,6 +575,12 @@ def get_config(game: str) -> MuZeroConfig:
             policy_head_type="conv",    # AlphaZero spatial 73-plane policy head (8×8×73=4672);
                                         # removes the flat head's 2-channel/128-dim bottleneck that
                                         # left the policy unable to rank legal moves. Chess-only.
+            use_moves_left=True,        # Lc0 moves-left head: aux CE on plies-to-end. Trains during
+                                        # warmstart (Stockfish game lengths). Breaks value saturation
+                                        # so search can prefer faster wins over shuffling. The gated
+                                        # MCTS utility (Step 4) is wired separately; this enables the
+                                        # head + training loss now so it's trained by the time self-play
+                                        # needs it. See mcts_audit_2026_06_17.md.
             value_head_type="wdl",      # Lc0-style 3-output W/D/L classifier; replaces
                                         # the 5-bin scalar head. Targets game outcome z directly,
                                         # eliminating the predict-zero collapse failure mode where
