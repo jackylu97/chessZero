@@ -141,6 +141,15 @@ class ChessGame(Game):
             current_player=1,  # white = 1, black = -1
         )
 
+    def reset_from_fen(self, fen: str) -> GameState:
+        """Start a game from an arbitrary FEN (e.g. endgame-seed curriculum).
+        current_player follows the side to move in the FEN."""
+        board = chess.Board(fen)
+        return GameState(
+            board=board,
+            current_player=1 if board.turn == chess.WHITE else -1,
+        )
+
     def step(self, state: GameState, action: int) -> tuple[GameState, float, bool]:
         board = state.board.copy()
         move = _action_to_move(action, board)

@@ -29,6 +29,11 @@ class GameHistory:
     # shuffle penalty). NOT set for stalemate / insufficient-material / ply-cap.
     draw_by_repetition: bool = False
     draw_by_no_progress: bool = False
+    # Optional starting position (FEN) for games that do NOT begin from the
+    # standard initial position — e.g. endgame-seed curriculum games. When set,
+    # from_compact_dict replays actions from this FEN instead of game.reset().
+    # None (default) => standard start; existing shards omit the key entirely.
+    start_fen: str | None = None
     # Monotonic insertion counter, stamped by ReplayBuffer.save_game and used by
     # the buffer's retention-weighted eviction (decisive games age slower).
     # Runtime-only — not serialized in the compact dict; reassigned on load().
@@ -94,6 +99,8 @@ class GameHistory:
         }
         if self.external_values:
             d["external_values"] = np.asarray(self.external_values, dtype=np.float32)
+        if self.start_fen:
+            d["start_fen"] = self.start_fen
         return d
 
     @classmethod
@@ -120,7 +127,12 @@ class GameHistory:
         gh.draw_by_repetition = bool(d.get("draw_by_repetition", False))
         gh.draw_by_no_progress = bool(d.get("draw_by_no_progress", False))
 
-        state = game.reset()
+        start_fen = d.get("start_fen")
+        gh.start_fen = start_fen
+        if start_fen is not None and hasattr(game, "reset_from_fen"):
+            state = game.reset_from_fen(start_fen)
+        else:
+            state = game.reset()
         gh.observations.append(game.to_tensor(state))
         for a in gh.actions:
             gh.legal_actions_list.append(game.legal_actions(state))
