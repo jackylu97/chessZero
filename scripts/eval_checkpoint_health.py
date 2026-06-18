@@ -92,18 +92,29 @@ EARLY_STEPS = 6000
 
 
 def build_network(ckpt, game, cfg, device):
+    # Detect heads from the checkpoint so old and new architectures both load
+    # (matches play_web.load_network). Lets the probe compare e.g. a conv+moves-left
+    # checkpoint against a conv-only one.
+    sd = ckpt["model_state_dict"]
+    has_conv_policy = any(".policy_head.mix." in k or ".policy_head.proj." in k for k in sd)
+    has_moves_left = any(k.startswith("moves_left_head.") for k in sd)
+    has_consistency = any(k.startswith("projection.") for k in sd)
+    has_inverse = any(k.startswith("inverse_dynamics_head.") for k in sd)
     net = MuZeroNetwork(
         observation_channels=game.num_planes * cfg.history_frames,
         action_space_size=game.action_space_size, hidden_planes=cfg.hidden_planes,
         num_blocks=cfg.num_residual_blocks, latent_h=cfg.latent_h, latent_w=cfg.latent_w,
         input_h=8, input_w=8, fc_hidden=cfg.fc_hidden, value_support_size=cfg.value_support_size,
         reward_support_size=cfg.reward_support_size, action_embed_dim=cfg.action_embed_dim,
-        use_consistency_loss=cfg.use_consistency_loss, proj_hid=cfg.proj_hid, proj_out=cfg.proj_out,
+        use_consistency_loss=has_consistency, proj_hid=cfg.proj_hid, proj_out=cfg.proj_out,
         pred_hid=cfg.pred_hid, pred_out=cfg.pred_out, use_scalar_transform=cfg.use_scalar_transform,
         value_target_scale=cfg.value_target_scale, value_head_type=cfg.value_head_type,
         draw_score=cfg.draw_score, value_head_init_std=getattr(cfg, "value_head_init_std", 0.0),
-        use_inverse_dynamics_loss=getattr(cfg, "use_inverse_dynamics_loss", False),
+        use_inverse_dynamics_loss=has_inverse,
         inverse_dynamics_hidden=getattr(cfg, "inverse_dynamics_hidden", 256),
+        policy_head_type="conv" if has_conv_policy else "flat",
+        use_moves_left=has_moves_left,
+        moves_left_support_size=getattr(cfg, "moves_left_support_size", 10),
     ).to(device)
     net.load_state_dict(ckpt["model_state_dict"])
     net.eval()
