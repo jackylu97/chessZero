@@ -585,10 +585,12 @@ def get_config(game: str) -> MuZeroConfig:
                                         # left the policy unable to rank legal moves. Chess-only.
             use_moves_left=True,        # Lc0 moves-left head: aux CE on plies-to-end. Trains during
                                         # warmstart (Stockfish game lengths). Breaks value saturation
-                                        # so search can prefer faster wins over shuffling. The gated
-                                        # MCTS utility (Step 4) is wired separately; this enables the
-                                        # head + training loss now so it's trained by the time self-play
-                                        # needs it. See mcts_audit_2026_06_17.md.
+                                        # so search can prefer faster wins over shuffling. See
+                                        # mcts_audit_2026_06_17.md.
+            moves_left_mcts=True,       # Enable the gated MLH search utility (Step 4). Acts only in
+                                        # self-play search (post-warmup), where the head is trained.
+                                        # Forces TensorMCTS off the Triton kernel onto torch _select
+                                        # (the MLH/override live there; Triton port deferred).
             value_head_type="wdl",      # Lc0-style 3-output W/D/L classifier; replaces
                                         # the 5-bin scalar head. Targets game outcome z directly,
                                         # eliminating the predict-zero collapse failure mode where
