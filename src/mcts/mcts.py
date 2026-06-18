@@ -51,6 +51,11 @@ class MCTSNode:
         "child_rewards", "child_value_sums",
         "value_prior", "root_legal_actions", "root_legal_logits",
         "root_sampled_perturbed", "min_max_q",
+        # Root-terminal-draws override: (K,) float with NaN=normal, else the
+        # mover-POV draw value used DIRECTLY as raw_q in selection (so a winning
+        # side avoids the repeating move, a losing side keeps it). terminal_value
+        # marks a materialized child as a non-expanding terminal-draw leaf.
+        "child_terminal_value", "terminal_value",
     )
 
     def __init__(self, prior: float = 0.0, visit_count: int = 0,
@@ -72,6 +77,8 @@ class MCTSNode:
         self.root_legal_logits = None        # (|legals|,) float64 — raw logits at legal actions; used to build dense π' training target
         self.root_sampled_perturbed = None   # (m,) float64 — g(a)+logits(a) at sampled actions, parallel to child_actions
         self.min_max_q = None                # (min, max) Q bounds after search
+        self.child_terminal_value = None     # (K,) float64 NaN=normal; else forced-draw mover-POV value
+        self.terminal_value = None           # float on a materialized forced-draw child (don't expand)
 
     @property
     def value(self) -> float:
@@ -238,6 +245,9 @@ class MCTS:
         child = node.children[idx]
         if child is None:
             child = MCTSNode(prior=float(node.child_priors[idx]))
+            tv = node.child_terminal_value
+            if tv is not None and tv[idx] == tv[idx]:  # not NaN → forced-draw terminal child
+                child.terminal_value = float(tv[idx])
             node.children[idx] = child
         return child
 
@@ -276,13 +286,17 @@ class MCTS:
         visits = node.child_visits.tolist()
         rewards = node.child_rewards.tolist()
         value_sums = node.child_value_sums.tolist()
+        term = node.child_terminal_value.tolist() if node.child_terminal_value is not None else None
 
         best_score = -float("inf")
         best_idx = -1
         for i in range(len(priors)):
             v = visits[i]
             prior_score = pb_c * priors[i] * sqrt_n / (1.0 + v)
-            if v > 0:
+            if term is not None and term[i] == term[i]:  # forced-draw terminal: fixed Q, all visit counts
+                raw_q = term[i]
+                value_score = (raw_q - mm_min) / mm_span if has_range else raw_q
+            elif v > 0:
                 # Mover-POV Q at this child:
                 #   Q(parent POV) = child.reward + γ * V(child)_parent_POV
                 #                 = child.reward + γ * (-child.value_child_POV)
@@ -321,6 +335,19 @@ class MCTS:
         else:
             normalized_q = raw_q
         value_scores = np.where(visits > 0, normalized_q, 0.0)
+
+        # Root-terminal-draws: forced-draw children use the fixed draw value as Q at
+        # ALL visit counts (overrides the visits>0 gate), so a winning side avoids
+        # the repeating move and a losing side keeps it.
+        term = node.child_terminal_value
+        if term is not None:
+            tmask = ~np.isnan(term)
+            if tmask.any():
+                if min_max_stats.maximum > min_max_stats.minimum:
+                    tnorm = (term - min_max_stats.minimum) / (min_max_stats.maximum - min_max_stats.minimum)
+                else:
+                    tnorm = term
+                value_scores = np.where(tmask, tnorm, value_scores)
 
         scores = prior_scores + value_scores
         best_idx = int(np.argmax(scores))
@@ -481,10 +508,17 @@ class BatchedMCTS(MCTS):
         observations: list[torch.Tensor],
         legal_actions_list: list[list[int]],
         add_noise: bool = True,
+        forced_draw_actions: list | None = None,
     ) -> list[MCTSNode]:
+        """forced_draw_actions: optional per-game container (set/list) of root action
+        indices that lead to a draw-by-repetition / 50-move. Those root children are
+        treated as terminal with the contempt draw value (root-terminal-draws override):
+        a winning side plays on, a losing side keeps the draw. Caller derives them from
+        the real board (the agent's own move history — not a simulator oracle)."""
         n = len(observations)
         roots = [MCTSNode() for _ in range(n)]
         min_max_stats = [MinMaxStats() for _ in range(n)]
+        draw_score = float(getattr(self.config, "draw_score", 0.0))
 
         action_space_size = self.game.action_space_size
         sample_k = getattr(self.config, "sample_k", None)
@@ -564,6 +598,13 @@ class BatchedMCTS(MCTS):
             self._expand_from_priors(roots[g], actions_np, priors_np)
             if add_noise and roots[g].children:
                 self._add_dirichlet_noise(roots[g])
+            if forced_draw_actions is not None and forced_draw_actions[g]:
+                fd = forced_draw_actions[g]
+                ctv = np.full(len(roots[g].child_actions), np.nan, dtype=np.float64)
+                for ci, a in enumerate(roots[g].child_actions):
+                    if int(a) in fd:
+                        ctv[ci] = draw_score
+                roots[g].child_terminal_value = ctv
 
         for _ in range(self.config.num_simulations):
             search_paths = []
@@ -630,6 +671,15 @@ class BatchedMCTS(MCTS):
 
             for g in range(n):
                 leaf = search_paths[g][-1]
+                if leaf.terminal_value is not None:
+                    # Forced-draw terminal child: do NOT expand. Back up the draw
+                    # value (0.0 — a draw ≈ 0 for the value target; the contempt
+                    # draw_score acts only in selection, matching draw_score's
+                    # "tree-side only" semantics). The recurrent_inference for this
+                    # game this step is discarded (wasteful but rare; correctness > speed).
+                    self._backpropagate(search_paths[g], path_indices_all[g],
+                                        0.0, min_max_stats[g])
+                    continue
                 leaf.hidden_state = next_hiddens[g]
                 leaf.reward = rewards_list[g]
                 if use_sampled_leaf:

@@ -81,6 +81,22 @@ def _rep_override(root, board, chosen_action, draw_score):
     return best
 
 
+def _forced_draw_actions(board, legal_actions):
+    """Set of root action indices that lead to a draw-by-repetition / 50-move,
+    via the real board (the agent's own move history). Passed to run_batch so the
+    in-search root-terminal-draws override can value them at draw_score."""
+    fd = set()
+    for a in legal_actions:
+        mv = _action_to_move(int(a), board)
+        if mv is None:
+            continue
+        board.push(mv)
+        if board.is_repetition(3) or board.halfmove_clock >= 100:
+            fd.add(int(a))
+        board.pop()
+    return fd
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -128,9 +144,15 @@ def main():
         legal = {g: game.legal_actions(states[g]) for g in active}
         mcts_g = [g for g in active if mc[g] >= n_random]
         roots = {}
+        fd_by_g = {}
         if mcts_g:
             obs_list = [stack_with_history(single[g], obs_hist[g], nf) for g in mcts_g]
-            rs = mcts.run_batch(obs_list, [legal[g] for g in mcts_g], add_noise=True)
+            fda = None
+            if args.root_terminal_draws:
+                fd_by_g = {g: _forced_draw_actions(states[g].board, legal[g]) for g in mcts_g}
+                fda = [fd_by_g[g] for g in mcts_g]   # in-search override: real mechanism
+            rs = mcts.run_batch(obs_list, [legal[g] for g in mcts_g], add_noise=True,
+                                forced_draw_actions=fda)
             roots = dict(zip(mcts_g, rs))
         for g in active:
             board = states[g].board
@@ -141,10 +163,8 @@ def main():
                 temp = temp_init if mc[g] < cfg.temperature_drop_step else cfg.temperature_final
                 action, _ = select_action(root, temperature=temp)
                 rv = float(root.value)
-                if args.root_terminal_draws:
-                    alt = _rep_override(root, board, action, cfg.draw_score)
-                    if alt is not None:
-                        action = alt; overrides[g] += 1
+                if fd_by_g.get(g):
+                    overrides[g] += 1   # a forced-draw option existed this ply (override active)
                 tk = root_topk(root, board, args.topk)
                 mv = _action_to_move(int(action), board)
                 traces[g].append({
