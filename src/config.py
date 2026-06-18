@@ -1,6 +1,6 @@
 """Hyperparameter configurations per game."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 @dataclass
@@ -740,4 +740,20 @@ def get_config(game: str) -> MuZeroConfig:
             dirichlet_alpha=0.1,
         ),
     }
+    # chess_small: a ~5x-smaller chess net for fast hyperparameter iteration.
+    # Same game (ChessGame, via game="chess") and ALL chess settings inherited;
+    # only the model size shrinks, so experiments differ from the chess preset
+    # only in capacity. ~22.9M -> ~4.6M params (4.9x); inference backbone (the
+    # MCTS/self-play forward) 5.9M -> 1.4M (~4.3x faster turnaround). The SSL
+    # projection (was 46% of params) and the inverse-dynamics head (24%) are the
+    # biggest cuts. Select with `--game chess_small`; override any HP via CLI.
+    configs["chess_small"] = replace(
+        configs["chess"],
+        hidden_planes=64,            # 128 -> 64  (block conv params scale ~quadratically)
+        num_residual_blocks=6,       # 8 -> 6
+        fc_hidden=64,                # 128 -> 64
+        proj_hid=384, proj_out=384,  # SSL projection MLP: 1024 -> 384
+        pred_hid=192, pred_out=384,  # SimSiam predictor (pred_out must match proj_out)
+        inverse_dynamics_hidden=96,  # 256 -> 96
+    )
     return configs.get(game, configs["tictactoe"])

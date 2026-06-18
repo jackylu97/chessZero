@@ -28,7 +28,7 @@ def get_game(name: str):
     if name == "connect4":
         from src.games.connect4 import Connect4
         return Connect4()
-    if name == "chess":
+    if name in ("chess", "chess_small"):
         from src.games.chess import ChessGame
         return ChessGame()
     if name == "checkers":
@@ -40,7 +40,7 @@ def get_game(name: str):
 def main():
     parser = argparse.ArgumentParser(description="Train MuZero")
     parser.add_argument("--game", type=str, default="tictactoe",
-                        choices=["tictactoe", "connect4", "chess", "checkers"])
+                        choices=["tictactoe", "connect4", "chess", "chess_small", "checkers"])
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--log-dir", type=str, default="runs")
