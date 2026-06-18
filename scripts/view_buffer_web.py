@@ -66,8 +66,11 @@ def _policy_top(pol, board, k: int = 3) -> list:
         if p <= 0.0:
             break
         mv = _action_to_move(int(a), board)
-        san = board.san(mv) if (mv is not None and mv in board.legal_moves) else f"?{int(a)}"
-        out.append([san, round(p, 3)])
+        if mv is not None and mv in board.legal_moves:
+            san, uci = board.san(mv), mv.uci()
+        else:
+            san, uci = f"?{int(a)}", None
+        out.append([san, round(p, 3), uci])  # uci drives the board arrows
     return out
 
 
@@ -128,6 +131,8 @@ HTML = """<!DOCTYPE html>
   .meta { color: #666; font-size: 13px; margin-bottom: 12px; }
   .layout { display: grid; grid-template-columns: 480px 1fr; gap: 24px; }
   #board { width: 480px; }
+  .boardwrap { position: relative; width: 480px; }
+  #arrows { position: absolute; left: 0; top: 0; z-index: 10; pointer-events: none; }
   .controls { margin: 12px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
   .controls button { padding: 6px 12px; font-size: 14px; cursor: pointer; border: 1px solid #bbb; background: white; border-radius: 4px; }
   .controls button:hover { background: #f0f0f0; }
@@ -167,7 +172,7 @@ HTML = """<!DOCTYPE html>
 </div>
 <div class="layout">
   <div>
-    <div id="board"></div>
+    <div class="boardwrap"><div id="board"></div><svg id="arrows" xmlns="http://www.w3.org/2000/svg"></svg></div>
     <div class="controls">
       <button onclick="step(-999999)">⏮</button>
       <button onclick="step(-1)">◀</button>
@@ -256,6 +261,53 @@ function renderInfo() {
         `${g.captures} captures · ${g.checks} checks ${gameTag(g)}`;
 }
 
+const SVGNS = 'http://www.w3.org/2000/svg';
+
+function squareCenter(sq, originRect) {
+    const el = document.querySelector('#board [data-square="' + sq + '"]');
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.left + r.width / 2 - originRect.left, y: r.top + r.height / 2 - originRect.top };
+}
+
+function addArrow(svg, x1, y1, x2, y2, width, opacity) {
+    const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len, uy = dy / len, px = -uy, py = ux;
+    const head = Math.max(12, width * 2.0);
+    const ex = x2 - ux * head, ey = y2 - uy * head;  // base of the arrowhead
+    const hw = head * 0.6, color = '#1565c0';
+    const line = document.createElementNS(SVGNS, 'line');
+    line.setAttribute('x1', x1); line.setAttribute('y1', y1);
+    line.setAttribute('x2', ex); line.setAttribute('y2', ey);
+    line.setAttribute('stroke', color); line.setAttribute('stroke-width', width);
+    line.setAttribute('stroke-linecap', 'round'); line.setAttribute('opacity', opacity);
+    svg.appendChild(line);
+    const poly = document.createElementNS(SVGNS, 'polygon');
+    poly.setAttribute('points', `${x2},${y2} ${ex + px * hw},${ey + py * hw} ${ex - px * hw},${ey - py * hw}`);
+    poly.setAttribute('fill', color); poly.setAttribute('opacity', opacity);
+    svg.appendChild(poly);
+}
+
+function drawArrows() {
+    const svg = document.getElementById('arrows');
+    const br = document.getElementById('board').getBoundingClientRect();
+    svg.setAttribute('width', br.width); svg.setAttribute('height', br.height);
+    svg.style.width = br.width + 'px'; svg.style.height = br.height + 'px';
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    if (!currentGame || ply >= currentGame.num_plies) return;
+    const origin = svg.getBoundingClientRect();
+    const pt = (currentGame.policy_top && currentGame.policy_top[ply]) || [];
+    // weakest first so the highest-probability arrow renders on top
+    for (const entry of pt.slice().reverse()) {
+        const prob = entry[1], uci = entry[2];
+        if (!uci) continue;
+        const from = squareCenter(uci.slice(0, 2), origin);
+        const to = squareCenter(uci.slice(2, 4), origin);
+        if (!from || !to) continue;
+        addArrow(svg, from.x, from.y, to.x, to.y, 3 + prob * 14, 0.3 + prob * 0.6);
+    }
+}
+
 function setPly(p) {
     if (!currentGame) return;
     ply = Math.max(0, Math.min(currentGame.fens.length - 1, p));
@@ -264,6 +316,7 @@ function setPly(p) {
     document.getElementById('plyLabel').textContent = `${ply} / ${currentGame.num_plies}`;
     renderMoves();
     renderPly();
+    drawArrows();
 }
 
 function step(delta) { setPly(ply + delta); }
@@ -377,7 +430,7 @@ def load_or_build_records(buffer_path: str, force_rebuild: bool = False) -> list
     Cache path: `<buffer_path>.viewer.pkl`. Rebuilt if missing, older than the
     buffer, or if --rebuild-cache is passed.
     """
-    cache_path = buffer_path + ".viewer3.pkl"  # v3: adds reanalyze_count
+    cache_path = buffer_path + ".viewer4.pkl"  # v4: policy_top carries uci (for arrows)
     if not force_rebuild and os.path.exists(cache_path):
         if os.path.getmtime(cache_path) >= os.path.getmtime(buffer_path):
             print(f"Loading cache {cache_path} ...")
