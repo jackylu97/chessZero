@@ -116,6 +116,14 @@ def main():
                              "MCTS-root-value blend into the outcome one-hot for "
                              "self-play positions (self-referential → keep cool, "
                              "e.g. 0.1; AlphaZero/Lc0 default 0.0).")
+    parser.add_argument("--temperature-drop-step", type=int, default=None,
+                        help="Override config.temperature_drop_step (plies of tau=init before tau=final).")
+    parser.add_argument("--dirichlet-alpha", type=float, default=None,
+                        help="Override config.dirichlet_alpha (root exploration noise concentration).")
+    parser.add_argument("--no-moves-left", dest="use_moves_left", action="store_false", default=None,
+                        help="Disable the moves-left head AND its MCTS utility for this run (ablation).")
+    parser.add_argument("--use-moves-left", dest="use_moves_left", action="store_true", default=None,
+                        help="Force-enable the moves-left head.")
     parser.add_argument("--repetition-penalty", type=float, default=None,
                         help="Override config.repetition_penalty. δ in [0,1]: tilts "
                              "the value target of a self-play NO-PROGRESS draw "
@@ -244,6 +252,14 @@ def main():
         config.warmstart_q_ratio = args.warmstart_q_ratio
     if args.selfplay_q_ratio is not None:
         config.selfplay_q_ratio = args.selfplay_q_ratio
+    if args.temperature_drop_step is not None:
+        config.temperature_drop_step = args.temperature_drop_step
+    if args.dirichlet_alpha is not None:
+        config.dirichlet_alpha = args.dirichlet_alpha
+    if args.use_moves_left is not None:
+        config.use_moves_left = args.use_moves_left
+        if not args.use_moves_left:
+            config.moves_left_mcts = False  # disabling the head also disables its search utility
     if args.repetition_penalty is not None:
         config.repetition_penalty = args.repetition_penalty
     if args.repetition_penalty_window is not None:
