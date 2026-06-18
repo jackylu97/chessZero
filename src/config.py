@@ -752,8 +752,9 @@ def get_config(game: str) -> MuZeroConfig:
         hidden_planes=64,            # 128 -> 64  (block conv params scale ~quadratically)
         num_residual_blocks=6,       # 8 -> 6
         fc_hidden=64,                # 128 -> 64
-        proj_hid=384, proj_out=384,  # SSL projection MLP: 1024 -> 384
-        pred_hid=192, pred_out=384,  # SimSiam predictor (pred_out must match proj_out)
+        proj_hid=512, proj_out=512,  # SSL projection MLP: 1024 -> 512
+        pred_hid=256, pred_out=512,  # SimSiam predictor: pred_out matches proj_out (512);
+                                     # pred_hid=256 keeps the predictor bottleneck (half of proj_out)
         inverse_dynamics_hidden=96,  # 256 -> 96
         # Pure MuZero/AlphaZero exploration formulation: NO random openings — rely
         # solely on visit-count temperature (tau=1 for the first temperature_drop_step
