@@ -39,6 +39,7 @@ import numpy as np
 import torch
 
 from src.mcts.mcts import MCTSNode
+from src.model.utils import support_to_scalar, inverse_scalar_transform
 
 
 _NEG_INF = float("-inf")
@@ -209,6 +210,24 @@ class TensorMCTS:
             )
         if select_backend == "triton" and self.device.type != "cuda":
             raise ValueError("select_backend='triton' requires CUDA.")
+
+        # MLH search utility + root-terminal-draws override. Both are implemented in
+        # the torch _select path only (NOT the Triton kernel), so force a non-triton
+        # backend when either is on. (Triton port is a deferred speed follow-up.)
+        self._use_ml_utility = (
+            bool(getattr(config, "moves_left_mcts", False))
+            and network is not None
+            and getattr(network, "moves_left_head", None) is not None
+        )
+        self._use_terminal_draws = bool(getattr(config, "root_terminal_draws", False))
+        self._ml_threshold = float(getattr(config, "ml_threshold", 0.3))
+        self._ml_slope = float(getattr(config, "ml_slope", 0.005))
+        self._ml_max_effect = float(getattr(config, "ml_max_effect", 0.1))
+        self._ml_support = (getattr(network, "moves_left_support_size", 10)
+                            if network is not None else 10)
+        self._draw_score = float(getattr(config, "draw_score", 0.0))
+        if (self._use_ml_utility or self._use_terminal_draws) and select_backend == "triton":
+            select_backend = "compile" if self.compile else "eager"
         self.select_backend = select_backend
 
         self.action_space_size = int(game.action_space_size)
@@ -297,6 +316,9 @@ class TensorMCTS:
         self.node_visits = torch.zeros(n, m, dtype=torch.int32, device=dev)
         self.node_value_sum = torch.zeros(n, m, dtype=torch.float32, device=dev)
         self.node_reward = torch.zeros(n, m, dtype=torch.float32, device=dev)
+        # Expected plies-to-end per node (MLH search utility). 0 until a node is
+        # expanded; only used when the moves-left utility is enabled.
+        self.node_moves_left = torch.zeros(n, m, dtype=torch.float32, device=dev)
         self.node_hidden = torch.zeros(n, m, c, h, w, dtype=self.hidden_dtype, device=dev)
         self.parent_idx = torch.full((n, m), -1, dtype=torch.int32, device=dev)
         self.parent_child_slot = torch.full((n, m), -1, dtype=torch.int32, device=dev)
@@ -360,6 +382,7 @@ class TensorMCTS:
         self.node_visits.zero_()
         self.node_value_sum.zero_()
         self.node_reward.zero_()
+        self.node_moves_left.zero_()
         # node_hidden is overwritten on allocation; no need to zero.
         self.parent_idx.fill_(-1)
         self.parent_child_slot.fill_(-1)
@@ -1052,6 +1075,26 @@ class TensorMCTS:
             value_score = torch.where(visits_f > 0, normalized_q, torch.zeros_like(normalized_q))
 
             scores = prior_score + value_score
+
+            # MLH utility: among same-Q moves prefer the faster win (smaller child M)
+            # / slower loss, gated to |Q| > threshold. Only on expanded children
+            # (child_node_idx >= 0). Lives in the torch path only (not the Triton kernel).
+            if self._use_ml_utility:
+                child_idx = self.child_node_idx[arange_n, cur]  # [N, K] int32
+                ml_valid = child_idx >= 0
+                child_m = torch.where(
+                    ml_valid,
+                    self.node_moves_left[arange_n.unsqueeze(1), child_idx.clamp(min=0).long()],
+                    torch.zeros_like(value_score),
+                )
+                ml_gate = ml_valid & (raw_q.abs() > self._ml_threshold)
+                ml_term = torch.where(
+                    ml_gate,
+                    torch.sign(-raw_q) * torch.clamp(self._ml_slope * child_m, max=self._ml_max_effect),
+                    torch.zeros_like(value_score),
+                )
+                scores = scores + ml_term
+
             # Mask invalid slots so argmax never picks them.
             scores = torch.where(
                 actions == -1, torch.full_like(scores, _NEG_INF), scores
@@ -1206,6 +1249,11 @@ class TensorMCTS:
         rewards_f32 = rewards.view(-1).to(torch.float32)
         self.node_hidden[arange_n, new_l] = next_hidden.to(self.hidden_dtype)
         self.node_reward[arange_n, new_l] = rewards_f32
+        if self._use_ml_utility:
+            ml_logits = self.network.predict_moves_left(next_hidden)
+            m = inverse_scalar_transform(
+                support_to_scalar(ml_logits, self._ml_support)).clamp(min=0.0)
+            self.node_moves_left[arange_n, new_l] = m.view(-1).to(torch.float32)
         self.parent_idx[arange_n, new_l] = leaf_parent_node
         self.parent_child_slot[arange_n, new_l] = leaf_slot
         self.child_actions[arange_n, new_l, :] = leaf_sampled.to(torch.int32)
