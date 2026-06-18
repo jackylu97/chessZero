@@ -34,6 +34,13 @@ class GameHistory:
     # from_compact_dict replays actions from this FEN instead of game.reset().
     # None (default) => standard start; existing shards omit the key entirely.
     start_fen: str | None = None
+    # Number of times this game has been reanalyzed (policies/root_values
+    # overwritten by the current net's MCTS). 0 => never reanalyzed, so the
+    # stored policy targets still match the net-at-generation-time. Set
+    # deterministically by Trainer._reanalyze. Warmstart games stay 0 (excluded
+    # from reanalyze). Lets the buffer viewer state for sure whether a game's
+    # policy targets were recomputed (decoupled from the played moves).
+    reanalyze_count: int = 0
     # Monotonic insertion counter, stamped by ReplayBuffer.save_game and used by
     # the buffer's retention-weighted eviction (decisive games age slower).
     # Runtime-only — not serialized in the compact dict; reassigned on load().
@@ -101,6 +108,8 @@ class GameHistory:
             d["external_values"] = np.asarray(self.external_values, dtype=np.float32)
         if self.start_fen:
             d["start_fen"] = self.start_fen
+        if self.reanalyze_count:
+            d["reanalyze_count"] = int(self.reanalyze_count)
         return d
 
     @classmethod
@@ -127,6 +136,7 @@ class GameHistory:
         gh.draw_by_repetition = bool(d.get("draw_by_repetition", False))
         gh.draw_by_no_progress = bool(d.get("draw_by_no_progress", False))
 
+        gh.reanalyze_count = int(d.get("reanalyze_count", 0))
         start_fen = d.get("start_fen")
         gh.start_fen = start_fen
         if start_fen is not None and hasattr(game, "reset_from_fen"):

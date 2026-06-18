@@ -40,6 +40,7 @@ class GameRecord:
     is_selfplay: bool = True   # False => warmstart (external_values populated)
     draw_by_repetition: bool = False
     draw_by_no_progress: bool = False
+    reanalyze_count: int = 0   # 0 => policy targets match the net-at-generation-time
     # Per-ply diagnostics (length = num_plies, aligned to fens[i]/the position
     # BEFORE move i). root_values are STM-POV MCTS root values; policy_top is the
     # top-3 (san, prob) of the stored policy target at each position.
@@ -110,6 +111,7 @@ def decode_game(game, idx: int) -> GameRecord:
         is_selfplay=len(getattr(game, "external_values", []) or []) == 0,
         draw_by_repetition=bool(getattr(game, "draw_by_repetition", False)),
         draw_by_no_progress=bool(getattr(game, "draw_by_no_progress", False)),
+        reanalyze_count=int(getattr(game, "reanalyze_count", 0)),
         root_values=root_values,
         policy_top=policy_top,
     )
@@ -146,6 +148,7 @@ HTML = """<!DOCTYPE html>
   .tag { font-size: 11px; padding: 1px 6px; border-radius: 8px; color: white; margin-left: 4px; }
   .tag.sp { background: #1565c0; } .tag.ws { background: #6a1b9a; }
   .tag.rep { background: #c62828; } .tag.np { background: #ef6c00; }
+  .tag.ra { background: #00838f; } .tag.fresh { background: #558b2f; }
 </style>
 </head>
 <body>
@@ -201,6 +204,11 @@ function gameTag(g) {
                           : '<span class="tag ws">warmstart</span>';
     if (g.draw_by_repetition) t += '<span class="tag rep">3-fold</span>';
     if (g.draw_by_no_progress) t += '<span class="tag np">75-move</span>';
+    if (g.is_selfplay) {
+        t += (g.reanalyze_count > 0)
+            ? `<span class="tag ra">reanalyzed ${g.reanalyze_count}x</span>`
+            : '<span class="tag fresh">not reanalyzed</span>';
+    }
     return t;
 }
 
@@ -341,7 +349,8 @@ def games():
              "captures": r.captures, "checks": r.checks,
              "is_selfplay": r.is_selfplay,
              "draw_by_repetition": r.draw_by_repetition,
-             "draw_by_no_progress": r.draw_by_no_progress}
+             "draw_by_no_progress": r.draw_by_no_progress,
+             "reanalyze_count": r.reanalyze_count}
             for r in RECORDS
         ],
     })
@@ -357,6 +366,7 @@ def game(i: int):
         "is_selfplay": r.is_selfplay,
         "draw_by_repetition": r.draw_by_repetition,
         "draw_by_no_progress": r.draw_by_no_progress,
+        "reanalyze_count": r.reanalyze_count,
         "root_values": r.root_values, "policy_top": r.policy_top,
     })
 
@@ -367,7 +377,7 @@ def load_or_build_records(buffer_path: str, force_rebuild: bool = False) -> list
     Cache path: `<buffer_path>.viewer.pkl`. Rebuilt if missing, older than the
     buffer, or if --rebuild-cache is passed.
     """
-    cache_path = buffer_path + ".viewer2.pkl"  # v2: adds is_selfplay/root_values/policy_top
+    cache_path = buffer_path + ".viewer3.pkl"  # v3: adds reanalyze_count
     if not force_rebuild and os.path.exists(cache_path):
         if os.path.getmtime(cache_path) >= os.path.getmtime(buffer_path):
             print(f"Loading cache {cache_path} ...")

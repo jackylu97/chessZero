@@ -1133,7 +1133,17 @@ class MuZeroTrainer:
                 game.root_values[pos] = root.value
                 positions_updated += 1
 
-        tqdm.write(f"Step {self.global_step}: reanalyze done ({positions_updated} positions updated)")
+        # Mark each reanalyzed game deterministically (once per pass). Uses the
+        # unique games that actually contributed positions to this batch, so a
+        # game's reanalyze_count is the exact number of times its policy/value
+        # targets were recomputed by a (newer) net — decoupling them from the
+        # originally-played moves. Persisted via to_compact_dict.
+        touched = {id(g): g for (_, _, g, _) in items}
+        for g in touched.values():
+            g.reanalyze_count += 1
+
+        tqdm.write(f"Step {self.global_step}: reanalyze done ({positions_updated} positions updated, "
+                   f"{len(touched)} games marked)")
         self.writer.add_scalar("reanalyze/positions_updated", positions_updated, self.global_step)
 
     def _policy_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
