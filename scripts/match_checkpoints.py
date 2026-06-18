@@ -55,11 +55,14 @@ def main():
     ap.add_argument("--max-plies", type=int, default=300, help="declare draw past this (draw-basin shuffles)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--game", default="chess",
+                    help="config preset for network sizing (e.g. chess_small). Both "
+                         "checkpoints must share this architecture.")
     args = ap.parse_args()
 
     dev = args.device
     game = ChessGame()
-    cfg = get_config("chess"); cfg.device = dev
+    cfg = get_config(args.game); cfg.device = dev
     cfg.num_simulations = args.sims
     n_frames = getattr(cfg, "history_frames", 1)
     asz = game.action_space_size
