@@ -112,9 +112,10 @@ def main():
     ap.add_argument("--dirichlet-alpha", type=float, default=None,
                     help="Override config.dirichlet_alpha (root exploration noise concentration).")
     ap.add_argument("--root-terminal-draws", action="store_true",
-                    help="Treat draw-by-repetition/50-move as terminal at the root: if the chosen "
-                         "move completes such a draw, switch to the best non-drawing move when one "
-                         "scores above draw_score (winning side plays on; losing side still draws).")
+                    help="In-search root-terminal-draws override: forced-draw root children valued at "
+                         "draw_score (winning side plays on; losing side still draws).")
+    ap.add_argument("--moves-left-mcts", action="store_true",
+                    help="Enable the MLH search utility (prefer faster wins). Needs a trained moves-left head.")
     args = ap.parse_args()
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
@@ -124,6 +125,8 @@ def main():
         cfg.temperature_final = args.temp_final
     if args.dirichlet_alpha is not None:
         cfg.dirichlet_alpha = args.dirichlet_alpha
+    if args.moves_left_mcts:
+        cfg.moves_left_mcts = True
     game = ChessGame()
     net = play_web.load_network(args.checkpoint, game, cfg, args.device)
     mcts = BatchedMCTS(net, game, cfg, args.device)
