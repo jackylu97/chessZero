@@ -755,5 +755,10 @@ def get_config(game: str) -> MuZeroConfig:
         proj_hid=384, proj_out=384,  # SSL projection MLP: 1024 -> 384
         pred_hid=192, pred_out=384,  # SimSiam predictor (pred_out must match proj_out)
         inverse_dynamics_hidden=96,  # 256 -> 96
+        # Pure MuZero/AlphaZero exploration formulation: NO random openings — rely
+        # solely on visit-count temperature (tau=1 for the first temperature_drop_step
+        # plies, then temperature_final) + Dirichlet root noise. Drops the random-
+        # opening double-dip the chess preset uses (random_opening_plies=8).
+        random_opening_plies=0,
     )
     return configs.get(game, configs["tictactoe"])
