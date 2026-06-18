@@ -359,6 +359,9 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
         ".policy_head.mix." in k or ".policy_head.proj." in k for k in state_dict
     ) else "flat"
 
+    # Moves-left head (Lc0): detect so moves-head checkpoints load.
+    has_moves_left = any(k.startswith("moves_left_head.") for k in state_dict)
+
     network = MuZeroNetwork(
         # Input is the T-frame history stack (num_planes * history_frames), matching training.
         observation_channels=game.num_planes * getattr(config, "history_frames", 1),
@@ -384,6 +387,8 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
         value_head_type=getattr(config, "value_head_type", "support"),
         draw_score=getattr(config, "draw_score", 0.0),
         policy_head_type=policy_head_type,
+        use_moves_left=has_moves_left,
+        moves_left_support_size=getattr(config, "moves_left_support_size", 10),
         use_inverse_dynamics_loss=has_inverse,
         inverse_dynamics_hidden=getattr(config, "inverse_dynamics_hidden", 256),
     )

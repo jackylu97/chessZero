@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from src.model.utils import support_to_scalar, inverse_scalar_transform
 from src.mcts.gumbel import (
     compute_improved_policy,
     compute_v_mix,
@@ -56,6 +57,7 @@ class MCTSNode:
         # side avoids the repeating move, a losing side keeps it). terminal_value
         # marks a materialized child as a non-expanding terminal-draw leaf.
         "child_terminal_value", "terminal_value",
+        "moves_left",   # expected plies-to-end at this node (MLH utility); None until expanded
     )
 
     def __init__(self, prior: float = 0.0, visit_count: int = 0,
@@ -79,6 +81,7 @@ class MCTSNode:
         self.min_max_q = None                # (min, max) Q bounds after search
         self.child_terminal_value = None     # (K,) float64 NaN=normal; else forced-draw mover-POV value
         self.terminal_value = None           # float on a materialized forced-draw child (don't expand)
+        self.moves_left = None               # float: expected plies-to-end (MLH utility)
 
     @property
     def value(self) -> float:
@@ -109,6 +112,25 @@ class MCTS:
         self.device = device
         # RNG for Gumbel-Top-K sampling at root. Leaves use torch RNG inline on GPU.
         self._rng = np.random.default_rng()
+        # MLH (moves-left) search utility: prefer faster wins / slower losses among
+        # same-Q moves. Needs a trained moves-left head; off by default.
+        self._use_ml_utility = (
+            bool(getattr(config, "moves_left_mcts", False))
+            and network is not None
+            and getattr(network, "moves_left_head", None) is not None
+        )
+        self._ml_threshold = float(getattr(config, "ml_threshold", 0.3))
+        self._ml_slope = float(getattr(config, "ml_slope", 0.005))
+        self._ml_max_effect = float(getattr(config, "ml_max_effect", 0.1))
+        self._ml_support = (getattr(network, "moves_left_support_size", 10)
+                            if network is not None else 10)
+
+    def _compute_moves_left(self, hidden_batch: torch.Tensor) -> np.ndarray:
+        """Expected plies-to-end (>=0) per row of a batched hidden state, for the
+        MLH utility. hidden_batch: (B, C, H, W)."""
+        logits = self.network.predict_moves_left(hidden_batch)
+        m = inverse_scalar_transform(support_to_scalar(logits, self._ml_support))
+        return m.clamp(min=0.0).detach().cpu().numpy().astype(np.float64)
 
     @torch.no_grad()
     def run(
@@ -308,6 +330,12 @@ class MCTS:
             else:
                 value_score = 0.0
             score = prior_score + value_score
+            if self._use_ml_utility:
+                ch = node.children[i]
+                # moves_left set ⟹ child expanded ⟹ non-terminal, v>0 branch ran ⟹ raw_q defined.
+                if ch is not None and ch.moves_left is not None and abs(raw_q) > self._ml_threshold:
+                    score += math.copysign(1.0, -raw_q) * min(self._ml_slope * ch.moves_left,
+                                                              self._ml_max_effect)
             if score > best_score:
                 best_score = score
                 best_idx = i
@@ -350,6 +378,18 @@ class MCTS:
                 value_scores = np.where(tmask, tnorm, value_scores)
 
         scores = prior_scores + value_scores
+
+        # MLH utility: among same-Q moves prefer faster wins (smaller child M) /
+        # slower losses, gated to |Q| > threshold. Only on expanded children.
+        if self._use_ml_utility:
+            ml_arr = np.array(
+                [c.moves_left if (c is not None and c.moves_left is not None) else np.nan
+                 for c in node.children], dtype=np.float64)
+            mlmask = ~np.isnan(ml_arr) & (np.abs(raw_q) > self._ml_threshold)
+            if mlmask.any():
+                ml_term = np.sign(-raw_q) * np.minimum(self._ml_slope * ml_arr, self._ml_max_effect)
+                scores = scores + np.where(mlmask, ml_term, 0.0)
+
         best_idx = int(np.argmax(scores))
         return int(node.child_actions[best_idx]), best_idx, self._get_or_create_child(node, best_idx)
 
@@ -534,6 +574,7 @@ class BatchedMCTS(MCTS):
         obs_batch = torch.stack(observations).to(self.device)
         hidden_batch_gpu, policy_batch, value_batch = \
             self.network.initial_inference(obs_batch)
+        ml_roots = self._compute_moves_left(hidden_batch_gpu) if self._use_ml_utility else None
 
         # One bulk transfer of all root logits; mask+softmax per game in numpy.
         root_logits_cpu = policy_batch.detach().cpu().numpy().astype(np.float64)
@@ -543,6 +584,8 @@ class BatchedMCTS(MCTS):
 
         for g in range(n):
             roots[g].hidden_state = hidden_batch_gpu[g]
+            if ml_roots is not None:
+                roots[g].moves_left = float(ml_roots[g])
             legals_np = np.asarray(legal_actions_list[g], dtype=np.int64)
             legal_logits = root_logits_cpu[g][legals_np]
             full_priors = _masked_softmax_np(root_logits_cpu[g], legals_np)
@@ -644,6 +687,7 @@ class BatchedMCTS(MCTS):
             action_batch = torch.tensor(leaf_actions, device=self.device)
             next_hiddens, rewards, policy_batch, value_batch = \
                 self.network.recurrent_inference(hidden_batch, action_batch)
+            ml_leaves = self._compute_moves_left(next_hiddens) if self._use_ml_utility else None
 
             # Batched GPU→CPU transfers: 3 syncs for the whole step, not 3×N.
             rewards_list = rewards.view(-1).tolist()
@@ -682,6 +726,8 @@ class BatchedMCTS(MCTS):
                     continue
                 leaf.hidden_state = next_hiddens[g]
                 leaf.reward = rewards_list[g]
+                if ml_leaves is not None:
+                    leaf.moves_left = float(ml_leaves[g])
                 if use_sampled_leaf:
                     self._expand_from_priors(
                         leaf, topk_actions_list[g], topk_priors_list[g]

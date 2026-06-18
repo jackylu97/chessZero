@@ -403,6 +403,14 @@ class MuZeroConfig:
     use_moves_left: bool = False
     moves_left_support_size: int = 10
     moves_left_loss_weight: float = 0.25
+    # MLH MCTS utility (Lc0): among same-Q moves, prefer the faster win (and drag out
+    # a loss). Added to the selection score as sign(-Q)*clip(slope*M, 0, max_effect),
+    # gated to |Q| > threshold so it only acts in clearly won/lost positions (never
+    # near draws). M = child's expected plies-to-end. Tunable via the trace A/B.
+    moves_left_mcts: bool = False         # enable the search-time utility (needs a trained head)
+    ml_threshold: float = 0.3             # |raw_q| above which the utility engages
+    ml_slope: float = 0.005               # per-ply effect before clipping
+    ml_max_effect: float = 0.1            # clip magnitude (vs value_score in [0,1])
 
     # Value-head output-layer init std. 0.0 = zero-init (MuZero/LightZero default;
     # blocks gradient to the body at cold start because Wᵀ·grad_out = 0). A small
