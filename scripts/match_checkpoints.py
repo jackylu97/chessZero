@@ -47,8 +47,8 @@ def gen_openings(game, n_openings, plies, seed):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint-a", required=True, help="model A (e.g. newer)")
-    ap.add_argument("--checkpoint-b", required=True, help="model B (e.g. older)")
+    ap.add_argument("--checkpoint-a", "-a", required=True, help="model A (e.g. newer)")
+    ap.add_argument("--checkpoint-b", "-b", required=True, help="model B (e.g. older)")
     ap.add_argument("--games", type=int, default=400)
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--opening-plies", type=int, default=8)
