@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import chess
+import numpy as np
 import torch  # required to unpickle GameHistory (observations are torch.Tensor)  # noqa: F401
 from flask import Flask, jsonify
 
@@ -36,6 +37,14 @@ class GameRecord:
     checks: int
     fens: list[str]           # length = num_plies + 1 (includes start position)
     sans: list[str]           # length = num_plies
+    is_selfplay: bool = True   # False => warmstart (external_values populated)
+    draw_by_repetition: bool = False
+    draw_by_no_progress: bool = False
+    # Per-ply diagnostics (length = num_plies, aligned to fens[i]/the position
+    # BEFORE move i). root_values are STM-POV MCTS root values; policy_top is the
+    # top-3 (san, prob) of the stored policy target at each position.
+    root_values: list[float] = None
+    policy_top: list[list] = None
 
 
 def _outcome_label(o: float) -> str:
@@ -44,13 +53,40 @@ def _outcome_label(o: float) -> str:
     return "½-½"
 
 
+def _policy_top(pol, board, k: int = 3) -> list:
+    """Top-k (san, prob) of a dense policy target at ``board`` (the position to move)."""
+    if pol is None or len(pol) == 0:
+        return []
+    pol = np.asarray(pol, dtype=np.float64)
+    order = np.argsort(pol)[::-1][:k]
+    out = []
+    for a in order:
+        p = float(pol[a])
+        if p <= 0.0:
+            break
+        mv = _action_to_move(int(a), board)
+        san = board.san(mv) if (mv is not None and mv in board.legal_moves) else f"?{int(a)}"
+        out.append([san, round(p, 3)])
+    return out
+
+
 def decode_game(game, idx: int) -> GameRecord:
     board = chess.Board()
+    # Endgame-seed / other FEN-start games begin off the standard position.
+    start_fen = getattr(game, "start_fen", None)
+    if start_fen:
+        board = chess.Board(start_fen)
     fens = [board.fen()]
     sans: list[str] = []
     captures = 0
     checks = 0
-    for act in game.actions:
+    root_values: list[float] = []
+    policy_top: list[list] = []
+    rv = list(getattr(game, "root_values", []) or [])
+    pols = list(getattr(game, "policies", []) or [])
+    for i, act in enumerate(game.actions):
+        root_values.append(float(rv[i]) if i < len(rv) else None)
+        policy_top.append(_policy_top(pols[i] if i < len(pols) else None, board))
         move = _action_to_move(act, board)
         if move is None or move not in board.legal_moves:
             sans.append(f"<illegal:{act}>")
@@ -71,6 +107,11 @@ def decode_game(game, idx: int) -> GameRecord:
         checks=checks,
         fens=fens,
         sans=sans,
+        is_selfplay=len(getattr(game, "external_values", []) or []) == 0,
+        draw_by_repetition=bool(getattr(game, "draw_by_repetition", False)),
+        draw_by_no_progress=bool(getattr(game, "draw_by_no_progress", False)),
+        root_values=root_values,
+        policy_top=policy_top,
     )
 
 
@@ -98,12 +139,26 @@ HTML = """<!DOCTYPE html>
   #moves .num { color: #888; }
   .gameinfo { font-size: 13px; margin-bottom: 10px; color: #333; }
   .gameinfo b { font-weight: 600; }
+  .plyinfo { font-family: ui-monospace, monospace; font-size: 13px; background: #f5f5f5; padding: 10px; border-radius: 4px; margin-top: 8px; }
+  .vbar { height: 14px; background: linear-gradient(90deg,#c62828,#ddd,#2e7d32); border-radius: 3px; position: relative; margin: 4px 0 8px; }
+  .vbar .mark { position: absolute; top: -3px; width: 3px; height: 20px; background: #111; }
+  .ptarget span { display: inline-block; margin-right: 10px; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 8px; color: white; margin-left: 4px; }
+  .tag.sp { background: #1565c0; } .tag.ws { background: #6a1b9a; }
+  .tag.rep { background: #c62828; } .tag.np { background: #ef6c00; }
 </style>
 </head>
 <body>
 <h1>ChessZero — Buffer Viewer</h1>
 <p class="meta" id="bufmeta">Loading...</p>
 <div>
+  <label for="filterSel"><b>Show:</b></label>
+  <select id="filterSel">
+    <option value="selfplay">Self-play only</option>
+    <option value="all">All games</option>
+    <option value="warmstart">Warmstart only</option>
+  </select>
+  &nbsp;&nbsp;
   <label for="gameSel"><b>Game:</b></label>
   <select id="gameSel"></select>
 </div>
@@ -119,6 +174,7 @@ HTML = """<!DOCTYPE html>
       <span id="plyLabel">0 / 0</span>
     </div>
     <div class="gameinfo" id="gameinfo"></div>
+    <div class="plyinfo" id="plyinfo"></div>
   </div>
   <div>
     <h3 style="margin-top: 0;">Moves</h3>
@@ -130,13 +186,43 @@ HTML = """<!DOCTYPE html>
 <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
 <script>
 let board = null;
-let currentGame = null;  // {idx, outcome, captures, checks, fens, sans}
+let currentGame = null;  // {idx, outcome, captures, checks, fens, sans, root_values, policy_top}
 let ply = 0;
+let allGames = [];       // full list from /games (each carries a sortedIdx into RECORDS)
 
 function fmtOutcome(o) {
     if (o > 0.5) return '1-0 (White wins)';
     if (o < -0.5) return '0-1 (Black wins)';
     return '½-½ (draw)';
+}
+
+function gameTag(g) {
+    let t = g.is_selfplay ? '<span class="tag sp">self-play</span>'
+                          : '<span class="tag ws">warmstart</span>';
+    if (g.draw_by_repetition) t += '<span class="tag rep">3-fold</span>';
+    if (g.draw_by_no_progress) t += '<span class="tag np">75-move</span>';
+    return t;
+}
+
+function renderPly() {
+    const g = currentGame;
+    const el = document.getElementById('plyinfo');
+    // root_values/policy_top are aligned to the position BEFORE move `ply` (i.e. fens[ply]).
+    if (ply >= g.num_plies) { el.innerHTML = '<i>terminal position</i>'; return; }
+    const v = (g.root_values && g.root_values[ply] != null) ? g.root_values[ply] : null;
+    const stm = (ply % 2 === 0) ? 'White' : 'Black';
+    let html = '';
+    if (v != null) {
+        const pct = Math.max(0, Math.min(100, (v + 1) * 50));
+        html += `<div><b>Root value</b> (${stm} to move, STM-POV): <b>${v >= 0 ? '+' : ''}${v.toFixed(3)}</b></div>`;
+        html += `<div class="vbar"><div class="mark" style="left:${pct}%"></div></div>`;
+    }
+    const pt = (g.policy_top && g.policy_top[ply]) ? g.policy_top[ply] : [];
+    if (pt.length) {
+        html += '<div class="ptarget"><b>Policy target:</b> ' +
+            pt.map(([san, p]) => `<span>${san} ${(p*100).toFixed(0)}%</span>`).join('') + '</div>';
+    }
+    el.innerHTML = html || '<i>no per-ply data</i>';
 }
 
 function renderMoves() {
@@ -158,7 +244,8 @@ function renderMoves() {
 function renderInfo() {
     const g = currentGame;
     document.getElementById('gameinfo').innerHTML =
-        `<b>Game ${g.idx}</b> — ${fmtOutcome(g.outcome)} · ${g.num_plies} plies · ${g.captures} captures · ${g.checks} checks`;
+        `<b>Game ${g.idx}</b> — ${fmtOutcome(g.outcome)} · ${g.num_plies} plies · ` +
+        `${g.captures} captures · ${g.checks} checks ${gameTag(g)}`;
 }
 
 function setPly(p) {
@@ -168,6 +255,7 @@ function setPly(p) {
     document.getElementById('slider').value = ply;
     document.getElementById('plyLabel').textContent = `${ply} / ${currentGame.num_plies}`;
     renderMoves();
+    renderPly();
 }
 
 function step(delta) { setPly(ply + delta); }
@@ -188,16 +276,34 @@ async function init() {
     });
     const listResp = await fetch('/games');
     const data = await listResp.json();
+    // Tag each game with its index into the server-side (sorted) RECORDS list.
+    allGames = data.games.map((g, i) => ({ ...g, sortedIdx: i }));
+    const nSP = allGames.filter(g => g.is_selfplay).length;
     document.getElementById('bufmeta').textContent =
-        `${data.buffer_path} — ${data.num_games} games, sorted by (captures asc, length asc)`;
+        `${data.buffer_path} — ${data.num_games} games (${nSP} self-play, ${data.num_games - nSP} warmstart), ` +
+        `sorted by (captures asc, length asc)`;
     const sel = document.getElementById('gameSel');
-    data.games.forEach((g, i) => {
-        const opt = document.createElement('option');
-        opt.value = i;
-        opt.textContent = `#${i} — orig ${g.idx} · ${g.captures} caps · ${g.num_plies} plies · ${fmtOutcome(g.outcome)}`;
-        sel.appendChild(opt);
-    });
+    const filterSel = document.getElementById('filterSel');
+
+    function populate() {
+        const f = filterSel.value;
+        const shown = allGames.filter(g =>
+            f === 'all' || (f === 'selfplay' && g.is_selfplay) || (f === 'warmstart' && !g.is_selfplay));
+        sel.innerHTML = '';
+        shown.forEach(g => {
+            const opt = document.createElement('option');
+            opt.value = g.sortedIdx;
+            const flags = (g.draw_by_repetition ? ' 3fold' : '') + (g.draw_by_no_progress ? ' 75mv' : '');
+            opt.textContent = `orig ${g.idx} · ${g.captures} caps · ${g.num_plies} plies · ${fmtOutcome(g.outcome)}${flags}`;
+            sel.appendChild(opt);
+        });
+        if (shown.length) loadGame(parseInt(sel.value, 10));
+        else { document.getElementById('gameinfo').innerHTML = '<i>no games match this filter</i>'; }
+    }
+
+    filterSel.addEventListener('change', populate);
     sel.addEventListener('change', () => loadGame(parseInt(sel.value, 10)));
+    populate();
     document.getElementById('slider').addEventListener('input', (e) => setPly(parseInt(e.target.value, 10)));
     document.addEventListener('keydown', (e) => {
         if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
@@ -206,7 +312,6 @@ async function init() {
         else if (e.key === 'Home') step(-999999);
         else if (e.key === 'End') step(999999);
     });
-    if (data.games.length) await loadGame(0);
 }
 
 window.addEventListener('DOMContentLoaded', init);
@@ -233,7 +338,10 @@ def games():
         "num_games": len(RECORDS),
         "games": [
             {"idx": r.idx, "outcome": r.outcome, "num_plies": r.num_plies,
-             "captures": r.captures, "checks": r.checks}
+             "captures": r.captures, "checks": r.checks,
+             "is_selfplay": r.is_selfplay,
+             "draw_by_repetition": r.draw_by_repetition,
+             "draw_by_no_progress": r.draw_by_no_progress}
             for r in RECORDS
         ],
     })
@@ -246,6 +354,10 @@ def game(i: int):
         "idx": r.idx, "outcome": r.outcome, "num_plies": r.num_plies,
         "captures": r.captures, "checks": r.checks,
         "fens": r.fens, "sans": r.sans,
+        "is_selfplay": r.is_selfplay,
+        "draw_by_repetition": r.draw_by_repetition,
+        "draw_by_no_progress": r.draw_by_no_progress,
+        "root_values": r.root_values, "policy_top": r.policy_top,
     })
 
 
@@ -255,7 +367,7 @@ def load_or_build_records(buffer_path: str, force_rebuild: bool = False) -> list
     Cache path: `<buffer_path>.viewer.pkl`. Rebuilt if missing, older than the
     buffer, or if --rebuild-cache is passed.
     """
-    cache_path = buffer_path + ".viewer.pkl"
+    cache_path = buffer_path + ".viewer2.pkl"  # v2: adds is_selfplay/root_values/policy_top
     if not force_rebuild and os.path.exists(cache_path):
         if os.path.getmtime(cache_path) >= os.path.getmtime(buffer_path):
             print(f"Loading cache {cache_path} ...")
