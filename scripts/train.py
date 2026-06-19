@@ -209,6 +209,14 @@ def main():
     parser.add_argument("--tensor-mcts-hidden-dtype", default=None,
                         choices=["float32", "float16", "bfloat16"],
                         help="Storage dtype for MCTS node_hidden. fp16 halves memory.")
+    parser.add_argument("--tensor-mcts-compile-net", action="store_true",
+                        help="torch.compile the per-sim network forward inside MCTS "
+                             "(recurrent_inference etc.). ~1.4x faster self-play search; "
+                             "exact net-output parity. See config.tensor_mcts_compile_net.")
+    parser.add_argument("--max-plies", type=int, default=None,
+                        help="Override config.max_plies (self-play ply cap; draw if reached). "
+                             "Bounds GPU-resident self-play memory (per-ply stacks grow with the "
+                             "longest game) and wall-clock. Lower for long-shuffling cold runs.")
     parser.add_argument("--no-consistency-loss", action="store_true",
                         help="Disable EfficientZero SimSiam consistency loss for this run "
                              "(falsifier for the action-blind dynamics collapse hypothesis).")
@@ -322,6 +330,10 @@ def main():
         config.tensor_mcts_subtree_reuse = True
     if args.tensor_mcts_hidden_dtype is not None:
         config.tensor_mcts_hidden_dtype = args.tensor_mcts_hidden_dtype
+    if args.tensor_mcts_compile_net:
+        config.tensor_mcts_compile_net = True
+    if args.max_plies is not None:
+        config.max_plies = args.max_plies
     if args.no_consistency_loss:
         config.use_consistency_loss = False
     if args.consistency_single_frame_target is not None:

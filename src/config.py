@@ -82,6 +82,11 @@ class MuZeroConfig:
     # Self-play
     num_self_play_games: int = 100  # games per self-play batch
     self_play_interval: int = 100  # training steps between self-play rounds
+    # Hard ply cap for a self-play game (draw if reached). Also bounds the GPU-resident
+    # self-play per-ply accumulators (obs/policy/legal-mask stacks grow with the LONGEST
+    # game in the batch) — the dominant memory cost, so lowering it cuts both wall-clock
+    # and peak VRAM. Mirrors GpuChessGame.max_plies (set on the env at construction).
+    max_plies: int = 1024
     # Two-phase (Option A) curriculum. For the first ``self_play_warmup_steps``
     # training steps, self-play and reanalyze are gated OFF and the network
     # trains purely on the supervised Stockfish stream (a fixed-length warmstart

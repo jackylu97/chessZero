@@ -249,6 +249,7 @@ def play_games_parallel_gpu(
     network.eval()
     chess_game = ChessGame()  # for MCTS action_space + legacy interface bits
     gpu_game = GpuChessGame()
+    gpu_game.max_plies = int(getattr(config, "max_plies", gpu_game.max_plies))
     batched_mcts = _make_batched_mcts(network, chess_game, config, device)
     temp_init = get_temperature(training_step, config)
     use_gumbel = bool(getattr(config, "use_gumbel", False))
@@ -417,6 +418,7 @@ def play_games_parallel_gpu_resident(
     network.eval()
     chess_game = ChessGame()
     gpu_game = GpuChessGame()
+    gpu_game.max_plies = int(getattr(config, "max_plies", gpu_game.max_plies))
 
     dtype_str = getattr(config, "tensor_mcts_hidden_dtype", "float32")
     dtype_map = {
@@ -443,7 +445,7 @@ def play_games_parallel_gpu_resident(
 
     # Cap loop length so we always have a static upper bound; ChessGame.max_plies
     # does the in-engine termination, alive_mask handles per-game stopping.
-    max_plies_cap = int(getattr(ChessGame, "max_plies", 400))
+    max_plies_cap = int(getattr(config, "max_plies", getattr(ChessGame, "max_plies", 400)))
 
     state = gpu_game.reset_batch(num_games, device=device)
 
