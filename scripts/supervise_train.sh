@@ -22,6 +22,9 @@ Supervisor flags:
   --backoff-base SECS    Base for exponential backoff (default 5).
   --backoff-cap SECS     Max backoff (default 300).
   --train-log PATH       Training stdout/stderr log (default chess_train.log).
+  --ckpt-game NAME       Game dir for checkpoints/runs (default: --game value).
+                         Set when config.game differs from --game — e.g. chess_small
+                         saves under checkpoints/chess/, so pass --ckpt-game chess.
   --help, -h             Show this help.
 
 All other flags pass through to scripts/train.py. The supervisor manages --resume
@@ -37,6 +40,7 @@ MAX_NO_PROGRESS=3
 BACKOFF_BASE=5
 BACKOFF_CAP=300
 TRAIN_LOG="chess_train.log"
+CKPT_GAME=""
 GAME=""
 RUN_ID=""
 INITIAL_RESUME=""
@@ -51,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --backoff-base)            BACKOFF_BASE="$2"; shift 2 ;;
     --backoff-cap)             BACKOFF_CAP="$2"; shift 2 ;;
     --train-log)               TRAIN_LOG="$2"; shift 2 ;;
+    --ckpt-game)               CKPT_GAME="$2"; shift 2 ;;
     --game)                    GAME="$2"; PASSTHROUGH+=("$1" "$2"); shift 2 ;;
     --run-id)                  RUN_ID="$2"; PASSTHROUGH+=("$1" "$2"); shift 2 ;;
     --resume)                  INITIAL_RESUME="$2"; shift 2 ;;
@@ -77,8 +82,9 @@ if [[ ! -f "scripts/train.py" ]]; then
   exit 2
 fi
 
-CHECKPOINT_DIR="checkpoints/$GAME/$RUN_ID"
-RUN_DIR="runs/$GAME/$RUN_ID"
+CKPT_GAME="${CKPT_GAME:-$GAME}"
+CHECKPOINT_DIR="checkpoints/$CKPT_GAME/$RUN_ID"
+RUN_DIR="runs/$CKPT_GAME/$RUN_ID"
 STOP_FILE="$RUN_DIR/STOP"
 SUP_LOG="$RUN_DIR/supervisor.log"
 mkdir -p "$RUN_DIR"
