@@ -154,16 +154,19 @@ def test_terminal_threefold_repetition():
 
 
 def test_terminal_ply_cap():
-    """Construct a position with ply()==399; one move pushes to 400 → cap.
+    """Construct a position with ply()==max_plies-1; one move pushes to the cap → draw.
 
     python-chess derives ply() from fullmove_number + turn:
         ply = 2*(fullmove - 1) + (turn==BLACK)
-    So fullmove=200, black to move → ply=399. After any move, ply=400=max_plies.
+    For black to move, ply == cap-1 ⇒ fullmove = (cap-2)//2 + 1. Reads the LIVE cap
+    (ChessGame.max_plies; was 400, bumped to 1024 on 2026-05-08) so the test tracks it.
     """
+    cap = int(ChessGame.max_plies)
+    fullmove = (cap - 2) // 2 + 1   # black to move ⇒ ply == cap-1
     # Two kings + two knights on quiet ranks so the move is legal.
-    fen = "4k3/8/8/8/8/8/8/N3K2N b - - 0 200"
+    fen = f"4k3/8/8/8/8/8/8/N3K2N b - - 0 {fullmove}"
     board = chess.Board(fen)
-    assert board.ply() == 399, f"FEN setup wrong: ply={board.ply()}"
+    assert board.ply() == cap - 1, f"FEN setup wrong: ply={board.ply()} (cap={cap})"
 
     _step_both_and_compare(fen, "e8d8", expected_done=True,
                            expected_reward=0.0, expected_winner_state=0)
