@@ -465,6 +465,13 @@ class MuZeroConfig:
     # forward speedup available — ~1.3-1.5× vs fp32. Tree storage is unaffected
     # (controlled separately by tensor_mcts_hidden_dtype).
     tensor_mcts_amp_dtype: str | None = None
+    # Compile the NETWORK forward (recurrent_inference / predict_moves_left /
+    # initial_inference) used inside MCTS, in addition to _select/_backprop. The
+    # per-sim net forward otherwise runs eager (~40 conv/norm/relu kernel launches
+    # each); for small models the GPU work is tiny so this CPU-side launch dispatch
+    # is the self-play bottleneck (GPU underutilized, one CPU core pegged). Batch is
+    # a fixed [num_parallel_games, ...] every sim → dynamic=False fuses the launches.
+    tensor_mcts_compile_net: bool = False
     # Whether to save the replay buffer (.buf) alongside the network
     # checkpoint (.pt) at each save interval. When False, only .pt is
     # saved; resume always cold-starts the buffer via self-play. Useful

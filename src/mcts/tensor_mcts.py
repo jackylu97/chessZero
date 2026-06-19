@@ -200,6 +200,16 @@ class TensorMCTS:
         # CUDA graphs, cutting per-iteration kernel-launch overhead by 5-10×.
         # Set False when debugging to read clean tracebacks.
         self.compile = compile and self.device.type == "cuda"
+        # Also compile the network forward used per-sim (recurrent_inference etc.),
+        # not just _select/_backprop. See config.tensor_mcts_compile_net.
+        self.compile_net = bool(getattr(config, "tensor_mcts_compile_net", False)) and self.compile
+        # Default to raw (eager) network methods; _allocate swaps in compiled
+        # versions when compile_net is set (once tree shapes are known). Defined
+        # here so the root initial_inference call — which precedes the first
+        # _allocate — always resolves.
+        self._recurrent_inference = self.network.recurrent_inference
+        self._initial_inference = self.network.initial_inference
+        self._predict_moves_left = getattr(self.network, "predict_moves_left", None)
         # Selection backend: "compile" (default, torch.compile + inductor),
         # "triton" (custom fused PUCT-step kernel — see tensor_mcts_triton.py),
         # or "eager" (plain PyTorch, for debugging).
@@ -226,7 +236,10 @@ class TensorMCTS:
         self._ml_support = (getattr(network, "moves_left_support_size", 10)
                             if network is not None else 10)
         self._draw_score = float(getattr(config, "draw_score", 0.0))
-        if (self._use_ml_utility or self._use_terminal_draws) and select_backend == "triton":
+        # MLH utility is now implemented in the Triton kernel (parity-tested vs the
+        # torch _select path), so it no longer forces a downgrade. root-terminal-draws
+        # has no tensor/Triton implementation yet, so it still does.
+        if self._use_terminal_draws and select_backend == "triton":
             select_backend = "compile" if self.compile else "eager"
         self.select_backend = select_backend
 
@@ -370,6 +383,25 @@ class TensorMCTS:
             # Replace ``_select`` with the Triton-kernel-driven version.
             self._select = self._select_triton  # type: ignore[method-assign]
 
+        # Per-sim network forward. recurrent_inference runs EVERY simulation
+        # (~40 conv/norm/relu launches); for small models this CPU-side kernel
+        # dispatch dominates wall-time (GPU underutilized). Compiling fuses the
+        # launches. Batch is a fixed [N=num_parallel_games, ...] every sim
+        # (padded + masked) → dynamic=False. Compiling a local reference (not
+        # mutating self.network) keeps the training/eager forward untouched;
+        # weight updates are read at call time, so no recompile per optimizer step.
+        self._recurrent_inference = self.network.recurrent_inference
+        self._initial_inference = self.network.initial_inference
+        self._predict_moves_left = getattr(self.network, "predict_moves_left", None)
+        if self.compile_net:
+            self._recurrent_inference = torch.compile(
+                self.network.recurrent_inference, mode="default", dynamic=False, fullgraph=False)
+            self._initial_inference = torch.compile(
+                self.network.initial_inference, mode="default", dynamic=False, fullgraph=False)
+            if self._use_ml_utility and self._predict_moves_left is not None:
+                self._predict_moves_left = torch.compile(
+                    self.network.predict_moves_left, mode="default", dynamic=False, fullgraph=False)
+
     def _reset(self):
         """Zero out tree tensors at the start of each MCTS run.
 
@@ -415,7 +447,7 @@ class TensorMCTS:
 
         obs_batch = torch.stack(observations).to(self.device)
         with self._amp_ctx():
-            hidden_batch, policy_logits_root, value_root = self.network.initial_inference(obs_batch)
+            hidden_batch, policy_logits_root, value_root = self._initial_inference(obs_batch)
         # hidden_batch: [N, C, H, W]; policy_logits_root: [N, A]; value_root: [N, 1] or [N].
 
         c, h, w = hidden_batch.shape[1:]
@@ -514,7 +546,7 @@ class TensorMCTS:
             self._refresh_reused_root(legal_mask, add_noise)
         else:
             with self._amp_ctx():
-                hidden_batch, policy_logits_root, _value_root = self.network.initial_inference(obs_batch)
+                hidden_batch, policy_logits_root, _value_root = self._initial_inference(obs_batch)
             c, h, w = hidden_batch.shape[1:]
             self._allocate(n, num_sims, (c, h, w))
             self._reset()
@@ -1185,6 +1217,7 @@ class TensorMCTS:
             child_actions=self.child_actions,
             child_node_idx=self.child_node_idx,
             node_visits=self.node_visits,
+            node_moves_left=self.node_moves_left,
             path_node_idx=path_node_idx,
             path_slot=path_slot,
             leaf_parent_node=leaf_parent_node,
@@ -1196,6 +1229,10 @@ class TensorMCTS:
             pb_c_base=self.PB_C_BASE,
             pb_c_init=self.PB_C_INIT,
             discount=float(self.config.discount),
+            ml_slope=self._ml_slope,
+            ml_max_effect=self._ml_max_effect,
+            ml_threshold=self._ml_threshold,
+            use_ml=self._use_ml_utility,
         )
 
         return path_node_idx, path_slot, leaf_parent_node, leaf_slot, leaf_action, depth
@@ -1226,7 +1263,7 @@ class TensorMCTS:
         # the network when AMP is enabled.
         compute_dtype = self._compute_dtype()
         with self._amp_ctx():
-            next_hidden, rewards, policy_logits, leaf_values = self.network.recurrent_inference(
+            next_hidden, rewards, policy_logits, leaf_values = self._recurrent_inference(
                 parent_hidden.to(compute_dtype),
                 leaf_action.long(),
             )
@@ -1250,7 +1287,7 @@ class TensorMCTS:
         self.node_hidden[arange_n, new_l] = next_hidden.to(self.hidden_dtype)
         self.node_reward[arange_n, new_l] = rewards_f32
         if self._use_ml_utility:
-            ml_logits = self.network.predict_moves_left(next_hidden)
+            ml_logits = self._predict_moves_left(next_hidden)
             m = inverse_scalar_transform(
                 support_to_scalar(ml_logits, self._ml_support)).clamp(min=0.0)
             self.node_moves_left[arange_n, new_l] = m.view(-1).to(torch.float32)

@@ -49,6 +49,8 @@ def _puct_walk_kernel(
     child_node_idx_ptr,      # int32
     # [N, M] node-level visits.
     node_visits_ptr,         # int32
+    # [N, M] expected plies-to-end per node (MLH utility; read only when USE_ML).
+    node_moves_left_ptr,     # float32
     # [N, M] path arrays — written at columns 0..MAX_DEPTH (root + each step).
     path_node_idx_ptr,       # int32
     path_slot_ptr,           # int32
@@ -68,6 +70,10 @@ def _puct_walk_kernel(
     PB_C_BASE: tl.constexpr,
     PB_C_INIT: tl.constexpr,
     DISCOUNT: tl.constexpr,
+    ML_SLOPE: tl.constexpr,
+    ML_MAX_EFFECT: tl.constexpr,
+    ML_THRESHOLD: tl.constexpr,
+    USE_ML: tl.constexpr,
 ):
     """One full PUCT walk per game. ONE launch per simulation (vs. one per
     step), unrolling the MAX_DEPTH-step inner loop entirely on-device.
@@ -119,6 +125,23 @@ def _puct_walk_kernel(
         value_score = tl.where(visits_f > 0, normalized_q, 0.0)
 
         scores = prior_score + value_score
+
+        # MLH utility — parity with the torch ``_select`` path. On EXPANDED
+        # children (child_node_idx >= 0) with |Q| > threshold, nudge toward faster
+        # wins / slower losses: scores += sign(-raw_q) * min(slope*child_m, max).
+        # ``USE_ML`` is a constexpr → the whole block compiles out when disabled
+        # (zero overhead on the non-MLH hot path).
+        if USE_ML:
+            child_idx_vec = tl.load(child_node_idx_ptr + base + slot, mask=valid_slot, other=-1)
+            ml_valid = child_idx_vec >= 0
+            safe_idx = tl.where(ml_valid, child_idx_vec, 0).to(tl.int64)
+            child_m = tl.load(node_moves_left_ptr + g * M + safe_idx, mask=ml_valid, other=0.0)
+            ml_gate = ml_valid & (tl.abs(raw_q) > ML_THRESHOLD)
+            eff = tl.minimum(ML_SLOPE * child_m, ML_MAX_EFFECT)
+            sgn = tl.where(raw_q > 0, -1.0, tl.where(raw_q < 0, 1.0, 0.0))  # = sign(-raw_q)
+            ml_term = tl.where(ml_gate, sgn * eff, 0.0)
+            scores = scores + ml_term
+
         invalid = (actions == -1) | (~valid_slot)
         scores = tl.where(invalid, float("-inf"), scores)
 
@@ -177,6 +200,7 @@ def puct_walk(
     child_actions: torch.Tensor,
     child_node_idx: torch.Tensor,
     node_visits: torch.Tensor,
+    node_moves_left: torch.Tensor,
     path_node_idx: torch.Tensor,
     path_slot: torch.Tensor,
     leaf_parent_node: torch.Tensor,
@@ -188,6 +212,10 @@ def puct_walk(
     pb_c_base: int,
     pb_c_init: float,
     discount: float,
+    ml_slope: float = 0.0,
+    ml_max_effect: float = 0.0,
+    ml_threshold: float = 0.0,
+    use_ml: bool = False,
 ) -> None:
     """Run a full PUCT walk (up to max_depth) for all N games via Triton.
 
@@ -201,6 +229,7 @@ def puct_walk(
     ``path_slot[:, 1..max_depth]``.
     """
     n, m, k = child_priors.shape
+    assert node_moves_left.shape == (n, m)
     assert path_node_idx.shape == (n, m)
     assert path_slot.shape == (n, m)
     assert leaf_parent_node.shape == (n,) and leaf_parent_node.dtype == torch.int32
@@ -219,6 +248,7 @@ def puct_walk(
         child_actions,
         child_node_idx,
         node_visits,
+        node_moves_left,
         path_node_idx,
         path_slot,
         leaf_parent_node,
@@ -234,4 +264,8 @@ def puct_walk(
         PB_C_BASE=pb_c_base,
         PB_C_INIT=pb_c_init,
         DISCOUNT=discount,
+        ML_SLOPE=ml_slope,
+        ML_MAX_EFFECT=ml_max_effect,
+        ML_THRESHOLD=ml_threshold,
+        USE_ML=use_ml,
     )
