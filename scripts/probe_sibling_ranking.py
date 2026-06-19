@@ -14,7 +14,7 @@ and as a CONTRAST, the across-position correlation of V(position) vs SF(position
 
 Run: .venv/bin/python scripts/probe_sibling_ranking.py --checkpoint <path.pt>
 """
-import argparse, os, sys
+import argparse, os, sys, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
@@ -23,9 +23,9 @@ from scipy.stats import spearmanr
 
 from src.config import get_config, MuZeroConfig
 from src.games.chess import ChessGame
-from src.model.muzero_net import MuZeroNetwork
 from src.mcts.mcts import MCTS, select_action
 from src.training.replay_buffer import stack_with_history
+from scripts.eval_checkpoint_health import build_network
 
 
 def _spearman(a, b):
@@ -42,31 +42,25 @@ def main():
     ap.add_argument("--sf-depth", type=int, default=12)
     ap.add_argument("--stockfish", default="/usr/games/stockfish")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--game", default="chess",
+                    help="config preset for network sizing (e.g. chess_small).")
+    ap.add_argument("--json", action="store_true",
+                    help="emit one JSON results line on stdout (suppresses verbose prints).")
     args = ap.parse_args()
     torch.manual_seed(args.seed); np.random.seed(args.seed)
 
-    cfg = get_config("chess"); cfg.device = "cpu"; cfg.num_simulations = args.sims
+    cfg = get_config(args.game); cfg.device = "cpu"; cfg.num_simulations = args.sims
     game = ChessGame()
     torch.serialization.add_safe_globals([MuZeroConfig])
     ck = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    sd = ck["model_state_dict"]
-    net = MuZeroNetwork(
-        observation_channels=game.num_planes * cfg.history_frames,
-        action_space_size=game.action_space_size, hidden_planes=cfg.hidden_planes,
-        num_blocks=cfg.num_residual_blocks, latent_h=cfg.latent_h, latent_w=cfg.latent_w,
-        input_h=8, input_w=8, fc_hidden=cfg.fc_hidden,
-        value_support_size=cfg.value_support_size, reward_support_size=cfg.reward_support_size,
-        use_consistency_loss=any(k.startswith("projection.") for k in sd),
-        use_scalar_transform=cfg.use_scalar_transform, value_target_scale=cfg.value_target_scale,
-        value_head_type=cfg.value_head_type, draw_score=cfg.draw_score,
-        use_inverse_dynamics_loss=any(k.startswith("inverse_dynamics_head.") for k in sd),
-        # checkpoint has a flat policy head; default policy_head_type="flat" loads it.
-    )
-    net.load_state_dict(sd); net.eval()
+    # build_network detects heads (conv/flat policy, moves-left, consistency, inverse
+    # dynamics) from the state_dict and sizes from cfg — loads any chess/chess_small arch.
+    net = build_network(ck, game, cfg, "cpu")
     mcts = MCTS(net, game, cfg, "cpu")
     eng = chess.engine.SimpleEngine.popen_uci(args.stockfish)
-    print(f"Loaded {args.checkpoint} (step {ck.get('step','?')}); sims={args.sims}, "
-          f"SF depth={args.sf_depth}\n")
+    if not args.json:
+        print(f"Loaded {args.checkpoint} (step {ck.get('step','?')}); sims={args.sims}, "
+              f"SF depth={args.sf_depth}\n")
 
     def model_value(state, frames):
         """Scalar value of `state` from its side-to-move POV."""
@@ -124,9 +118,10 @@ def main():
                 sf_sorted = sorted(sf_cp, key=sf_cp.get, reverse=True)
                 model_move_sf_rank.append(sf_sorted.index(model_best) + 1)
                 collected += 1
-                print(f"  pos {collected:2d}: legal={len(moves):2d}  "
-                      f"spearman(V,SF)={sp:+.2f}  best-agree={'Y' if best_agree[-1] else 'n'}  "
-                      f"model-move SF-rank={model_move_sf_rank[-1]}")
+                if not args.json:
+                    print(f"  pos {collected:2d}: legal={len(moves):2d}  "
+                          f"spearman(V,SF)={sp:+.2f}  best-agree={'Y' if best_agree[-1] else 'n'}  "
+                          f"model-move SF-rank={model_move_sf_rank[-1]}")
 
         # advance with the model (greedy) to stay on-distribution
         obs = stack_with_history(game.to_tensor(state), frames, cfg.history_frames)
@@ -139,6 +134,24 @@ def main():
     eng.quit()
 
     sp = np.array([s for s in per_pos_spearman if not np.isnan(s)])
+    pooled = _spearman(pool_model, pool_sf) if len(pool_model) >= 3 else float("nan")
+    narrow = _spearman(pos_modelV, pos_sfV) if len(pos_modelV) >= 3 else float("nan")
+    results = {
+        "checkpoint": args.checkpoint, "step": ck.get("step", None),
+        "n_positions": int(len(per_pos_spearman)),
+        "within_spearman_median": float(np.median(sp)) if len(sp) else float("nan"),
+        "within_spearman_mean": float(np.mean(sp)) if len(sp) else float("nan"),
+        "within_frac_gt_0.3": float(np.mean(sp > 0.3)) if len(sp) else float("nan"),
+        "within_frac_lt_0": float(np.mean(sp < 0)) if len(sp) else float("nan"),
+        "best_move_agreement": float(np.mean(best_agree)) if best_agree else float("nan"),
+        "model_move_sf_rank_median": float(np.median(model_move_sf_rank)) if model_move_sf_rank else float("nan"),
+        "model_move_sf_rank_mean": float(np.mean(model_move_sf_rank)) if model_move_sf_rank else float("nan"),
+        "pooled_wide_spearman": float(pooled), "across_narrow_spearman": float(narrow),
+        "sims": args.sims, "sf_depth": args.sf_depth,
+    }
+    if args.json:
+        print(json.dumps(results))
+        return
     print(f"\n=== sibling ranking over {len(per_pos_spearman)} positions ===")
     print(f"  WITHIN-position Spearman(model V, Stockfish): "
           f"median {np.median(sp):+.2f}  mean {np.mean(sp):+.2f}")
