@@ -725,6 +725,12 @@ def get_config(game: str) -> MuZeroConfig:
             #     have a clean compile-and-skip-on-recompile gate. AMP autocast
             #     still gives ~1.3-1.5×.
             tensor_mcts_amp_dtype="float16",
+            # tensor_mcts_compile_net: SAFE local-handle torch.compile of the per-sim
+            # net forward inside TensorMCTS (self._recurrent_inference etc.) — distinct
+            # from compile_network below. Does NOT mutate the network's bound methods,
+            # so it avoids the BatchedMCTS/reanalyze re-entry SIGILL path. ~1.4x faster
+            # search; exact net-output parity; validated 2026-06-19 (cold2 runs, no SIGILL).
+            tensor_mcts_compile_net=True,
             compile_network=False,
             #   save_buffer=True: re-enabled 2026-06-12. Was disabled 2026-05-07
             #     when the v3 compact format hit "illegal move on load" errors

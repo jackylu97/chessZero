@@ -596,11 +596,11 @@ def _compute_pawn_pseudo_targets(state: "ChessBatchedState",
     # Capturable squares: opponent occupancy + en-passant target.
     ep_bb = torch.zeros((N,), dtype=torch.int64, device=device)
     ep_valid = state.ep >= 0
-    if ep_valid.any():
-        # Build EP bb: bit (ep_sq) for valid games.
-        ep_idx = state.ep.to(torch.int64).clamp(0, 63)
-        # bit shift in int64: (1 << ep_idx). For ep_idx=63 produces sign bit; OK.
-        ep_bb = torch.where(ep_valid, torch.tensor(1, dtype=torch.int64, device=device) << ep_idx, ep_bb)
+    # Unconditional (no `.any()` host sync per ply): the torch.where selects ep_bb=0 for
+    # invalid games, and ep_idx is clamped so ep=-1 games are safe under the shift.
+    ep_idx = state.ep.to(torch.int64).clamp(0, 63)
+    # bit shift in int64: (1 << ep_idx). For ep_idx=63 produces sign bit; OK.
+    ep_bb = torch.where(ep_valid, torch.tensor(1, dtype=torch.int64, device=device) << ep_idx, ep_bb)
     capture_targets = (opp_occ | ep_bb).unsqueeze(-1).expand(N, 64)  # (N, 64)
 
     # Pawn capture moves: per-sq attack ∩ capturable, gated by "our pawn here".
@@ -1032,7 +1032,7 @@ def _legal_mask_impl(state: "ChessBatchedState") -> tuple[torch.Tensor, torch.Te
     pin_filter = _compute_pin_filter(our_king_bb, our_occ, opp_rq, opp_bq, occupancy)
 
     # Check resolve mask + check status.
-    resolve, in_check, double_check, _checkers = _compute_check_resolve(
+    resolve, in_check, double_check, checkers = _compute_check_resolve(
         our_king_bb, our_occ, opp_pieces, 1 - 0, occupancy, empty, is_white,
     )
 
@@ -1068,9 +1068,9 @@ def _legal_mask_impl(state: "ChessBatchedState") -> tuple[torch.Tensor, torch.Te
     ep_captured_sq = torch.where(is_white, ep_idx_safe - 8, ep_idx_safe + 8).clamp(0, 63)
     ep_captured_bb = torch.where(ep_valid, one << ep_captured_sq, zero)
     ep_target_bb = torch.where(ep_valid, one << ep_idx_safe, zero)
-    _, in_check_now, _, checkers_now = _compute_check_resolve(
-        our_king_bb, our_occ, opp_pieces, 1 - 0, occupancy, empty, is_white,
-    )
+    # Reuse the check-resolve from above (identical args) — bit-identical, avoids a
+    # second 8-way slider/check pass per ply.
+    in_check_now, checkers_now = in_check, checkers
     ep_resolves = in_check_now & ((checkers_now & ep_captured_bb) != 0) & ep_valid
 
     # Per-from-sq EP-capture contribution: for pawns whose diagonal attack
@@ -1344,12 +1344,13 @@ class GpuChessGame(BatchedGame):
         piece_planes = bits.view(n, 12, 8, 8)                                # row=sq//8, col=sq%8
 
         # STM: for black, flip ranks and swap own(white)/opp(black) planes.
-        if is_black.any():
-            flipped = piece_planes.flip(2)
-            swapped = torch.cat([flipped[:, 6:12], flipped[:, 0:6]], dim=1)
-            piece_planes = torch.where(
-                is_black.view(n, 1, 1, 1), swapped, piece_planes,
-            )
+        # Unconditional (no `.any()` host sync per ply): torch.where leaves all-white
+        # batches unchanged.
+        flipped = piece_planes.flip(2)
+        swapped = torch.cat([flipped[:, 6:12], flipped[:, 0:6]], dim=1)
+        piece_planes = torch.where(
+            is_black.view(n, 1, 1, 1), swapped, piece_planes,
+        )
 
         # Castling: STM reorders [WK,WQ,BK,BQ] → [own_KS,own_QS,opp_KS,opp_QS].
         castle_abs = state.castling.to(torch.float32)                        # (N, 4)
