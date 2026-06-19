@@ -144,6 +144,25 @@ def main():
                              "position, geometric soft-tail decay backward (discount-style; "
                              "takes precedence over --repetition-penalty-window). "
                              "γ=0.93 ≈ half-strength 9.5 plies back. 0 (default) = inactive.")
+    parser.add_argument("--draw-score", type=float, default=None,
+                        help="Override config.draw_score. WDL→scalar value uses "
+                             "V = P(W) - P(L) + draw_score·P(D); more-negative subtracts the "
+                             "draw mass that squashes won-but-unconverted positions to V≈0, so "
+                             "a converting move can out-rank a safe shuffle in MCTS. Preset -0.05.")
+    parser.add_argument("--eval-to-wdl-alpha", type=float, default=None,
+                        help="Override config.eval_to_wdl_alpha. Logistic slope mapping a scalar "
+                             "eval/root_value → (P_W,P_D,P_L); larger = sharper (narrower draw "
+                             "zone → more decisive WDL targets). Preset 4.0.")
+    parser.add_argument("--eval-to-wdl-beta", type=float, default=None,
+                        help="Override config.eval_to_wdl_beta. Draw-width of the eval→WDL "
+                             "logistic; smaller = narrower draw zone (more decisive). Preset 2.0.")
+    parser.add_argument("--decisive-sample-frac", type=float, default=None,
+                        help="Override config.decisive_sample_frac. Fraction of each batch "
+                             "force-drawn from DECISIVE self-play games (|game_outcome|=1) so the "
+                             "value head can't collapse to draw-everywhere. Preset 0.5.")
+    parser.add_argument("--reanalyze-interval", type=int, default=None,
+                        help="Override config.reanalyze_interval (training steps between "
+                             "reanalyze calls; 0 = disabled). Preset 1024.")
     parser.add_argument("--mask-illegal-policy", action="store_true", default=False,
                         help="Enable legal-move policy masking (config.mask_illegal_policy). "
                              "Keeps the standard full-softmax policy CE and ADDS a penalty "
@@ -266,6 +285,16 @@ def main():
         config.repetition_penalty_window = args.repetition_penalty_window
     if args.repetition_penalty_decay is not None:
         config.repetition_penalty_decay = args.repetition_penalty_decay
+    if args.draw_score is not None:
+        config.draw_score = args.draw_score
+    if args.eval_to_wdl_alpha is not None:
+        config.eval_to_wdl_alpha = args.eval_to_wdl_alpha
+    if args.eval_to_wdl_beta is not None:
+        config.eval_to_wdl_beta = args.eval_to_wdl_beta
+    if args.decisive_sample_frac is not None:
+        config.decisive_sample_frac = args.decisive_sample_frac
+    if args.reanalyze_interval is not None:
+        config.reanalyze_interval = args.reanalyze_interval
     if args.decisive_retention_multiplier is not None:
         config.decisive_retention_multiplier = args.decisive_retention_multiplier
     if args.policy_head_type is not None:
