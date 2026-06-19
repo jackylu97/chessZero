@@ -623,10 +623,13 @@ def get_config(game: str) -> MuZeroConfig:
                                         # WDL — de-saturates the value head on won positions.
                                         # Safe to run hot: the teacher signal is EXTERNAL, not
                                         # self-referential.
-            selfplay_q_ratio=0.1,       # COOL: only 10% MCTS-root-value blended into the
-                                        # outcome one-hot. The root value is the network's OWN
-                                        # estimate (self-referential → feedback-loop risk), so
-                                        # keep near the AlphaZero/Lc0 pure-outcome default (0.0).
+            selfplay_q_ratio=0.0,       # AlphaZero/Lc0 pure-outcome default. Was 0.1, but the
+                                        # 2026-06-19 bug hunt showed even 0.1 DILUTES decisive
+                                        # targets toward draw when root_value≈0 (the basin regime):
+                                        # eval_to_wdl(0)=[.12,.76,.12], so a WIN one-hot at q=0.5
+                                        # → scalar +0.48 (38% draw mass); at q=0.1 still erodes the
+                                        # signal. Self-referential — keep 0.0 until the value head is
+                                        # externally calibrated. (q=0.5 was why that arm collapsed fastest.)
             warmstart_sample_frac=0.0,  # Cold-start mode (2026-05-07): no warmstart anchor.
                                         # Bump back to 0.4 when re-enabling the Stockfish pool.
             decisive_sample_frac=0.5,   # 2026-06-02: decisive-game resampling seed for the value

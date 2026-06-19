@@ -316,9 +316,17 @@ class GameHistory:
             # No-progress shuffle penalty: tilt a draw target toward LOSS before
             # blending. Only for no-progress draws (threefold OR 75-move, with
             # game_outcome == 0.0); decisive games, stalemate, insufficient
-            # material, and ply-cap draws are untouched. STM-symmetric.
+            # material, and ply-cap draws are untouched.
+            # STM-winning guard (2026-06-19 bug hunt): the tilt was STM-SYMMETRIC and
+            # taught the objectively-winning side of a won-but-shuffled position that it
+            # was LOSING. Skip it when the stored root value says STM is clearly winning
+            # (rv > guard); in the draw basin (rv≈0) the tilt still applies as before.
+            _rv_here = (float(self.root_values[ply_idx])
+                        if ply_idx < len(self.root_values) else 0.0)
+            stm_winning = _rv_here > 0.25
             if (rep_delta > 0.0 and self.game_outcome == 0.0
-                    and (self.draw_by_repetition or self.draw_by_no_progress)):
+                    and (self.draw_by_repetition or self.draw_by_no_progress)
+                    and not stm_winning):
                 # Per-ply shuffle-depth weighting: full δ at the drawn position,
                 # decaying backward. Exponential (decay**plies_to_end, preferred —
                 # discount-style soft tail) takes precedence over the linear window;
