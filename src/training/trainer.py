@@ -415,6 +415,10 @@ class MuZeroTrainer:
         self.writer.add_scalar("self_play/draw_no_progress_rate", no_progress_draws / n_games, self.global_step)
         self.writer.add_scalar("self_play/draw_computer_rate", computer_draws / n_games, self.global_step)
         self.writer.add_scalar("self_play/draw_plycap_rate", plycap_draws / n_games, self.global_step)
+        # Adjudication: fraction of games ended by consecutive-move resignation
+        # (truncated + relabeled as a decisive loss). 0 when resign_enabled=False.
+        resigned_games = sum(1 for g in games if getattr(g, "resigned", False))
+        self.writer.add_scalar("self_play/resignation_rate", resigned_games / n_games, self.global_step)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
         # Buffer composition: fraction of self-play (non-warmstart) games in the
         # buffer that are decisive — the quantity decisive_retention_multiplier is
@@ -1289,6 +1293,14 @@ class MuZeroTrainer:
         self.writer.add_scalar("train/per_beta", self.config.per_beta_init + (1.0 - self.config.per_beta_init) * (
             step / max(1, self.config.training_steps)
         ), step)
+        # Annealed material weights (the curriculum schedule) — so the decay is
+        # visible alongside loss/material_loss. Only when material is active.
+        if getattr(self.config, "material_value_weight", 0.0) > 0 or getattr(self.config, "use_material_head", False):
+            self.writer.add_scalar("material/value_blend_weight",
+                                   get_material_value_weight(step, self.config), step)
+            if getattr(self.config, "use_material_head", False):
+                self.writer.add_scalar("material/head_loss_weight",
+                                       get_material_head_weight(step, self.config), step)
         # Training throughput across this log window (steps/sec).
         now = time.monotonic()
         if self._last_log_t is not None and self._last_log_step is not None and now > self._last_log_t:

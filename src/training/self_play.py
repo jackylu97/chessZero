@@ -107,6 +107,7 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
         h.game_outcome = -1.0 if (p & 1) == 0 else 1.0
         h.draw_by_repetition = False
         h.draw_by_no_progress = False
+        h.resigned = True
         # Truncate: keep p played moves and p+1 observations (obs[p] = the resign
         # position, now terminal). Preserves len(obs) == len(actions) + 1.
         h.actions = h.actions[:p]

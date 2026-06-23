@@ -83,6 +83,10 @@ class GameHistory:
     # shuffle penalty). NOT set for stalemate / insufficient-material / ply-cap.
     draw_by_repetition: bool = False
     draw_by_no_progress: bool = False
+    # True iff this game was ended by post-hoc consecutive-move resignation
+    # (truncated + relabeled as a decisive loss). Transient self-play stat —
+    # used for the self_play/resignation_rate metric; not serialized.
+    resigned: bool = False
     # Optional starting position (FEN) for games that do NOT begin from the
     # standard initial position — e.g. endgame-seed curriculum games. When set,
     # from_compact_dict replays actions from this FEN instead of game.reset().
