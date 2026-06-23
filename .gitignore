@@ -36,3 +36,6 @@ htmlcov/
 
 # OS
 .DS_Store
+
+# Stockfish binary (restore via scripts/setup_stockfish.sh)
+tools/stockfish/

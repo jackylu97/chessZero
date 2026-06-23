@@ -100,6 +100,7 @@ def build_network(ckpt, game, cfg, device):
     has_moves_left = any(k.startswith("moves_left_head.") for k in sd)
     has_consistency = any(k.startswith("projection.") for k in sd)
     has_inverse = any(k.startswith("inverse_dynamics_head.") for k in sd)
+    has_material = any(k.startswith("material_head.") for k in sd)
     net = MuZeroNetwork(
         observation_channels=game.num_planes * cfg.history_frames,
         action_space_size=game.action_space_size, hidden_planes=cfg.hidden_planes,
@@ -115,6 +116,8 @@ def build_network(ckpt, game, cfg, device):
         policy_head_type="conv" if has_conv_policy else "flat",
         use_moves_left=has_moves_left,
         moves_left_support_size=getattr(cfg, "moves_left_support_size", 10),
+        use_material_head=has_material,
+        material_head_support_size=getattr(cfg, "material_head_support_size", 8),
     ).to(device)
     net.load_state_dict(ckpt["model_state_dict"])
     net.eval()
