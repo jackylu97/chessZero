@@ -95,17 +95,22 @@ def _assert_gamehistory_equal(a: GameHistory, b: GameHistory, policy_atol=1e-6):
     for la, lb in zip(a.legal_actions_list, b.legal_actions_list):
         assert list(la) == list(lb)
     assert len(a.policies) == len(b.policies)
+
+    def _nz_map(p):
+        # The save/load roundtrip may change the in-RAM REPRESENTATION (dense
+        # array <-> sparse (idx,val) tuple under Path B) while preserving content.
+        # Normalize to a nonzero index->value map so the comparison is
+        # representation-agnostic.
+        if isinstance(p, tuple):
+            idx, val = p
+            return {int(i): float(v) for i, v in zip(idx, val)}
+        return {int(i): float(p[i]) for i in np.nonzero(p)[0]}
+
     for pa, pb in zip(a.policies, b.policies):
-        # Policies are stored sparse as (indices, values) tuples (Path B);
-        # fall back to dense-array comparison for back-compat.
-        if isinstance(pa, tuple):
-            ia, va = pa
-            ib, vb = pb
-            assert np.array_equal(np.asarray(ia), np.asarray(ib))
-            assert np.allclose(va, vb, atol=policy_atol)
-        else:
-            assert pa.shape == pb.shape
-            assert np.allclose(pa, pb, atol=policy_atol)
+        ma, mb = _nz_map(pa), _nz_map(pb)
+        assert set(ma) == set(mb), f"policy support mismatch: {set(ma)} vs {set(mb)}"
+        for k in ma:
+            assert abs(ma[k] - mb[k]) <= policy_atol
 
 
 # ---------------------------------------------------------------------------
