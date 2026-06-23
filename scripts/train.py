@@ -346,6 +346,12 @@ def main():
         config.material_value_weight_final = args.material_value_weight_final
     if args.material_value_anneal_frac is not None:
         config.material_value_anneal_frac = args.material_value_anneal_frac
+    if args.use_material_head:
+        config.use_material_head = True
+    if args.material_head_loss_weight is not None:
+        config.material_head_loss_weight = args.material_head_loss_weight
+    if args.material_head_loss_weight_final is not None:
+        config.material_head_loss_weight_final = args.material_head_loss_weight_final
     if args.resign_enabled:
         config.resign_enabled = True
     if args.resign_threshold is not None:
