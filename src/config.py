@@ -859,8 +859,12 @@ def get_config(game: str) -> MuZeroConfig:
                                      #   512*680=348k sweep that already fit at 23.4GB,
                                      #   so even a full-750-ply sweep is safe here.
                                      #   num_self_play_games runs as multiple sweeps.
-        num_self_play_games=2048,    # 256 -> 2048: 2048 fresh games/round (~6 sweeps).
-        self_play_interval=660,      # 512 -> 660: 2048*165/512 -> reuse = 1.0.
+        num_self_play_games=1024,    # 2048 -> 1024 (2026-06-23): the 1:1 step:sample
+                                     #   ratio didn't help materially, so generate less
+                                     #   (self-play is the wall-clock bottleneck) and let
+                                     #   reuse rise. ~3 sweeps/round.
+        self_play_interval=660,      # held at 660: with 1024 games, 512*660 / (1024*165)
+                                     #   -> replay reuse ~2.0 (each fresh sample trained ~2x).
         batch_size=512,              # 256 -> 512: modest; lowered hard from the 4096
                                      #   mis-step. With 1:1 the per-step decisive count
                                      #   still rises because the buffer is decisive-rich
@@ -887,5 +891,17 @@ def get_config(game: str) -> MuZeroConfig:
                                      #   verdict smoking-gun #1). 0.0 -> flat PER.
         # NOTE: selfplay_q_ratio is already 0.0 (inherited from chess) — the
         # self-referential Q-blend that "collapses fastest" stays off.
+        # --- Cold-start substrate fixes (2026-06-23) ---------------------------
+        repetition_penalty=0.0,      # 0.35 -> 0: it's a late-regime lever (inert until
+                                     #   the policy can convert) AND a draw-amplifier
+                                     #   imprint (06-19 verdict: teaches "how soon the draw
+                                     #   comes," not board value). A confound for the cold
+                                     #   material experiment — re-enable once converting.
+        value_head_init_std=0.01,    # 0.0 -> 0.01: zero-init blocks the value head's body
+                                     #   gradient at cold start; 0.01 lets it flow without
+                                     #   dominating (cold-start ablation baseline).
+        max_plies=750,               # 1024 -> 750: match the 384-parallel GPU-memory
+                                     #   envelope (384*750=288k < the fitted 512*680 sweep;
+                                     #   1024 would exceed the tested size and risk OOM).
     )
     return configs.get(game, configs["tictactoe"])
