@@ -19,9 +19,9 @@ from ..config import MuZeroConfig
 from ..games.base import Game
 from ..model.muzero_net import MuZeroNetwork
 from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar, inverse_scalar_transform
-from .replay_buffer import ReplayBuffer, _iter_shard_games, _shard_record_count
+from .replay_buffer import ReplayBuffer, _iter_shard_games, _shard_record_count, _sparsify_policy
 from .representation_probe import compute_repr_metrics
-from .self_play import run_self_play
+from .self_play import run_self_play, get_material_value_weight, get_material_head_weight
 
 
 def _negative_cosine_similarity(p: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -721,7 +721,10 @@ class MuZeroTrainer:
             repetition_penalty=getattr(self.config, "repetition_penalty", 0.0),
             repetition_penalty_window=int(getattr(self.config, "repetition_penalty_window", 0)),
             repetition_penalty_decay=float(getattr(self.config, "repetition_penalty_decay", 0.0)),
+            material_value_weight=get_material_value_weight(self.global_step, self.config),
+            material_value_scale=float(getattr(self.config, "material_value_scale", 5.0)),
             build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
+            build_material_target=bool(getattr(self.config, "use_material_head", False)),
         )
 
         obs = batch["observations"].to(self.device)
@@ -779,6 +782,15 @@ class MuZeroTrainer:
         target_moves_left = (batch["target_moves_left"].to(self.device)
                              if use_moves_left and "target_moves_left" in batch else None)
 
+        # Material-margin head (KataGo score-dist analogue): aux CE on STM material.
+        # Inert unless the head exists AND the config enables it. Annealed weight.
+        use_material_head = (bool(getattr(self.config, "use_material_head", False))
+                             and getattr(self.network, "material_head", None) is not None)
+        material_head_weight = (get_material_head_weight(self.global_step, self.config)
+                                if use_material_head else 0.0)
+        target_material = (batch["target_material"].to(self.device)
+                           if use_material_head and "target_material" in batch else None)
+
         # Loss-weighting mode. See config.use_root_heavy_loss docstring.
         K = self.config.num_unroll_steps
         use_root_heavy = bool(getattr(self.config, "use_root_heavy_loss", False))
@@ -808,6 +820,10 @@ class MuZeroTrainer:
             if use_moves_left:
                 moves_left_loss = self._moves_left_loss(
                     self.network.predict_moves_left(hidden), target_moves_left[:, 0])  # root, full weight
+            material_loss = torch.zeros(obs.shape[0], device=self.device)
+            if use_material_head:
+                material_loss = self._material_loss(
+                    self.network.predict_material(hidden), target_material[:, 0])  # root, full weight
 
             for k in range(self.config.num_unroll_steps):
                 hidden_in = hidden  # h_k — the dynamics input at this unroll step
@@ -863,6 +879,13 @@ class MuZeroTrainer:
                         * mask_k
                     )
 
+                if use_material_head:
+                    material_loss = material_loss + unroll_scale * (
+                        self._material_loss(
+                            self.network.predict_material(hidden), target_material[:, k + 1])
+                        * mask_k
+                    )
+
             per_sample_loss = outer_scale * (
                 policy_loss
                 + value_weight * value_loss
@@ -871,6 +894,7 @@ class MuZeroTrainer:
                 + inverse_weight * inverse_loss
                 + illegal_pen_w * illegal_loss
                 + moves_left_weight * moves_left_loss
+                + material_head_weight * material_loss
             )
             total_loss = (is_weights_t * per_sample_loss).mean()
 
@@ -887,6 +911,7 @@ class MuZeroTrainer:
                 "consistency_loss": float("nan"),
                 "inverse_loss": float("nan"),
                 "moves_left_loss": float("nan"),
+                "material_loss": float("nan"),
                 "grad_norm": float("nan"),
                 "amp_scale": float(self.scaler.get_scale()),
                 "value_mae": float("nan"),
@@ -1009,6 +1034,7 @@ class MuZeroTrainer:
             "consistency_loss": (outer_scale * self.config.consistency_loss_weight * consistency_loss.mean()).item(),
             "inverse_loss": (outer_scale * inverse_weight * inverse_loss.mean()).item(),
             "moves_left_loss": (outer_scale * moves_left_weight * moves_left_loss.mean()).item() if use_moves_left else float("nan"),
+            "material_loss": (outer_scale * material_head_weight * material_loss.mean()).item() if use_material_head else float("nan"),
             "grad_norm": float(grad_norm),
             "amp_scale": float(self.scaler.get_scale()),
             "value_mae": value_mae,
@@ -1119,7 +1145,7 @@ class MuZeroTrainer:
                         _, action_probs = select_action_gumbel(
                             root, self.config, action_space_size
                         )
-                        game.policies[pos] = action_probs
+                        game.policies[pos] = _sparsify_policy(action_probs)
                     else:
                         # temperature=1.0 → raw visit-count normalization. Under
                         # Sampled MuZero the search prior was renormalized over σ,
@@ -1129,7 +1155,7 @@ class MuZeroTrainer:
                         # Pad to full action space size.
                         new_policy = np.zeros(action_space_size, dtype=np.float32)
                         new_policy[: len(action_probs)] = action_probs
-                        game.policies[pos] = new_policy
+                        game.policies[pos] = _sparsify_policy(new_policy)
                 game.root_values[pos] = root.value
                 positions_updated += 1
 
@@ -1214,6 +1240,15 @@ class MuZeroTrainer:
         so no negamax flip. Mirrors _value_loss's support path."""
         transformed = scalar_transform(target_scalar)
         target_dist = scalar_to_support(transformed, self.network.moves_left_support_size).to(logits.device)
+        return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1)
+
+    def _material_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor) -> torch.Tensor:
+        """Per-sample CE for the material-margin head. ``target_scalar``: (B,)
+        STM-relative material margin in pawns (signed). Always applies the
+        scalar_transform (compressed support → fine resolution near 0). STM-
+        relative target, so no negamax flip. Mirrors _moves_left_loss."""
+        transformed = scalar_transform(target_scalar)
+        target_dist = scalar_to_support(transformed, self.network.material_head_support_size).to(logits.device)
         return -(target_dist * F.log_softmax(logits, dim=1)).sum(dim=1)
 
     def _reward_loss(self, logits: torch.Tensor, target_scalar: torch.Tensor,

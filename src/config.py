@@ -299,6 +299,45 @@ class MuZeroConfig:
     eval_to_wdl_alpha: float = 4.0
     eval_to_wdl_beta: float = 2.0
 
+    # --- Material / score-margin value utility (KataGo c_score analogue) ------
+    # Tier-0 root-cause fix for the draw basin (see decisive_signal_plan_2026_06_23.md).
+    # The self-play value target is the game OUTCOME (V^π); a weak policy draws
+    # won positions, so the value head learns ≈draw everywhere → no within-
+    # position resolution → MCTS has no conversion gradient. KataGo breaks this
+    # by adding a bounded SCORE-MARGIN term so two winning positions are
+    # rank-able. Chess analogue = MATERIAL balance. When weight > 0 and the game
+    # is chess, the self-play WDL target is blended with material:
+    #     m_eval  = tanh(material_margin_stm / material_value_scale)   ∈ [-1,1]
+    #     target  = (1-w)·outcome_onehot + w·eval_to_wdl(m_eval)
+    # material_margin_stm is read STM-relative from the observation piece planes
+    # (planes 0-4 own minus 6-10 opp, weighted P/N/B/R/Q = 1/3/3/5/9; king
+    # excluded). Off by default (weight 0 = exact back-compat). Warmstart
+    # (external_values) targets are untouched — Stockfish already encodes material.
+    material_value_weight: float = 0.0   # w (INITIAL); KataGo uses c_score≈0.5. 0 = off.
+    material_value_scale: float = 5.0    # pawns mapping to ~tanh saturation (5 ≈ a rook).
+    # Annealing (curriculum / shaping-decay): strong material shaping early to
+    # escape the flat-target draw basin, then fade so the TRUE game outcome
+    # dominates (material is a means, not the objective, in chess — unlike Go).
+    # w(step) decays linearly material_value_weight → material_value_weight_final
+    # over [0, material_value_anneal_frac · training_steps]. anneal_frac = 0
+    # disables annealing (constant w = material_value_weight; back-compat).
+    material_value_weight_final: float = 0.0
+    material_value_anneal_frac: float = 0.0
+
+    # --- Consecutive-move resignation (AlphaZero/Leela/KataGo) ----------------
+    # Post-hoc, engine-agnostic: after self-play, if the side to move's stored
+    # root value stays below resign_threshold for resign_consecutive of ITS OWN
+    # moves, that side resigns — the game is truncated at that ply and relabeled
+    # as a decisive loss for the resigning side. Protects the decisive LABEL a
+    # weak policy would otherwise shuffle into a draw. Fires off the value head's
+    # own estimate, so it is inert until the value head can see advantages
+    # (pair with the material utility). Only threefold/no-progress-style flowing
+    # games are affected in practice; off by default. NOT a compute saving (the
+    # game is already played out) — label protection only.
+    resign_enabled: bool = False
+    resign_threshold: float = -0.9       # STM-POV root value; ≈ ≤5% expected score.
+    resign_consecutive: int = 5          # consecutive own-moves below threshold.
+
     # Stratified sampling: at every training batch, sample
     # floor(batch_size * warmstart_sample_frac) games from warmstart-only
     # (games with external_values populated) and the rest from self-play.
@@ -416,6 +455,24 @@ class MuZeroConfig:
     ml_threshold: float = 0.3             # |raw_q| above which the utility engages
     ml_slope: float = 0.005               # per-ply effect before clipping
     ml_max_effect: float = 0.1            # clip magnitude (vs value_score in [0,1])
+
+    # --- Material-margin head (KataGo score-distribution head, chess analogue) -
+    # Auxiliary categorical head predicting the CURRENT side-to-move material
+    # margin (pawns) from the LATENT state — incl. after the K dynamics unrolls,
+    # so it regularizes the WORLD MODEL to preserve material through latent
+    # rollouts (the meaningful chess form: final material is noisy and current
+    # material is trivially in the input, but predicting it from the *latent*
+    # after dynamics is not). Trained via CE on scalar_to_support(scalar_transform
+    # (margin)). Queried separately (like moves-left) — does NOT touch the MCTS
+    # inference tuple. chess only. Complements the value-TARGET material blend
+    # above (that fixes the value label; this regularizes the representation).
+    use_material_head: bool = False
+    material_head_support_size: int = 8   # covers transformed material to ~±63 pawns
+    material_head_loss_weight: float = 0.25   # INITIAL aux CE weight
+    # Annealed on the SHARED material_value_anneal_frac timeline (init → final);
+    # frac=0 ⇒ constant at the init weight. Lets the material influence fade in
+    # lockstep with the value-target blend as the policy learns to convert.
+    material_head_loss_weight_final: float = 0.0
 
     # Value-head output-layer init std. 0.0 = zero-init (MuZero/LightZero default;
     # blocks gradient to the body at cold start because Wᵀ·grad_out = 0). A small
@@ -782,5 +839,53 @@ def get_config(game: str) -> MuZeroConfig:
         # plies, then temperature_final) + Dirichlet root noise. Drops the random-
         # opening double-dip the chess preset uses (random_opening_plies=8).
         random_opening_plies=0,
+        # 2026-06-20: GENERATION-SCALED substrate for the data-scale convergence
+        # test. Hypothesis: cold self-play stalls for lack of self-play DATA
+        # VOLUME (AlphaZero/MuZero convergence is an argument about amount of
+        # fresh self-play data), not because the target has zero resolution. So
+        # scale GENERATION (wide parallel self-play) and hold the replay reuse at
+        # the paper's ~1:1 (train ~one sample per generated sample), keeping it
+        # pure self-play (no oracle / win-adjudication) per the paper's intent.
+        #
+        # Per-round 1:1 identity:  batch_size * self_play_interval
+        #                          == num_self_play_games * avg_game_len(~165).
+        num_parallel_games=384,      # 256 -> 384: per-SWEEP width, bounded by GPU
+                                     #   memory. Resident self-play holds the whole
+                                     #   sweep's trajectories on-GPU, so peak mem ~
+                                     #   num_parallel_games * max_plies (+ end-of-sweep
+                                     #   stack spike). 512 @ max_plies=750 OOM'd
+                                     #   STOCHASTICALLY on sweeps whose deepest game
+                                     #   hit ~740-750 plies. 384*750=288k < the
+                                     #   512*680=348k sweep that already fit at 23.4GB,
+                                     #   so even a full-750-ply sweep is safe here.
+                                     #   num_self_play_games runs as multiple sweeps.
+        num_self_play_games=2048,    # 256 -> 2048: 2048 fresh games/round (~6 sweeps).
+        self_play_interval=660,      # 512 -> 660: 2048*165/512 -> reuse = 1.0.
+        batch_size=512,              # 256 -> 512: modest; lowered hard from the 4096
+                                     #   mis-step. With 1:1 the per-step decisive count
+                                     #   still rises because the buffer is decisive-rich
+                                     #   early. (Total games over a run = steps*batch/L,
+                                     #   so 'more games' comes from steps, not batch.)
+        replay_buffer_size=5120,     # 1500 -> 5120 (~2.5 rounds resident), 3.4x the
+                                     #   baseline. Affordable only with SPARSE policies
+                                     #   (Path B, 2026-06-20): dense was ~10MB/game ->
+                                     #   8192=82GB OOM-kill; sparse ~3.2MB/game. Capped
+                                     #   at 5120 (not 8192) because the 60GB cgroup limit
+                                     #   binds on the self-play-ROUND peak = resting
+                                     #   buffer + round spike (new games + ~12GB dense
+                                     #   per-sweep CPU transient + base). Measured 30.9GB
+                                     #   RSS at buf=2048 -> 8192 would peak ~58GB; 5120
+                                     #   peaks ~46GB (anon, not cache -> OOM-relevant).
+        reanalyze_batch_size=1400,   # 256 -> 1400: scaled commensurately with the
+                                     #   8192 buffer (keeps the original 256/1500 ~=17%
+                                     #   per-call refresh fraction). Reanalyze runs MCTS
+                                     #   on EVERY position of each sampled game, so this
+                                     #   adds ~30-40% search wall-clock — dial down if
+                                     #   too slow. reanalyze_interval stays 1024.
+        decisive_sample_frac=0.0,    # AXED: stratified decisive oversampling overfit
+                                     #   a collapsing ~5-13 game pool (2026-06-19
+                                     #   verdict smoking-gun #1). 0.0 -> flat PER.
+        # NOTE: selfplay_q_ratio is already 0.0 (inherited from chess) — the
+        # self-referential Q-blend that "collapses fastest" stays off.
     )
     return configs.get(game, configs["tictactoe"])

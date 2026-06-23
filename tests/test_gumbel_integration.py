@@ -26,6 +26,13 @@ from src.training.self_play import (
     run_self_play,
 )
 from src.training.trainer import MuZeroTrainer
+from src.training.replay_buffer import _densify_policy
+
+
+def _dense(pi, n):
+    """Densify a stored policy (sparse (idx,val) tuple under Path B, or a dense
+    array) into a length-n dense numpy array for assertion convenience."""
+    return _densify_policy(pi, n)
 
 
 # --- Fixtures --------------------------------------------------------------
@@ -99,6 +106,7 @@ def test_play_game_use_gumbel_produces_normalized_policies(ttt, gumbel_cfg):
     assert len(history.actions) > 0
     assert len(history.policies) == len(history.actions)
     for pi in history.policies:
+        pi = _dense(pi, ttt.action_space_size)
         assert len(pi) == ttt.action_space_size
         assert sum(pi) == pytest.approx(1.0, abs=1e-5)
         assert all(p >= 0 for p in pi)
@@ -117,7 +125,7 @@ def test_play_games_parallel_use_gumbel_policies_sum_to_one(ttt, gumbel_cfg):
     for h in histories:
         assert len(h.actions) > 0
         for pi in h.policies:
-            assert sum(pi) == pytest.approx(1.0, abs=1e-5)
+            assert sum(_dense(pi, ttt.action_space_size)) == pytest.approx(1.0, abs=1e-5)
 
 
 def test_play_game_use_gumbel_false_still_valid_targets(ttt, puct_cfg):
@@ -130,7 +138,10 @@ def test_play_game_use_gumbel_false_still_valid_targets(ttt, puct_cfg):
 
     assert len(history.actions) > 0
     for pi in history.policies:
-        assert sum(pi) == pytest.approx(1.0, abs=1e-5)
+        # Policies are stored sparse as (indices, values) tuples (Path B);
+        # the value array normalizes to 1.
+        vals = pi[1] if isinstance(pi, tuple) else pi
+        assert sum(vals) == pytest.approx(1.0, abs=1e-5)
 
 
 def test_play_games_parallel_gumbel_mask_respects_legal_actions(ttt, gumbel_cfg):
@@ -145,6 +156,7 @@ def test_play_games_parallel_gumbel_mask_respects_legal_actions(ttt, gumbel_cfg)
     )
     for h in histories:
         for pi, legal in zip(h.policies, h.legal_actions_list):
+            pi = _dense(pi, ttt.action_space_size)
             legal_set = set(legal)
             for a, p in enumerate(pi):
                 if a not in legal_set:
@@ -336,6 +348,7 @@ def test_reanalyze_rewrites_policies_as_pi_prime(ttt, gumbel_cfg):
     rewritten_count = 0
     for g in tr.replay_buffer.buffer:
         for pi, legal in zip(g.policies, g.legal_actions_list):
+            pi = _dense(pi, ttt.action_space_size)
             total = sum(pi)
             if total > 0:  # skip any positions that may not have been reanalyzed
                 rewritten_count += 1

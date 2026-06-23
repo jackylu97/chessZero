@@ -8,6 +8,60 @@ import numpy as np
 import torch
 
 
+# --- Sparse policy storage (Path B, 2026-06-20) -----------------------------
+# MCTS visit-count policies are ~99% zeros (≈30-40 legal/visited moves out of
+# 4672). Storing them dense fp32 cost 18.2 KB/ply and dominated the in-RAM
+# replay buffer (~10 MB/game -> OOM-kill at the 60 GB cgroup cap once the buffer
+# scaled up). We store them sparse as (indices, values) and densify only the
+# ~batch_size positions sampled per training step. densify(sparsify(p)) == p
+# byte-for-byte, so this is a lossless storage transform — no consumer sees a
+# different distribution. `_densify_policy` also passes dense arrays through
+# unchanged, so producers that still write dense remain correct (just larger).
+
+def _sparsify_policy(dense) -> tuple:
+    """Dense policy array -> (int32 nonzero indices, fp32 values). Lossless."""
+    d = np.asarray(dense, dtype=np.float32)
+    idx = np.nonzero(d)[0].astype(np.int32)
+    return (idx, d[idx].astype(np.float32))
+
+
+# Standard piece values for the material-margin utility, indexed by the chess
+# observation plane order P,N,B,R,Q (planes 0-4 own / 6-10 opponent). King
+# (plane 5/11) excluded — both sides always have exactly one, so it cancels.
+_MATERIAL_PLANE_VALUES = np.array([1.0, 3.0, 3.0, 5.0, 9.0], dtype=np.float32)
+
+
+def _material_margin_stm(obs) -> float:
+    """STM-relative material margin (in pawns) from a chess observation.
+
+    ``obs`` is a single-frame (C, H, W) tensor/array with the AlphaZero chess
+    encoding: planes 0-5 = own pieces (P,N,B,R,Q,K) from the side-to-move POV,
+    6-11 = opponent. Returns (own material − opponent material), already
+    side-to-move-relative (matches the value-target POV — no parity flip).
+    """
+    a = obs.numpy() if hasattr(obs, "numpy") else np.asarray(obs)
+    own = a[0:5].reshape(5, -1).sum(axis=1)        # P,N,B,R,Q counts (own)
+    opp = a[6:11].reshape(5, -1).sum(axis=1)       # P,N,B,R,Q counts (opponent)
+    return float(np.dot(_MATERIAL_PLANE_VALUES, own - opp))
+
+
+def _densify_policy(p, action_space_size):
+    """Reconstruct a dense [action_space_size] fp32 policy.
+
+    Accepts a sparse (indices, values) tuple OR a dense ndarray (pass-through
+    for back-compat with producers/games that still store dense). None -> None.
+    """
+    if p is None:
+        return None
+    if isinstance(p, tuple):
+        idx, val = p
+        dense = np.zeros(action_space_size, dtype=np.float32)
+        if len(idx) > 0:
+            dense[np.asarray(idx, dtype=np.int64)] = np.asarray(val, dtype=np.float32)
+        return dense
+    return p  # already dense — make_target's pad/truncate handles width < A
+
+
 @dataclass
 class GameHistory:
     """Stores a complete game trajectory."""
@@ -62,35 +116,38 @@ class GameHistory:
         """
         n = len(self.actions)
 
+        # Normalize each policy to (indices, values) — handles both the sparse
+        # in-RAM tuple form (Path B) and legacy dense ndarrays.
+        def _to_idx_val(p):
+            if p is None:
+                return (np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float32))
+            if isinstance(p, tuple):
+                idx, val = p
+                return (np.asarray(idx, dtype=np.int32), np.asarray(val, dtype=np.float32))
+            d = np.asarray(p, dtype=np.float32)
+            nz = np.nonzero(d)[0].astype(np.int32)
+            return (nz, d[nz].astype(np.float32))
+
+        idx_val = [_to_idx_val(p) for p in self.policies]
+
         one_hot = (
             len(self.policies) == n
             and all(
-                p is not None and len(p) > 0
-                and np.count_nonzero(p) == 1
-                and float(p.max()) > 0.999
-                for p in self.policies
+                len(idx) == 1 and float(val[0]) > 0.999
+                for idx, val in idx_val
             )
         )
 
         if one_hot:
             policies_mode = "onehot"
             policies_data = np.fromiter(
-                (int(np.argmax(p)) for p in self.policies),
+                (int(idx[0]) for idx, _ in idx_val),
                 dtype=np.int32,
                 count=n,
             )
         else:
             policies_mode = "sparse"
-            policies_data = []
-            for p in self.policies:
-                if p is None or len(p) == 0:
-                    policies_data.append(
-                        (np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float32))
-                    )
-                    continue
-                nz = np.nonzero(p)[0].astype(np.int32)
-                vals = np.asarray(p, dtype=np.float32)[nz]
-                policies_data.append((nz, vals))
+            policies_data = list(idx_val)
 
         d = {
             "format_version": 3,
@@ -149,24 +206,22 @@ class GameHistory:
             state, _, _ = game.step(state, a)
             gh.observations.append(game.to_tensor(state))
 
-        action_space_size = game.action_space_size
         mode = d["policies_mode"]
         if mode == "onehot":
-            indices = d["policies_data"]
-            policies = []
-            for idx in indices:
-                p = np.zeros(action_space_size, dtype=np.float32)
-                p[int(idx)] = 1.0
-                policies.append(p)
+            # Each ply -> sparse single-entry policy (argmax, prob 1.0). Kept
+            # sparse in RAM (Path B); make_target densifies on read.
+            policies = [
+                (np.asarray([int(idx)], dtype=np.int32),
+                 np.asarray([1.0], dtype=np.float32))
+                for idx in d["policies_data"]
+            ]
             gh.policies = policies
         elif mode == "sparse":
-            policies = []
-            for idxs, vals in d["policies_data"]:
-                p = np.zeros(action_space_size, dtype=np.float32)
-                if len(idxs) > 0:
-                    p[np.asarray(idxs, dtype=np.int64)] = np.asarray(vals, dtype=np.float32)
-                policies.append(p)
-            gh.policies = policies
+            # Keep the on-disk (indices, values) sparse form in RAM as-is.
+            gh.policies = [
+                (np.asarray(idxs, dtype=np.int32), np.asarray(vals, dtype=np.float32))
+                for idxs, vals in d["policies_data"]
+            ]
         else:
             raise ValueError(f"Unknown policies_mode: {mode!r}")
 
@@ -209,7 +264,9 @@ class GameHistory:
                     selfplay_q_ratio: float | None = None,
                     repetition_penalty: float = 0.0,
                     repetition_penalty_window: int = 0,
-                    repetition_penalty_decay: float = 0.0):
+                    repetition_penalty_decay: float = 0.0,
+                    material_value_weight: float = 0.0,
+                    material_value_scale: float = 5.0):
         """Create training target for a given position.
 
         Args:
@@ -272,6 +329,11 @@ class GameHistory:
         rep_decay = float(min(max(repetition_penalty_decay, 0.0), 1.0))
         # Final ply index (terminal/drawn position is at len-1) for per-ply ramp.
         rep_end_idx = len(self) - 1
+        # Material/score-margin utility (chess self-play only). Guarded to chess
+        # because the piece-plane layout (planes 0-4/6-10) is chess-specific.
+        mat_w = (float(min(max(material_value_weight, 0.0), 1.0))
+                 if self.game_name == "chess" else 0.0)
+        mat_scale = float(material_value_scale) if material_value_scale > 0.0 else 5.0
 
         def _wdl_target_at(ply_idx: int) -> np.ndarray:
             """WDL target at ply_idx from side-to-move's POV, with q_ratio blend.
@@ -341,8 +403,20 @@ class GameHistory:
                     weight = 1.0
                 d = rep_delta * weight
                 legacy = np.array([0.0, 1.0 - d, d], dtype=np.float32)
+            # Material/score-margin blend (KataGo c_score analogue): make two
+            # winning positions rank-able so the value head gets a within-
+            # position gradient even on drawn-by-shuffle games (outcome=draw but
+            # material=+rook). Applied to the legacy (outcome) target BEFORE the
+            # q_self root-value blend, self-play phase only.
+            if mat_w > 0.0 and ply_idx < len(self.observations):
+                m_eval = float(np.tanh(
+                    _material_margin_stm(self.observations[ply_idx]) / mat_scale))
+                p_w, p_d, p_l = _eval_to_wdl(
+                    m_eval, alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta)
+                material_wdl = np.array([p_w, p_d, p_l], dtype=np.float32)
+                legacy = (1.0 - mat_w) * legacy + mat_w * material_wdl
             if q == 0.0:
-                return legacy
+                return legacy.astype(np.float32)
             # Blend in the MCTS root value (STM POV scalar) mapped to WDL.
             if ply_idx < len(self.root_values):
                 rv = float(self.root_values[ply_idx])
@@ -401,7 +475,8 @@ class GameHistory:
                 prev = idx - 1
                 rewards.append(self.rewards[prev] if 0 <= prev < len(self.rewards) else 0.0)
 
-                policy = self.policies[idx] if idx < len(self.policies) else None
+                policy = (_densify_policy(self.policies[idx], action_space_size)
+                          if idx < len(self.policies) else None)
                 if policy is None or len(policy) == 0:
                     # INTENTIONAL benign no-op (bug_hunt_2026_06_13.md §E).
                     # Root sampling (sample_batch: randint(0, len(game))) can land
@@ -670,7 +745,10 @@ class ReplayBuffer:
         repetition_penalty: float = 0.0,
         repetition_penalty_window: int = 0,
         repetition_penalty_decay: float = 0.0,
+        material_value_weight: float = 0.0,
+        material_value_scale: float = 5.0,
         build_legal_masks: bool = False,
+        build_material_target: bool = False,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -755,6 +833,7 @@ class ReplayBuffer:
         policies_batch = []
         legal_masks_batch = []
         moves_left_batch = []
+        material_batch = []
 
         for g_idx in game_indices:
             game = self.buffer[g_idx]
@@ -771,6 +850,8 @@ class ReplayBuffer:
                 repetition_penalty=repetition_penalty,
                 repetition_penalty_window=repetition_penalty_window,
                 repetition_penalty_decay=repetition_penalty_decay,
+                material_value_weight=material_value_weight,
+                material_value_scale=material_value_scale,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)
@@ -785,6 +866,20 @@ class ReplayBuffer:
             moves_left_batch.append([
                 float(max(0, final_idx - (pos + i))) for i in range(num_unroll_steps + 1)
             ])
+            if build_material_target:
+                # Current STM material margin at each unrolled position (pos+i),
+                # from that position's own observation (already STM-relative).
+                # chess only; past-end / non-chess steps → 0.0 (zeroed by the
+                # obs mask in the loss anyway).
+                is_chess = (game.game_name == "chess")
+                row = []
+                for i in range(num_unroll_steps + 1):
+                    idx = pos + i
+                    if is_chess and idx < len(game.observations):
+                        row.append(_material_margin_stm(game.observations[idx]))
+                    else:
+                        row.append(0.0)
+                material_batch.append(row)
             if build_legal_masks:
                 # (K+1, A) legal-move mask aligned with policies/actions: 1.0 on
                 # legal moves at ply (pos + i), 0.0 on illegal. Mirrors make_target's
@@ -830,6 +925,8 @@ class ReplayBuffer:
             "target_moves_left": torch.tensor(moves_left_batch, dtype=torch.float32),  # (B, K+1) plies-to-end
             "is_warmstart": torch.from_numpy(is_warmstart),
         }
+        if build_material_target:
+            batch["target_material"] = torch.tensor(material_batch, dtype=torch.float32)  # (B, K+1) STM material margin
         if build_legal_masks:
             # (B, K+1, A) — 1.0 legal, 0.0 illegal. Consumed by the trainer's
             # masked policy loss + illegal-mass penalty.
@@ -985,7 +1082,12 @@ class ReplayBuffer:
             for o in g.observations:
                 obs_b += o.element_size() * o.numel()
             for p in g.policies:
-                if p is not None and p.size:
+                if p is None:
+                    continue
+                if isinstance(p, tuple):  # sparse (idx, val) — no parent pinning
+                    idx, val = p
+                    pol_b += idx.nbytes + val.nbytes
+                elif p.size:
                     pol_b += p.nbytes
                     base = p.base
                     if base is not None:

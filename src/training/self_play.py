@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from ..games.base import Game
 from ..mcts.mcts import MCTS, BatchedMCTS, select_action, select_action_gumbel
-from .replay_buffer import GameHistory, stack_with_history
+from .replay_buffer import GameHistory, stack_with_history, _sparsify_policy
 
 
 def _make_batched_mcts(network, game, config, device):
@@ -64,6 +64,93 @@ def get_temperature(training_step: int, config) -> float:
     return temp
 
 
+def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory]:
+    """Post-hoc consecutive-move resignation (AlphaZero/Leela/KataGo style).
+
+    Engine-agnostic: scans each game's stored STM-relative ``root_values`` and,
+    if the side to move's value stays below ``resign_threshold`` for
+    ``resign_consecutive`` of ITS OWN moves, that side resigns — the game is
+    truncated at that ply and relabeled as a decisive loss for the resigner.
+
+    This protects the decisive LABEL a weak policy would otherwise shuffle into a
+    draw (see decisive_signal_plan_2026_06_23.md). It fires off the value head's
+    own estimate, so it is inert until the value head can see advantages. It is
+    NOT a compute saving (the game was already played out) — label protection
+    only. Mutates histories in place and returns the same list.
+    """
+    if not getattr(config, "resign_enabled", False):
+        return histories
+    thr = float(getattr(config, "resign_threshold", -0.9))
+    need = int(getattr(config, "resign_consecutive", 5))
+    if need <= 0:
+        return histories
+
+    for h in histories:
+        rv = h.root_values
+        n_ply = min(len(h.actions), len(rv))
+        cnt = [0, 0]                 # consecutive own-move counters: [even, odd]
+        resign_ply = None
+        for p in range(n_ply):
+            side = p & 1
+            if rv[p] < thr:
+                cnt[side] += 1
+                if cnt[side] >= need:
+                    resign_ply = p
+                    break
+            else:
+                cnt[side] = 0
+        if resign_ply is None or resign_ply < 1:
+            continue
+        p = resign_ply
+        # Side to move at ply p resigns (even ply = white = player 1). Outcome is
+        # player-1 POV: white resigns → black wins → -1; black resigns → +1.
+        h.game_outcome = -1.0 if (p & 1) == 0 else 1.0
+        h.draw_by_repetition = False
+        h.draw_by_no_progress = False
+        # Truncate: keep p played moves and p+1 observations (obs[p] = the resign
+        # position, now terminal). Preserves len(obs) == len(actions) + 1.
+        h.actions = h.actions[:p]
+        h.policies = h.policies[:p]
+        h.root_values = h.root_values[:p]
+        h.rewards = h.rewards[:p]
+        h.legal_actions_list = h.legal_actions_list[:p]
+        h.observations = h.observations[:p + 1]
+    return histories
+
+
+def get_material_value_weight(training_step: int, config) -> float:
+    """Annealed material/score-margin blend weight for the current step.
+
+    Linearly decays ``material_value_weight`` → ``material_value_weight_final``
+    over [0, ``material_value_anneal_frac`` · training_steps]. With
+    anneal_frac == 0 (or init weight 0) the weight is constant — back-compat.
+    Strong material shaping early to escape the flat-target draw basin, then
+    fade so the true game outcome dominates (see decisive_signal_plan_2026_06_23.md).
+    """
+    w_init = float(getattr(config, "material_value_weight", 0.0))
+    frac = float(getattr(config, "material_value_anneal_frac", 0.0))
+    if frac <= 0.0 or w_init == 0.0:
+        return w_init
+    w_final = float(getattr(config, "material_value_weight_final", 0.0))
+    total = max(1, int(getattr(config, "training_steps", 1)))
+    t = min(1.0, max(0.0, training_step / (frac * total)))
+    return w_init + (w_final - w_init) * t
+
+
+def get_material_head_weight(training_step: int, config) -> float:
+    """Annealed aux-loss weight for the material-margin head. Shares the
+    ``material_value_anneal_frac`` timeline with the value-target blend so the
+    material influence fades in lockstep. frac=0 ⇒ constant at the init weight."""
+    w_init = float(getattr(config, "material_head_loss_weight", 0.0))
+    frac = float(getattr(config, "material_value_anneal_frac", 0.0))
+    if frac <= 0.0 or w_init == 0.0:
+        return w_init
+    w_final = float(getattr(config, "material_head_loss_weight_final", 0.0))
+    total = max(1, int(getattr(config, "training_steps", 1)))
+    t = min(1.0, max(0.0, training_step / (frac * total)))
+    return w_init + (w_final - w_init) * t
+
+
 def play_game(
     network,
     game: Game,
@@ -112,7 +199,7 @@ def play_game(
 
         history.observations.append(single_frame)
         history.actions.append(action)
-        history.policies.append(action_probs)
+        history.policies.append(_sparsify_policy(action_probs))
         history.root_values.append(root_value)
         history.legal_actions_list.append(legal)
 
@@ -195,7 +282,7 @@ def play_games_parallel(
             # the T-frame stack from per-ply observations.
             histories[g].observations.append(single_frames[i])
             histories[g].actions.append(action)
-            histories[g].policies.append(action_probs)
+            histories[g].policies.append(_sparsify_policy(action_probs))
             histories[g].root_values.append(root_value)
             histories[g].legal_actions_list.append(legal_list[i])
 
@@ -317,7 +404,7 @@ def play_games_parallel_gpu(
 
             histories[g].observations.append(single_frames_active[i])
             histories[g].actions.append(action)
-            histories[g].policies.append(action_probs)
+            histories[g].policies.append(_sparsify_policy(action_probs))
             histories[g].root_values.append(root_value)
             histories[g].legal_actions_list.append(legal_list_active[i])
 
@@ -621,7 +708,7 @@ def play_games_parallel_gpu_resident(
             # alive, leaking ~1.5 GB per self-play batch.
             h_g.observations.append(torch.from_numpy(obs_cpu[g, t]).clone())
             h_g.actions.append(int(actions_cpu[g, t]))
-            h_g.policies.append(policies_cpu[g, t].copy())
+            h_g.policies.append(_sparsify_policy(policies_cpu[g, t]))
             h_g.root_values.append(float(values_cpu[g, t]))
             legal_idx = legal_masks_cpu[g, t].nonzero()[0].tolist()
             h_g.legal_actions_list.append(legal_idx)
@@ -678,7 +765,7 @@ def run_self_play(
                 play_fn(network, config, batch, device, training_step)
             )
             remaining -= batch
-        return histories
+        return _apply_resignation(histories, config)
 
     if n_parallel > 1:
         histories = []
@@ -690,7 +777,7 @@ def run_self_play(
             batch = min(n_parallel, remaining)
             histories.extend(play_games_parallel(network, game, config, batch, device, training_step))
             remaining -= batch
-        return histories
+        return _apply_resignation(histories, config)
 
     games = []
     iterator = range(num_games)
@@ -698,4 +785,4 @@ def run_self_play(
         iterator = tqdm(iterator, desc="Self-play", leave=False)
     for _ in iterator:
         games.append(play_game(network, game, config, device, training_step))
-    return games
+    return _apply_resignation(games, config)

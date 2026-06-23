@@ -404,6 +404,35 @@ class MovesLeftHead(nn.Module):
         return self.head(hidden_state)  # (B, 2*support_size + 1) logits
 
 
+class MaterialHead(nn.Module):
+    """KataGo score-distribution head (chess analogue): predicts the current
+    side-to-move MATERIAL margin (pawns) as a categorical distribution over the
+    transformed support {-K..K}.
+
+    Purpose: regularize the representation/world model to track material through
+    latent rollouts. Unlike value (negamax-flipped) the target is the margin from
+    each position's own STM POV — computed STM-relative from the observation, so
+    NO negamax flip here. Queried separately (like moves-left), so the main
+    inference tuple is unchanged. Trained via CE on scalar_to_support(
+    scalar_transform(margin)). Identical architecture to MovesLeftHead.
+    """
+
+    def __init__(self, hidden_planes: int, latent_h: int, latent_w: int,
+                 fc_hidden: int, support_size: int):
+        super().__init__()
+        self.support_size = support_size
+        self.head = nn.Sequential(
+            nn.Conv2d(hidden_planes, 1, 1, bias=False),
+            norm_layer(1, (latent_h, latent_w)),
+            nn.ReLU(),
+            nn.Flatten(),
+            mlp_head(latent_h * latent_w, fc_hidden, 2 * support_size + 1),
+        )
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        return self.head(hidden_state)  # (B, 2*support_size + 1) logits
+
+
 class MuZeroNetwork(nn.Module):
     """Full MuZero network combining representation, dynamics, prediction.
 
@@ -441,6 +470,8 @@ class MuZeroNetwork(nn.Module):
         policy_head_type: str = "flat",
         use_moves_left: bool = False,
         moves_left_support_size: int = 10,
+        use_material_head: bool = False,
+        material_head_support_size: int = 8,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -454,6 +485,8 @@ class MuZeroNetwork(nn.Module):
         self.use_inverse_dynamics_loss = use_inverse_dynamics_loss
         self.use_moves_left = use_moves_left
         self.moves_left_support_size = moves_left_support_size
+        self.use_material_head = use_material_head
+        self.material_head_support_size = material_head_support_size
 
         self.representation = RepresentationNetwork(
             observation_channels, hidden_planes, num_blocks,
@@ -491,6 +524,16 @@ class MuZeroNetwork(nn.Module):
             )
         else:
             self.moves_left_head = None
+
+        # Material-margin head (KataGo score-dist analogue): predicts current STM
+        # material from the latent; regularizes the world model. Training-only;
+        # not used by MCTS.
+        if use_material_head:
+            self.material_head = MaterialHead(
+                hidden_planes, latent_h, latent_w, fc_hidden, material_head_support_size,
+            )
+        else:
+            self.material_head = None
 
         if use_consistency_loss:
             flat_dim = hidden_planes * latent_h * latent_w
@@ -531,6 +574,14 @@ class MuZeroNetwork(nn.Module):
         assert self.moves_left_head is not None, \
             "predict_moves_left() called with use_moves_left=False"
         return self.moves_left_head(hidden)
+
+    def predict_material(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Material-margin logits (B, 2*K+1) from a hidden state. Queried
+        separately for the aux CE loss (training-only; not used by MCTS).
+        Target is STM-relative material, so no negamax flip."""
+        assert self.material_head is not None, \
+            "predict_material() called with use_material_head=False"
+        return self.material_head(hidden)
 
     def initial_inference(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run representation + prediction on observation.

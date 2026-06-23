@@ -163,6 +163,41 @@ def main():
     parser.add_argument("--reanalyze-interval", type=int, default=None,
                         help="Override config.reanalyze_interval (training steps between "
                              "reanalyze calls; 0 = disabled). Preset 1024.")
+    parser.add_argument("--material-value-weight", type=float, default=None,
+                        help="Override config.material_value_weight (KataGo c_score "
+                             "analogue). w in [0,1]: blends a material-margin WDL into the "
+                             "self-play value target so two won positions are rank-able "
+                             "(within-position resolution). chess only; 0 = off.")
+    parser.add_argument("--material-value-scale", type=float, default=None,
+                        help="Override config.material_value_scale (pawns mapping to ~tanh "
+                             "saturation; 5 ≈ a rook). Preset 5.0.")
+    parser.add_argument("--material-value-weight-final", type=float, default=None,
+                        help="Override config.material_value_weight_final (annealing floor "
+                             "the material blend weight decays toward). Preset 0.0.")
+    parser.add_argument("--material-value-anneal-frac", type=float, default=None,
+                        help="Override config.material_value_anneal_frac. Fraction of training "
+                             "over which the material blend weight linearly decays init→final. "
+                             "0 = no annealing (constant weight). E.g. 0.6 = faded by 60%% steps. "
+                             "Shared timeline for the material-margin head loss weight too.")
+    parser.add_argument("--use-material-head", action="store_true", default=False,
+                        help="Enable the auxiliary material-margin head (KataGo score-dist "
+                             "analogue): predicts current STM material from the latent state to "
+                             "regularize the world model. chess only.")
+    parser.add_argument("--material-head-loss-weight", type=float, default=None,
+                        help="Override config.material_head_loss_weight (INITIAL aux CE weight; "
+                             "annealed on --material-value-anneal-frac). Preset 0.25.")
+    parser.add_argument("--material-head-loss-weight-final", type=float, default=None,
+                        help="Override config.material_head_loss_weight_final (anneal floor). Preset 0.0.")
+    parser.add_argument("--resign-enabled", action="store_true", default=False,
+                        help="Enable post-hoc consecutive-move resignation: if STM root "
+                             "value < --resign-threshold for --resign-consecutive own-moves, "
+                             "truncate + relabel the game as a decisive loss (label protection).")
+    parser.add_argument("--resign-threshold", type=float, default=None,
+                        help="Override config.resign_threshold (STM-POV root value; ≈≤5%% "
+                             "expected score). Preset -0.9.")
+    parser.add_argument("--resign-consecutive", type=int, default=None,
+                        help="Override config.resign_consecutive (consecutive own-moves below "
+                             "threshold to trigger resignation). Preset 5.")
     parser.add_argument("--mask-illegal-policy", action="store_true", default=False,
                         help="Enable legal-move policy masking (config.mask_illegal_policy). "
                              "Keeps the standard full-softmax policy CE and ADDS a penalty "
@@ -303,6 +338,20 @@ def main():
         config.decisive_sample_frac = args.decisive_sample_frac
     if args.reanalyze_interval is not None:
         config.reanalyze_interval = args.reanalyze_interval
+    if args.material_value_weight is not None:
+        config.material_value_weight = args.material_value_weight
+    if args.material_value_scale is not None:
+        config.material_value_scale = args.material_value_scale
+    if args.material_value_weight_final is not None:
+        config.material_value_weight_final = args.material_value_weight_final
+    if args.material_value_anneal_frac is not None:
+        config.material_value_anneal_frac = args.material_value_anneal_frac
+    if args.resign_enabled:
+        config.resign_enabled = True
+    if args.resign_threshold is not None:
+        config.resign_threshold = args.resign_threshold
+    if args.resign_consecutive is not None:
+        config.resign_consecutive = args.resign_consecutive
     if args.decisive_retention_multiplier is not None:
         config.decisive_retention_multiplier = args.decisive_retention_multiplier
     if args.policy_head_type is not None:
@@ -387,6 +436,8 @@ def main():
         policy_head_type=getattr(config, "policy_head_type", "flat"),
         use_moves_left=getattr(config, "use_moves_left", False),
         moves_left_support_size=getattr(config, "moves_left_support_size", 10),
+        use_material_head=getattr(config, "use_material_head", False),
+        material_head_support_size=getattr(config, "material_head_support_size", 8),
     )
 
     trainer = MuZeroTrainer(

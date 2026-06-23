@@ -96,8 +96,16 @@ def _assert_gamehistory_equal(a: GameHistory, b: GameHistory, policy_atol=1e-6):
         assert list(la) == list(lb)
     assert len(a.policies) == len(b.policies)
     for pa, pb in zip(a.policies, b.policies):
-        assert pa.shape == pb.shape
-        assert np.allclose(pa, pb, atol=policy_atol)
+        # Policies are stored sparse as (indices, values) tuples (Path B);
+        # fall back to dense-array comparison for back-compat.
+        if isinstance(pa, tuple):
+            ia, va = pa
+            ib, vb = pb
+            assert np.array_equal(np.asarray(ia), np.asarray(ib))
+            assert np.allclose(va, vb, atol=policy_atol)
+        else:
+            assert pa.shape == pb.shape
+            assert np.allclose(pa, pb, atol=policy_atol)
 
 
 # ---------------------------------------------------------------------------
