@@ -87,6 +87,12 @@ class GameHistory:
     # (truncated + relabeled as a decisive loss). Transient self-play stat —
     # used for the self_play/resignation_rate metric; not serialized.
     resigned: bool = False
+    # Calibration holdout (AlphaZero-style): True iff this game hit the resign
+    # trigger but was left un-resigned (played to its natural end) to measure
+    # false positives. resign_false_positive: of those, True iff the would-have-
+    # resigned side did NOT actually lose (a wrong resignation we avoided).
+    resign_holdout: bool = False
+    resign_false_positive: bool = False
     # Optional starting position (FEN) for games that do NOT begin from the
     # standard initial position — e.g. endgame-seed curriculum games. When set,
     # from_compact_dict replays actions from this FEN instead of game.reset().

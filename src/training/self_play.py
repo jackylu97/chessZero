@@ -84,6 +84,10 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
     need = int(getattr(config, "resign_consecutive", 5))
     if need <= 0:
         return histories
+    # AlphaZero-style calibration holdout: this fraction of would-resign games is
+    # played to its natural end instead of resigned, so the false-positive rate
+    # (value head said "lost" but the side did NOT actually lose) is measurable.
+    holdout_frac = min(max(float(getattr(config, "resign_holdout_frac", 0.0)), 0.0), 1.0)
 
     for h in histories:
         rv = h.root_values
@@ -102,9 +106,19 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
         if resign_ply is None or resign_ply < 1:
             continue
         p = resign_ply
+        white_resigns = (p & 1) == 0
+        # Calibration holdout: leave this game un-resigned (natural outcome) and
+        # record whether resignation WOULD have been a false positive — i.e. the
+        # would-have-resigned side did NOT actually lose. resign_false_positive
+        # over the holdout sample is AlphaZero's <5% threshold-calibration metric.
+        if holdout_frac > 0.0 and random.random() < holdout_frac:
+            h.resign_holdout = True
+            actually_lost = (h.game_outcome == -1.0) if white_resigns else (h.game_outcome == 1.0)
+            h.resign_false_positive = not actually_lost
+            continue
         # Side to move at ply p resigns (even ply = white = player 1). Outcome is
         # player-1 POV: white resigns → black wins → -1; black resigns → +1.
-        h.game_outcome = -1.0 if (p & 1) == 0 else 1.0
+        h.game_outcome = -1.0 if white_resigns else 1.0
         h.draw_by_repetition = False
         h.draw_by_no_progress = False
         h.resigned = True

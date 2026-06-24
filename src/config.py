@@ -337,6 +337,11 @@ class MuZeroConfig:
     resign_enabled: bool = False
     resign_threshold: float = -0.9       # STM-POV root value; ≈ ≤5% expected score.
     resign_consecutive: int = 5          # consecutive own-moves below threshold.
+    # AlphaZero-style calibration holdout: this fraction of games that hit the
+    # resign trigger is played to its natural end instead of resigned, so the
+    # false-positive rate (self_play/resign_false_positive_rate) is measurable.
+    # AlphaZero played ~20% to completion; tune resign_threshold to keep FP < 5%.
+    resign_holdout_frac: float = 0.15
 
     # Stratified sampling: at every training batch, sample
     # floor(batch_size * warmstart_sample_frac) games from warmstart-only

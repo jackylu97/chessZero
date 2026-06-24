@@ -431,6 +431,16 @@ class MuZeroTrainer:
         self.writer.add_scalar("self_play/resign_p1_win_rate", resign_p1 / n_games, self.global_step)
         self.writer.add_scalar("self_play/resign_p2_win_rate", resign_p2 / n_games, self.global_step)
         self.writer.add_scalar("self_play/win_natural_rate", natural_decisive / n_games, self.global_step)
+        # Resignation calibration (AlphaZero-style holdout): games that hit the
+        # resign trigger but were played to completion, and of those the fraction
+        # where the would-have-resigned side did NOT actually lose (false
+        # positive). If resign_false_positive_rate exceeds ~5%, resign_threshold
+        # is too aggressive (it's truncating winnable/drawable games as losses).
+        holdout_triggered = sum(1 for g in games if getattr(g, "resign_holdout", False))
+        resign_fp = sum(1 for g in games if getattr(g, "resign_false_positive", False))
+        self.writer.add_scalar("self_play/resign_holdout_rate", holdout_triggered / n_games, self.global_step)
+        self.writer.add_scalar("self_play/resign_false_positive_rate",
+                               resign_fp / max(1, holdout_triggered), self.global_step)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
         # Buffer composition: fraction of self-play (non-warmstart) games in the
         # buffer that are decisive — the quantity decisive_retention_multiplier is

@@ -200,6 +200,10 @@ def main():
                         help="Enable post-hoc consecutive-move resignation: if STM root "
                              "value < --resign-threshold for --resign-consecutive own-moves, "
                              "truncate + relabel the game as a decisive loss (label protection).")
+    parser.add_argument("--resign-holdout-frac", type=float, default=None,
+                        help="Override config.resign_holdout_frac (AlphaZero-style): fraction of "
+                             "would-resign games played to completion to measure the false-positive "
+                             "rate (self_play/resign_false_positive_rate; tune threshold to <5%%). Preset 0.15.")
     parser.add_argument("--resign-threshold", type=float, default=None,
                         help="Override config.resign_threshold (STM-POV root value; ≈≤5%% "
                              "expected score). Preset -0.9.")
@@ -370,6 +374,8 @@ def main():
         config.resign_threshold = args.resign_threshold
     if args.resign_consecutive is not None:
         config.resign_consecutive = args.resign_consecutive
+    if args.resign_holdout_frac is not None:
+        config.resign_holdout_frac = args.resign_holdout_frac
     if args.decisive_retention_multiplier is not None:
         config.decisive_retention_multiplier = args.decisive_retention_multiplier
     if args.policy_head_type is not None:
