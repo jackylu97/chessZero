@@ -5,7 +5,7 @@
 set -u
 cd /workspace/chessZero
 RUN=${1:-2026_06_23_cold_material_anneal}
-PT=checkpoints/chess_small/$RUN/checkpoint_5000.pt
+PT=checkpoints/chess/$RUN/checkpoint_5000.pt
 SF=tools/stockfish/stockfish
 REPORT=logs/probe_5k_${RUN}.txt
 PY=.venv/bin/python
@@ -22,7 +22,7 @@ done
   echo "===================================================================="
   if [[ ! -f "$PT" ]]; then
     echo "TIMEOUT: $PT never appeared after ~8h."
-    ls -v "checkpoints/chess_small/$RUN" 2>/dev/null | grep -E '\.pt$' | tail -8
+    ls -v "checkpoints/chess/$RUN" 2>/dev/null | grep -E '\.pt$' | tail -8
     exit 0
   fi
   echo "checkpoint: $PT"
