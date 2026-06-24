@@ -161,11 +161,14 @@ def main():
                          "(real positions + full history). Falls back to constructed "
                          "FENs if the pool is absent.")
     ap.add_argument("--logdir", default=None)
+    ap.add_argument("--game", default="chess",
+                    help="config preset for network sizing (e.g. chess_small). "
+                         "Must match the run that produced the checkpoint.")
     args = ap.parse_args()
 
     dev = args.device
-    game = ChessGame(); HF = get_config("chess").history_frames
-    cfg = get_config("chess"); cfg.device = dev
+    game = ChessGame(); HF = get_config(args.game).history_frames
+    cfg = get_config(args.game); cfg.device = dev
     from src.config import MuZeroConfig
     torch.serialization.add_safe_globals([MuZeroConfig])
     ckpt = torch.load(args.checkpoint, map_location=dev, weights_only=True)
