@@ -20,6 +20,7 @@ import torch
 
 from src.config import MuZeroConfig
 from src.games.tictactoe import TicTacToe
+from src.training.replay_buffer import _densify_policy
 from src.model.muzero_net import MuZeroNetwork
 from src.training.self_play import (
     _make_batched_mcts,
@@ -116,8 +117,9 @@ def test_play_games_parallel_with_tensor_mcts_produces_valid_histories(ttt):
         assert len(h.actions) > 0
         # One observation per ply + one terminal observation appended.
         assert len(h.observations) == len(h.actions) + 1
-        # Per-ply policies sum to ~1 (deduped + dense).
+        # Per-ply policies sum to ~1 (deduped). Stored sparse (Path B) → densify.
         for pi in h.policies:
+            pi = _densify_policy(pi, ttt.action_space_size)
             assert pi.shape[0] >= 1
             assert pi.sum() == pytest.approx(1.0, abs=1e-5)
             assert (pi >= 0).all()
@@ -143,6 +145,7 @@ def test_play_games_parallel_tensor_mcts_respects_legal_actions(ttt):
     )
     for h in histories:
         for pi, legal in zip(h.policies, h.legal_actions_list):
+            pi = _densify_policy(pi, ttt.action_space_size)
             legal_set = set(legal)
             for a in range(pi.shape[0]):
                 if a not in legal_set:
@@ -274,6 +277,6 @@ def test_play_games_parallel_gpu_with_tensor_mcts_runs():
         assert h.game_outcome in (-1, 0, 1)
         for a in h.actions:
             assert 0 <= a < chess_game.action_space_size
-        # Per-ply policies sum to ~1 over the deduped/sampled support.
+        # Per-ply policies sum to ~1 over the deduped/sampled support (sparse → densify).
         for pi in h.policies:
-            assert pi.sum() == pytest.approx(1.0, abs=1e-5)
+            assert _densify_policy(pi, chess_game.action_space_size).sum() == pytest.approx(1.0, abs=1e-5)

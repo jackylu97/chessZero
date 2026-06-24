@@ -242,6 +242,9 @@ class TensorMCTS:
         if self._use_terminal_draws and select_backend == "triton":
             select_backend = "compile" if self.compile else "eager"
         self.select_backend = select_backend
+        # [N, K] bool mask (set per run_batch_gpu): root children whose action
+        # completes a repetition, pinned to draw_score in _select. None = off.
+        self._root_term_mask = None
 
         self.action_space_size = int(game.action_space_size)
         sample_k = getattr(config, "sample_k", None)
@@ -494,6 +497,7 @@ class TensorMCTS:
         obs_batch: torch.Tensor,
         legal_mask: torch.Tensor,
         add_noise: bool = True,
+        forced_draw_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Sync-free variant of ``run_batch``.
 
@@ -554,6 +558,18 @@ class TensorMCTS:
                 hidden_batch, policy_logits_root, legal_mask, add_noise
             )
             self.has_prior_search = False
+
+        # Map the per-action repetition mask [N, A] onto the root's K sampled
+        # children [N, K] (gather by action, mask invalid slots). Consumed in
+        # _select to pin repeating root children to draw_score.
+        if self._use_terminal_draws and forced_draw_mask is not None:
+            root_acts = self.child_actions[:, 0, :]                  # [N, K] int32
+            self._root_term_mask = (
+                torch.gather(forced_draw_mask, 1, root_acts.clamp(min=0).long())
+                & (root_acts != -1)
+            )
+        else:
+            self._root_term_mask = None
 
         for _ in range(num_sims):
             (
@@ -1105,6 +1121,20 @@ class TensorMCTS:
             q_norm = (raw_q - self.mm_min.unsqueeze(1)) / mm_span
             normalized_q = torch.where(has_range, q_norm, raw_q)
             value_score = torch.where(visits_f > 0, normalized_q, torch.zeros_like(normalized_q))
+
+            # Root-terminal-draws override: for root children whose action completes
+            # a repetition, pin value_score to the normalized draw_score (mover POV),
+            # regardless of visits. Side-aware automatically — a winning side's other
+            # children normalize ABOVE draw_score (so it avoids the repeat); a losing
+            # side's normalize below (so it keeps the draw). Root-only (cur == 0).
+            if self._use_terminal_draws and self._root_term_mask is not None:
+                term_here = (cur == 0).unsqueeze(1) & self._root_term_mask  # [N, K]
+                ds_norm = (self._draw_score - self.mm_min.unsqueeze(1)) / mm_span  # [N, 1]
+                ds_score = torch.where(
+                    has_range, ds_norm.expand_as(value_score),
+                    torch.full_like(value_score, self._draw_score),
+                )
+                value_score = torch.where(term_here, ds_score, value_score)
 
             scores = prior_score + value_score
 
