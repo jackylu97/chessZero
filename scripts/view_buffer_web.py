@@ -55,21 +55,33 @@ def _outcome_label(o: float) -> str:
 
 
 def _policy_top(pol, board, k: int = 3) -> list:
-    """Top-k (san, prob) of a dense policy target at ``board`` (the position to move)."""
+    """Top-k (san, prob) of a policy target at ``board`` (the position to move).
+
+    Policies are stored sparse as an ``(indices, values)`` tuple (Path B); dense
+    arrays are still accepted for back-compat with older buffers.
+    """
     if pol is None or len(pol) == 0:
         return []
-    pol = np.asarray(pol, dtype=np.float64)
-    order = np.argsort(pol)[::-1][:k]
+    if isinstance(pol, tuple):
+        idx = np.asarray(pol[0], dtype=np.int64)
+        val = np.asarray(pol[1], dtype=np.float64)
+    else:
+        val = np.asarray(pol, dtype=np.float64)
+        idx = np.arange(val.shape[0])
+    if len(val) == 0:
+        return []
+    order = np.argsort(val)[::-1][:k]
     out = []
-    for a in order:
-        p = float(pol[a])
+    for j in order:
+        a = int(idx[j])
+        p = float(val[j])
         if p <= 0.0:
             break
-        mv = _action_to_move(int(a), board)
+        mv = _action_to_move(a, board)
         if mv is not None and mv in board.legal_moves:
             san, uci = board.san(mv), mv.uci()
         else:
-            san, uci = f"?{int(a)}", None
+            san, uci = f"?{a}", None
         out.append([san, round(p, 3), uci])  # uci drives the board arrows
     return out
 

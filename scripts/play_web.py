@@ -362,6 +362,17 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
     # Moves-left head (Lc0): detect so moves-head checkpoints load.
     has_moves_left = any(k.startswith("moves_left_head.") for k in state_dict)
 
+    # Material head (decisive-signal aux head): detect so material-head
+    # checkpoints load. Recover the support size (2K+1) from the output proj.
+    has_material = any(k.startswith("material_head.") for k in state_dict)
+    material_support = getattr(config, "material_head_support_size", 8)
+    if has_material:
+        outw = next((v for k, v in state_dict.items()
+                     if k.startswith("material_head.") and v.ndim == 2
+                     and v.shape[0] % 2 == 1 and v.shape[0] < v.shape[1] * 4), None)
+        if outw is not None:
+            material_support = (outw.shape[0] - 1) // 2
+
     network = MuZeroNetwork(
         # Input is the T-frame history stack (num_planes * history_frames), matching training.
         observation_channels=game.num_planes * getattr(config, "history_frames", 1),
@@ -391,6 +402,8 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
         moves_left_support_size=getattr(config, "moves_left_support_size", 10),
         use_inverse_dynamics_loss=has_inverse,
         inverse_dynamics_hidden=getattr(config, "inverse_dynamics_hidden", 256),
+        use_material_head=has_material,
+        material_head_support_size=material_support,
     )
     network.load_state_dict(state_dict)
     network.to(device)
@@ -408,6 +421,9 @@ def main():
     parser.add_argument("--run-id", default=None,
                         help="Run id under checkpoints/chess/ to pull the latest checkpoint from "
                              "(ignored if --checkpoint is given).")
+    parser.add_argument("--game", default="chess",
+                        help="Config preset used to size the network (e.g. chess, chess_small). "
+                             "Must match the run that produced the checkpoint.")
     parser.add_argument("--device", default=None)
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", default="127.0.0.1")
@@ -427,7 +443,7 @@ def main():
     else:
         device = args.device
 
-    config = get_config("chess")
+    config = get_config(args.game)
     if args.use_gumbel is not None:
         config.use_gumbel = args.use_gumbel
     if args.num_simulations is not None:
