@@ -415,10 +415,22 @@ class MuZeroTrainer:
         self.writer.add_scalar("self_play/draw_no_progress_rate", no_progress_draws / n_games, self.global_step)
         self.writer.add_scalar("self_play/draw_computer_rate", computer_draws / n_games, self.global_step)
         self.writer.add_scalar("self_play/draw_plycap_rate", plycap_draws / n_games, self.global_step)
-        # Adjudication: fraction of games ended by consecutive-move resignation
-        # (truncated + relabeled as a decisive loss). 0 when resign_enabled=False.
+        # Resignation as its own OUTCOME CATEGORY. Resigned games are relabeled
+        # decisive (game_outcome = ±1), so they're already folded into
+        # p1/p2_win_rate above. Here we split them out so the three top-level
+        # categories are mutually exclusive and sum to 1.0:
+        #     win_natural_rate + resignation_rate + draw_rate == 1.0
+        # (draws are never resigned). resign_p{1,2}_win_rate sum to
+        # resignation_rate, mirroring the draw-type sub-breakdown. 0 throughout
+        # when resign_enabled=False.
         resigned_games = sum(1 for g in games if getattr(g, "resigned", False))
+        resign_p1 = sum(1 for g in games if getattr(g, "resigned", False) and g.game_outcome == 1)
+        resign_p2 = sum(1 for g in games if getattr(g, "resigned", False) and g.game_outcome == -1)
+        natural_decisive = (p1_wins + p2_wins) - resigned_games
         self.writer.add_scalar("self_play/resignation_rate", resigned_games / n_games, self.global_step)
+        self.writer.add_scalar("self_play/resign_p1_win_rate", resign_p1 / n_games, self.global_step)
+        self.writer.add_scalar("self_play/resign_p2_win_rate", resign_p2 / n_games, self.global_step)
+        self.writer.add_scalar("self_play/win_natural_rate", natural_decisive / n_games, self.global_step)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
         # Buffer composition: fraction of self-play (non-warmstart) games in the
         # buffer that are decisive — the quantity decisive_retention_multiplier is
