@@ -188,6 +188,14 @@ def main():
                              "annealed on --material-value-anneal-frac). Preset 0.25.")
     parser.add_argument("--material-head-loss-weight-final", type=float, default=None,
                         help="Override config.material_head_loss_weight_final (anneal floor). Preset 0.0.")
+    parser.add_argument("--root-terminal-draws", action="store_true", default=False,
+                        help="Enable the root repetition-draw penalty (terminal-aware search): "
+                             "pin a move that completes a 2nd/3rd repetition to draw_score in MCTS "
+                             "so the WINNING side avoids shuffling into a draw (side-aware; the "
+                             "losing side keeps the draw). chess / GPU-resident self-play only.")
+    parser.add_argument("--root-terminal-draws-min-repeats", type=int, default=None,
+                        help="Override config.root_terminal_draws_min_repeats (2 = avoid any "
+                             "repeat; 3 = only block completing a threefold). Preset 2.")
     parser.add_argument("--resign-enabled", action="store_true", default=False,
                         help="Enable post-hoc consecutive-move resignation: if STM root "
                              "value < --resign-threshold for --resign-consecutive own-moves, "
@@ -352,6 +360,10 @@ def main():
         config.material_head_loss_weight = args.material_head_loss_weight
     if args.material_head_loss_weight_final is not None:
         config.material_head_loss_weight_final = args.material_head_loss_weight_final
+    if args.root_terminal_draws:
+        config.root_terminal_draws = True
+    if args.root_terminal_draws_min_repeats is not None:
+        config.root_terminal_draws_min_repeats = args.root_terminal_draws_min_repeats
     if args.resign_enabled:
         config.resign_enabled = True
     if args.resign_threshold is not None:

@@ -456,7 +456,18 @@ class MuZeroConfig:
     ml_slope: float = 0.005               # per-ply effect before clipping
     ml_max_effect: float = 0.1            # clip magnitude (vs value_score in [0,1])
 
-    # --- Material-margin head (KataGo score-distribution head, chess analogue) -
+    # --- Root repetition-draw penalty (terminal-aware search, the AlphaZero
+    # property MuZero's latent search lacks) ----------------------------------
+    # When the side to move can complete a 2nd/3rd repetition, pin that move's
+    # search value to draw_score (mover POV). Side-aware automatically: a winning
+    # side avoids the repeat (draw_score < its winning Q), a losing side keeps it
+    # (draw_score > its losing Q) — so it preserves correct lost-side draws while
+    # forcing the winning side to make progress. Repeating moves are detected from
+    # the live board (GpuChessGame.repetition_move_mask) and applied at the root in
+    # TensorMCTS (_select). Enabling it downgrades the triton select backend to the
+    # torch path. Off by default. chess / GPU-resident self-play only.
+    root_terminal_draws: bool = False
+    root_terminal_draws_min_repeats: int = 2   # 2 = avoid any repeat; 3 = only block threefold
     # Auxiliary categorical head predicting the CURRENT side-to-move material
     # margin (pawns) from the LATENT state — incl. after the K dynamics unrolls,
     # so it regularizes the WORLD MODEL to preserve material through latent

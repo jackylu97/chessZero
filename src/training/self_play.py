@@ -530,6 +530,11 @@ def play_games_parallel_gpu_resident(
     temp_init = get_temperature(training_step, config)
     temp_final = float(config.temperature_final)
     temp_drop = int(config.temperature_drop_step)
+    # Root repetition-draw penalty: steer the winning side away from shuffling
+    # into a draw. Detect repeating root moves from the live board and pin them
+    # to draw_score in the search (TensorMCTS root-terminal-draws). Off by default.
+    use_terminal_draws = bool(getattr(config, "root_terminal_draws", False))
+    term_min_repeats = int(getattr(config, "root_terminal_draws_min_repeats", 2))
 
     # Cap loop length so we always have a static upper bound; ChessGame.max_plies
     # does the in-engine termination, alive_mask handles per-game stopping.
@@ -610,7 +615,14 @@ def play_games_parallel_gpu_resident(
             policy.scatter_(1, action.unsqueeze(1), 1.0)
             value = torch.zeros(num_games, device=device, dtype=torch.float32)
         else:
-            root_data = mcts.run_batch_gpu(stacked_obs, legal_mask, add_noise=True)
+            forced_draw_mask = (
+                gpu_game.repetition_move_mask(state, legal_mask, min_repeats=term_min_repeats)
+                if use_terminal_draws else None
+            )
+            root_data = mcts.run_batch_gpu(
+                stacked_obs, legal_mask, add_noise=True,
+                forced_draw_mask=forced_draw_mask,
+            )
 
             # 4. Per-game temperature for sampling (AlphaZero schedule).
             #    Picks from pre-cached tensors to avoid per-ply construction.
