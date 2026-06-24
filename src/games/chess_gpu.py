@@ -1489,11 +1489,31 @@ def _zobrist_hash(state: ChessBatchedState) -> torch.Tensor:
     cr_idx = rights[:, 0] * 8 + rights[:, 1] * 4 + rights[:, 2] * 2 + rights[:, 3]
     z_castling = ZOBRIST_CASTLING.to(device)
     h = h ^ z_castling[cr_idx]
-    # EP file (0..7), only when ep set.
-    has_ep = state.ep >= 0
-    ep_file = state.ep.to(torch.int64).clamp(0, 63) % 8
+    # EP file (0..7), included ONLY when an en-passant capture is actually
+    # available — matching python-chess's `_transposition_key`, which uses
+    # `ep_square if has_legal_en_passant() else None`. The previous code XOR'd
+    # the ep file on EVERY double-push (`state.ep >= 0`), even when no pawn could
+    # capture, making the hash spuriously unique → repetition undercount /
+    # threefold detected a ply late (mechanistic_verdict_2026_06_19 bug #3, which
+    # also corrupts the rep planes 19/20 derived from this hash). We use the
+    # pseudo-legal condition: a friendly pawn attacks the ep target. This matches
+    # python-chess except in the ultra-rare en-passant-pin / pinned-capturer case
+    # (the capture would expose the king), negligible for repetition counting.
+    ep_set = state.ep >= 0
+    ep_idx = state.ep.to(torch.int64).clamp(0, 63)
+    arange_n = torch.arange(N, device=device)
+    # Friendly pawns for the side to move (white planes 0-5, black 6-11).
+    our_pawn_bb = state.pieces[arange_n, state.side.to(torch.int64) * 6 + P_PAWN]  # (N,) bitboard
+    # Squares from which a friendly pawn attacks the ep target = the attack set of
+    # an ENEMY pawn placed on the ep square (reverse-attack identity): white to
+    # move (side==0) → BLACK table, black to move → WHITE table.
+    paw_w = PAWN_ATTACKS_W.to(device)
+    paw_b = PAWN_ATTACKS_B.to(device)
+    ep_attacker_sqs = torch.where(state.side == 0, paw_b[ep_idx], paw_w[ep_idx])   # (N,) bitboard
+    ep_legal = ep_set & ((ep_attacker_sqs & our_pawn_bb) != 0)
+    ep_file = ep_idx % 8
     z_ep = ZOBRIST_EP.to(device)
-    h = torch.where(has_ep, h ^ z_ep[ep_file], h)
+    h = torch.where(ep_legal, h ^ z_ep[ep_file], h)
     return h
 
 
