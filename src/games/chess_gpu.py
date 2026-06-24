@@ -1413,6 +1413,100 @@ class GpuChessGame(BatchedGame):
         legal, _in_check = _legal_mask_impl(state)
         return legal
 
+    def repetition_move_mask(
+        self,
+        state: ChessBatchedState,
+        legal_mask: torch.Tensor,
+        min_repeats: int = 2,
+    ) -> torch.Tensor:
+        """`(N, 4672)` bool: legal moves that would make the resulting position
+        occur >= ``min_repeats`` times (i.e. complete a 2nd/3rd repetition).
+
+        Only fully-REVERSIBLE moves can ever repeat a prior position — any
+        capture, pawn move, promotion, or castling-rights change is irreversible
+        (it alters material / pawn structure / rights, none of which can return),
+        so those are always False. For the reversible candidates the resulting
+        Zobrist hash has a closed incremental form (move the one piece, flip the
+        side, drop any stale ep), letting us check the rep-hash ring directly
+        without applying the move. Used to steer the winning side away from
+        shuffling into a draw (TensorMCTS root-terminal-draws override).
+        """
+        dev = state.device
+        N = state.n
+        A = 4672
+        if state.rep_hashes is None or state.rep_count is None:
+            return torch.zeros((N, A), dtype=torch.bool, device=dev)
+
+        cur_h = _zobrist_hash(state)                                   # [N] (ep-legal-gated)
+        side = state.side
+        is_white = (side == 0)
+
+        # Decode from/to squares per action (to-square is side-dependent for promos).
+        from_sq = ACTION_FROM_SQ.to(dev)                              # [A]
+        from_NA = from_sq.view(1, A).expand(N, A)                     # [N, A]
+        to_sq = torch.where(
+            is_white.view(N, 1),
+            ACTION_TARGET_W.to(dev).view(1, A),
+            ACTION_TARGET_B.to(dev).view(1, A),
+        )                                                            # [N, A]
+
+        # Per-square occupying piece plane (0-11), or -1 if empty.
+        bit_idx = torch.arange(64, device=dev, dtype=torch.int64)
+        bits = ((state.pieces.unsqueeze(-1) >> bit_idx) & 1).bool()   # [N, 12, 64]
+        plane_ids = torch.arange(12, device=dev).view(1, 12, 1).expand_as(bits)
+        occ = torch.where(bits, plane_ids, torch.full_like(plane_ids, -1)).max(dim=1).values  # [N, 64]
+
+        piece_from = torch.gather(occ, 1, from_NA.clamp(0, 63))       # [N, A]
+        to_occ = torch.gather(occ, 1, to_sq.clamp(0, 63))            # [N, A]
+        is_quiet = (to_sq >= 0) & (to_occ < 0)                        # to-square empty
+        is_pawn = (piece_from >= 0) & ((piece_from % 6) == P_PAWN)
+
+        # Castling-rights change: from-square is a king/rook home square AND that
+        # right is currently held (if held, the home piece IS the king/rook).
+        cr = state.castling.bool()
+        wk, wq, bk, bq = cr[:, CR_WK], cr[:, CR_WQ], cr[:, CR_BK], cr[:, CR_BQ]
+        fs = from_sq.view(1, A)
+        changes_rights = (
+            ((fs == 4) & (wk | wq).view(N, 1))    # e1 king
+            | ((fs == 0) & wq.view(N, 1))         # a1 rook
+            | ((fs == 7) & wk.view(N, 1))         # h1 rook
+            | ((fs == 60) & (bk | bq).view(N, 1)) # e8 king
+            | ((fs == 56) & bq.view(N, 1))        # a8 rook
+            | ((fs == 63) & bk.view(N, 1))        # h8 rook
+        )
+
+        candidate = (
+            legal_mask & is_quiet & ~is_pawn & ~changes_rights & (piece_from >= 0)
+        )
+
+        # Incremental hash for the reversible candidate: cur ^ side ^ (piece
+        # from->to) ^ (drop the stale legal-ep contribution, if any).
+        zp = ZOBRIST_PIECE.to(dev)                                    # [12, 64]
+        pf = piece_from.clamp(min=0).long()
+        zp_from = zp[pf, from_NA.clamp(0, 63)]                        # [N, A]
+        zp_to = zp[pf, to_sq.clamp(0, 63)]                            # [N, A]
+        # Legal-ep contribution currently in cur_h (same gating as _zobrist_hash).
+        ep_set = state.ep >= 0
+        ep_idx = state.ep.to(torch.int64).clamp(0, 63)
+        arange_n = torch.arange(N, device=dev)
+        our_pawn = state.pieces[arange_n, side.to(torch.int64) * 6 + P_PAWN]
+        ep_attackers = torch.where(
+            is_white, PAWN_ATTACKS_B.to(dev)[ep_idx], PAWN_ATTACKS_W.to(dev)[ep_idx]
+        )
+        ep_legal = ep_set & ((ep_attackers & our_pawn) != 0)
+        z_ep = ZOBRIST_EP.to(dev)
+        old_ep_xor = torch.where(ep_legal, z_ep[ep_idx % 8], torch.zeros_like(cur_h))  # [N]
+
+        new_h = cur_h.view(N, 1) ^ ZOBRIST_SIDE ^ zp_from ^ zp_to ^ old_ep_xor.view(N, 1)
+
+        # Count valid ring entries equal to new_h (ring includes the current pos).
+        rep_pos = torch.arange(REP_HISTORY_K, device=dev).view(1, 1, REP_HISTORY_K)
+        valid = rep_pos < state.rep_count.to(torch.int64).view(N, 1, 1)
+        match = (new_h.unsqueeze(-1) == state.rep_hashes.view(N, 1, REP_HISTORY_K)) & valid
+        match_count = match.sum(dim=-1)                               # [N, A]
+        # Resulting occurrence count = ring matches + 1 (this move). >= min_repeats.
+        return candidate & (match_count >= (min_repeats - 1))
+
     def step_batch(
         self,
         state: ChessBatchedState,
