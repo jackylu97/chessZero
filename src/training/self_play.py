@@ -600,6 +600,8 @@ def play_games_parallel_gpu_resident(
     terminal_no_progress = torch.zeros(num_games, dtype=torch.bool, device=device)
     game_length = torch.zeros(num_games, dtype=torch.int32, device=device)
     move_count = torch.zeros(num_games, dtype=torch.int32, device=device)
+    # Per-game: did it ever reach a ≤tb_max_pieces (tablebase) position while alive?
+    tb_reached = torch.zeros(num_games, dtype=torch.bool, device=device)
 
     iteration = 0
     log_every = 20
@@ -651,6 +653,8 @@ def play_games_parallel_gpu_resident(
                 tb_prober.root_move_values(state, legal_mask)
                 if tb_prober is not None else None
             )
+            if tb_prober is not None and tb_prober.last_in_tb is not None:
+                tb_reached |= tb_prober.last_in_tb.to(device) & alive_mask
             root_data = mcts.run_batch_gpu(
                 stacked_obs, legal_mask, add_noise=True,
                 forced_draw_mask=forced_draw_mask,
@@ -740,12 +744,21 @@ def play_games_parallel_gpu_resident(
     game_outcome_cpu = game_outcome.cpu().numpy()
     terminal_threefold_cpu = terminal_threefold.cpu().numpy()
     terminal_no_progress_cpu = terminal_no_progress.cpu().numpy()
+    tb_reached_cpu = tb_reached.cpu().numpy()
+    if tb_prober is not None:
+        n_reached = int(tb_reached_cpu.sum())
+        tqdm.write(
+            f"  TB probe: {n_reached}/{num_games} games reached <= {tb_prober.max_pieces} "
+            f"pieces; {tb_prober.n_probed} root positions probed this batch"
+        )
+        tb_prober.close()
 
     # 11. Build GameHistory objects.
     histories: list[GameHistory] = []
     for g in range(num_games):
         L = int(game_length_cpu[g])
         h_g = GameHistory(game_name=config.game)
+        h_g.reached_tb = bool(tb_reached_cpu[g])
         for t in range(L):
             # .copy() / torch.from_numpy(...).clone() materializes per-ply slices.
             # Without this, each appended view pins the entire [N, T, ...] parent

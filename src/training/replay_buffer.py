@@ -93,6 +93,10 @@ class GameHistory:
     # resigned side did NOT actually lose (a wrong resignation we avoided).
     resign_holdout: bool = False
     resign_false_positive: bool = False
+    # True iff this game ever reached a ≤tb_max_pieces (tablebase) position while
+    # alive. Drives self_play/tb_reach_rate — "how often does the model even reach
+    # the stage where root TB probing fires?" Transient, not serialized.
+    reached_tb: bool = False
     # Optional starting position (FEN) for games that do NOT begin from the
     # standard initial position — e.g. endgame-seed curriculum games. When set,
     # from_compact_dict replays actions from this FEN instead of game.reset().

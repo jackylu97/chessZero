@@ -441,6 +441,12 @@ class MuZeroTrainer:
         self.writer.add_scalar("self_play/resign_holdout_rate", holdout_triggered / n_games, self.global_step)
         self.writer.add_scalar("self_play/resign_false_positive_rate",
                                resign_fp / max(1, holdout_triggered), self.global_step)
+        # Root tablebase reach rate: fraction of games that ever simplified into a
+        # ≤tb_max_pieces position (where root TB probing can fire). Tells us how
+        # often the model even reaches the endgame stage the probe targets.
+        if getattr(self.config, "tb_root_probe", False):
+            tb_reached = sum(1 for g in games if getattr(g, "reached_tb", False))
+            self.writer.add_scalar("self_play/tb_reach_rate", tb_reached / n_games, self.global_step)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
         # Buffer composition: fraction of self-play (non-warmstart) games in the
         # buffer that are decisive — the quantity decisive_retention_multiplier is

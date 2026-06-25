@@ -74,6 +74,8 @@ class SyzygyRootProber:
         self.dtz_weight = float(dtz_weight)
         self.draw_score = float(draw_score)
         self._cache: dict[str, dict[int, float]] = {}
+        self.last_in_tb = None   # [N] bool — games in TB range on the most recent call
+        self.n_probed = 0        # cumulative count of root positions probed
 
     def close(self):
         try:
@@ -98,7 +100,9 @@ class SyzygyRootProber:
         for b in range(64):
             bits = bits + ((occ >> b) & 1)
         in_tb = bits <= self.max_pieces
+        self.last_in_tb = in_tb
         idxs = torch.nonzero(in_tb, as_tuple=False).flatten().tolist()
+        self.n_probed += len(idxs)
         if not idxs:
             return out.to(dev)
 
