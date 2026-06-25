@@ -1,17 +1,18 @@
 #!/bin/bash
 # TB-VALUE arm: identical to _launch_tbprobe.sh (400 sims / 512 games / 256 parallel)
 # but ADDS DTZ value-target relabeling (tb_value_weight=1.0, tb_value_dtz_shape=0.5)
-# on top of the search-side probe. Resumes from the LATEST tb_probe baseline
-# checkpoint so it's a same-model before/after test: does relabeling flip the value
-# head (corr(value,-DTZ): -0.34 -> +) and unlock no-probe conversion? selfplay_q_ratio
-# stays 0 (config default) so the TB value isn't washed out.
+# on top of the search-side probe. Starts FRESH from the SAME 15k warmstart anchor
+# tb_probe used (NOT a continuation of tb_probe's 61k) — so it's a clean parallel A/B
+# from a common origin: self-play runs from scratch with relabeling on from the first
+# self-play game. self-play-warmup-steps=15000 == the resume step, so self-play begins
+# immediately. selfplay_q_ratio stays 0 (config default) so the TB value isn't washed.
 cd /workspace/chessZero
 
-RESUME=$(ls -t checkpoints/chess/2026_06_25_tb_probe/checkpoint_*.pt 2>/dev/null | head -1)
-if [ -z "$RESUME" ]; then
-  echo "ERROR: no tb_probe baseline checkpoint to resume from"; exit 1
+RESUME=checkpoints/chess/2026_06_23_warmstart_material/checkpoint_15000.pt
+if [ ! -f "$RESUME" ]; then
+  echo "ERROR: warmstart anchor $RESUME not found"; exit 1
 fi
-echo "Resuming tb_value from baseline: $RESUME"
+echo "Starting tb_value FRESH from the warmstart anchor (same start as tb_probe): $RESUME"
 
 .venv/bin/python -u scripts/_faulthandler_bootstrap.py scripts/train.py \
   --game chess_small \
