@@ -1,5 +1,6 @@
 #!/bin/bash
-# TB-VALUE arm: identical to _launch_tbprobe.sh (400 sims / 512 games / 256 parallel)
+# TB-VALUE arm: 400 sims / 512 games / 512 parallel (all games in one self-play batch;
+# functionally equivalent to 256-parallel for training, just one GPU pass instead of two)
 # but ADDS DTZ value-target relabeling (tb_value_weight=1.0, tb_value_dtz_shape=0.5)
 # on top of the search-side probe. Starts FRESH from the SAME 15k warmstart anchor
 # tb_probe used (NOT a continuation of tb_probe's 61k) — so it's a clean parallel A/B
@@ -39,7 +40,7 @@ echo "Starting tb_value FRESH from the warmstart anchor (same start as tb_probe)
   --resign-holdout-frac 0.20 \
   --num-simulations 400 \
   --num-self-play-games 512 \
-  --num-parallel-games 256 \
+  --num-parallel-games 512 \
   --reanalyze-interval 0 \
   --tb-root-probe \
   --tb-dtz-weight 1.0 \
