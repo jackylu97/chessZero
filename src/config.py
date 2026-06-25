@@ -473,6 +473,13 @@ class MuZeroConfig:
     # torch path. Off by default. chess / GPU-resident self-play only.
     root_terminal_draws: bool = False
     root_terminal_draws_min_repeats: int = 2   # 2 = avoid any repeat; 3 = only block threefold
+    # Root Syzygy tablebase probing: at each self-play ply, classify the root's
+    # legal moves vs tablebases (≤ tb_max_pieces) and overwrite the root children's
+    # value_score toward the DTZ-optimal conversion move (tensor_mcts._select).
+    tb_root_probe: bool = False
+    tb_path: str = "data/syzygy"
+    tb_max_pieces: int = 5
+    tb_dtz_weight: float = 0.05   # 0 = flat win value; >0 ranks winners by DTZ (shortest highest)
     # Auxiliary categorical head predicting the CURRENT side-to-move material
     # margin (pawns) from the LATENT state — incl. after the K dynamics unrolls,
     # so it regularizes the WORLD MODEL to preserve material through latent

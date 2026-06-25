@@ -198,6 +198,17 @@ def main():
     parser.add_argument("--root-terminal-draws-min-repeats", type=int, default=None,
                         help="Override config.root_terminal_draws_min_repeats (2 = avoid any "
                              "repeat; 3 = only block completing a threefold). Preset 2.")
+    parser.add_argument("--tb-root-probe", action="store_true", default=False,
+                        help="Enable root Syzygy tablebase probing: classify the root's legal "
+                             "moves vs tablebases (<= tb-max-pieces) and steer MCTS toward the "
+                             "DTZ-optimal conversion move. chess / GPU-resident self-play only.")
+    parser.add_argument("--tb-path", type=str, default=None,
+                        help="Directory of Syzygy tablebase files (override config.tb_path).")
+    parser.add_argument("--tb-max-pieces", type=int, default=None,
+                        help="Max total pieces to probe (override config.tb_max_pieces, preset 5).")
+    parser.add_argument("--tb-dtz-weight", type=float, default=None,
+                        help="DTZ ranking weight among winning moves (override config.tb_dtz_weight, "
+                             "preset 0.05; 0 = flat win value).")
     parser.add_argument("--resign-enabled", action="store_true", default=False,
                         help="Enable post-hoc consecutive-move resignation: if STM root "
                              "value < --resign-threshold for --resign-consecutive own-moves, "
@@ -372,6 +383,14 @@ def main():
         config.root_terminal_draws = True
     if args.root_terminal_draws_min_repeats is not None:
         config.root_terminal_draws_min_repeats = args.root_terminal_draws_min_repeats
+    if args.tb_root_probe:
+        config.tb_root_probe = True
+    if args.tb_path is not None:
+        config.tb_path = args.tb_path
+    if args.tb_max_pieces is not None:
+        config.tb_max_pieces = args.tb_max_pieces
+    if args.tb_dtz_weight is not None:
+        config.tb_dtz_weight = args.tb_dtz_weight
     if args.resign_enabled:
         config.resign_enabled = True
     if args.resign_threshold is not None:

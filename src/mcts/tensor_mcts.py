@@ -230,6 +230,7 @@ class TensorMCTS:
             and getattr(network, "moves_left_head", None) is not None
         )
         self._use_terminal_draws = bool(getattr(config, "root_terminal_draws", False))
+        self._use_tb_root = bool(getattr(config, "tb_root_probe", False))
         self._ml_threshold = float(getattr(config, "ml_threshold", 0.3))
         self._ml_slope = float(getattr(config, "ml_slope", 0.005))
         self._ml_max_effect = float(getattr(config, "ml_max_effect", 0.1))
@@ -238,13 +239,16 @@ class TensorMCTS:
         self._draw_score = float(getattr(config, "draw_score", 0.0))
         # MLH utility is now implemented in the Triton kernel (parity-tested vs the
         # torch _select path), so it no longer forces a downgrade. root-terminal-draws
-        # has no tensor/Triton implementation yet, so it still does.
-        if self._use_terminal_draws and select_backend == "triton":
+        # and root tablebase probing have no Triton implementation, so they still do.
+        if (self._use_terminal_draws or self._use_tb_root) and select_backend == "triton":
             select_backend = "compile" if self.compile else "eager"
         self.select_backend = select_backend
         # [N, K] bool mask (set per run_batch_gpu): root children whose action
         # completes a repetition, pinned to draw_score in _select. None = off.
         self._root_term_mask = None
+        # [N, K] float (set per run_batch_gpu): root children's tablebase mover-POV
+        # value (NaN = not classified), overwrites value_score in _select. None = off.
+        self._root_tb_value = None
 
         self.action_space_size = int(game.action_space_size)
         sample_k = getattr(config, "sample_k", None)
@@ -498,6 +502,7 @@ class TensorMCTS:
         legal_mask: torch.Tensor,
         add_noise: bool = True,
         forced_draw_mask: torch.Tensor | None = None,
+        root_tb_value: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Sync-free variant of ``run_batch``.
 
@@ -570,6 +575,18 @@ class TensorMCTS:
             )
         else:
             self._root_term_mask = None
+
+        # Map the per-action tablebase value [N, A] onto the root's K children
+        # [N, K] (NaN where unmapped / invalid slot). Consumed in _select to
+        # overwrite the root children's value_score with the TB verdict.
+        if self._use_tb_root and root_tb_value is not None:
+            root_acts = self.child_actions[:, 0, :]                  # [N, K] int32
+            gathered = torch.gather(root_tb_value, 1, root_acts.clamp(min=0).long())
+            self._root_tb_value = torch.where(
+                root_acts != -1, gathered, torch.full_like(gathered, float("nan"))
+            )
+        else:
+            self._root_tb_value = None
 
         for _ in range(num_sims):
             (
@@ -1135,6 +1152,18 @@ class TensorMCTS:
                     torch.full_like(value_score, self._draw_score),
                 )
                 value_score = torch.where(term_here, ds_score, value_score)
+
+            # Root tablebase override: for root children classified by Syzygy,
+            # overwrite value_score with the (normalized) TB mover-POV value —
+            # winning-with-shortest-DTZ moves score highest, win-throwing moves
+            # low. Steers visits toward the conversion move. Root-only (cur == 0),
+            # NaN entries left untouched (net value used).
+            if self._use_tb_root and self._root_tb_value is not None:
+                tb_here = (cur == 0).unsqueeze(1) & ~torch.isnan(self._root_tb_value)  # [N, K]
+                tb_raw = torch.nan_to_num(self._root_tb_value, nan=0.0)
+                tb_norm = (tb_raw - self.mm_min.unsqueeze(1)) / mm_span
+                tb_score = torch.where(has_range, tb_norm, tb_raw)
+                value_score = torch.where(tb_here, tb_score, value_score)
 
             scores = prior_score + value_score
 

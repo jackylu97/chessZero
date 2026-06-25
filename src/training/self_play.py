@@ -550,6 +550,20 @@ def play_games_parallel_gpu_resident(
     use_terminal_draws = bool(getattr(config, "root_terminal_draws", False))
     term_min_repeats = int(getattr(config, "root_terminal_draws_min_repeats", 2))
 
+    # Root Syzygy probing: at each ply, classify the root's legal moves against
+    # tablebases (≤ tb_max_pieces) and overwrite the root children's value_score
+    # in the search toward the DTZ-optimal conversion move. Off by default.
+    use_tb_root = bool(getattr(config, "tb_root_probe", False))
+    tb_prober = None
+    if use_tb_root:
+        from ..games.syzygy_probe import SyzygyRootProber
+        tb_prober = SyzygyRootProber(
+            getattr(config, "tb_path", "data/syzygy"),
+            max_pieces=int(getattr(config, "tb_max_pieces", 5)),
+            dtz_weight=float(getattr(config, "tb_dtz_weight", 0.05)),
+            draw_score=float(getattr(config, "draw_score", 0.0)),
+        )
+
     # Cap loop length so we always have a static upper bound; ChessGame.max_plies
     # does the in-engine termination, alive_mask handles per-game stopping.
     max_plies_cap = int(getattr(config, "max_plies", getattr(ChessGame, "max_plies", 400)))
@@ -633,9 +647,14 @@ def play_games_parallel_gpu_resident(
                 gpu_game.repetition_move_mask(state, legal_mask, min_repeats=term_min_repeats)
                 if use_terminal_draws else None
             )
+            root_tb_value = (
+                tb_prober.root_move_values(state, legal_mask)
+                if tb_prober is not None else None
+            )
             root_data = mcts.run_batch_gpu(
                 stacked_obs, legal_mask, add_noise=True,
                 forced_draw_mask=forced_draw_mask,
+                root_tb_value=root_tb_value,
             )
 
             # 4. Per-game temperature for sampling (AlphaZero schedule).
