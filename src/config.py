@@ -352,6 +352,12 @@ class MuZeroConfig:
     # basin failure observed in runs 0001 / 0002 (post-pool-exhaustion drift).
     # 0.0 = back-compat (no stratification). 0.3-0.5 = chess recommended.
     warmstart_sample_frac: float = 0.0
+    # Anneal the warmstart anchor: warmstart_sample_frac decays linearly to
+    # warmstart_sample_frac_final over [0, warmstart_anneal_frac · training_steps].
+    # anneal_frac = 0 ⇒ constant (back-compat). Fade the off-distribution Stockfish
+    # anchor as self-play accrues its own decisive signal (see get_warmstart_sample_frac).
+    warmstart_sample_frac_final: float = 0.0
+    warmstart_anneal_frac: float = 0.0
 
     # Decisive-game resampling: at every batch, sample floor(batch_size *
     # decisive_sample_frac) games from DECISIVE self-play games (|game_outcome|=1,

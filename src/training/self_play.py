@@ -152,6 +152,27 @@ def get_material_value_weight(training_step: int, config) -> float:
     return w_init + (w_final - w_init) * t
 
 
+def get_warmstart_sample_frac(training_step: int, config) -> float:
+    """Annealed warmstart-anchor sampling fraction for the current step.
+
+    Linearly decays ``warmstart_sample_frac`` → ``warmstart_sample_frac_final``
+    over [0, ``warmstart_anneal_frac`` · training_steps]. With anneal_frac == 0
+    the fraction is constant — back-compat. The Stockfish anchor calibrates the
+    value head early (anti V^π≈draw collapse), but its middlegame distribution
+    diverges from the model's own play and dilutes self-play conversion learning;
+    as self-play accrues its own decisive signal (TB conversions) the anchor's
+    cost outweighs its benefit, so fade it. See decisive_signal_plan_2026_06_23.md.
+    """
+    f_init = float(getattr(config, "warmstart_sample_frac", 0.0))
+    frac = float(getattr(config, "warmstart_anneal_frac", 0.0))
+    if frac <= 0.0 or f_init == 0.0:
+        return f_init
+    f_final = float(getattr(config, "warmstart_sample_frac_final", 0.0))
+    total = max(1, int(getattr(config, "training_steps", 1)))
+    t = min(1.0, max(0.0, training_step / (frac * total)))
+    return f_init + (f_final - f_init) * t
+
+
 def get_material_head_weight(training_step: int, config) -> float:
     """Annealed aux-loss weight for the material-margin head. Shares the
     ``material_value_anneal_frac`` timeline with the value-target blend so the

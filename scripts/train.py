@@ -101,6 +101,12 @@ def main():
                              "for a pure-self-play run with no warmstart anchor "
                              "(also pass --stockfish-injection-games 0 + "
                              "--stockfish-injection-interval 0 to disable injection).")
+    parser.add_argument("--warmstart-sample-frac-final", type=float, default=None,
+                        help="Override config.warmstart_sample_frac_final: the end value "
+                             "the warmstart anchor anneals to (with --warmstart-anneal-frac).")
+    parser.add_argument("--warmstart-anneal-frac", type=float, default=None,
+                        help="Override config.warmstart_anneal_frac: fraction of training over "
+                             "which warmstart_sample_frac decays to its final value. 0 = constant.")
     parser.add_argument("--self-play-warmup-steps", type=int, default=None,
                         help="Override config.self_play_warmup_steps. Two-phase "
                              "(Option A) curriculum: self-play + reanalyze are gated "
@@ -335,6 +341,10 @@ def main():
         config.num_self_play_games = args.num_self_play_games
     if args.warmstart_sample_frac is not None:
         config.warmstart_sample_frac = args.warmstart_sample_frac
+    if args.warmstart_sample_frac_final is not None:
+        config.warmstart_sample_frac_final = args.warmstart_sample_frac_final
+    if args.warmstart_anneal_frac is not None:
+        config.warmstart_anneal_frac = args.warmstart_anneal_frac
     if args.self_play_warmup_steps is not None:
         config.self_play_warmup_steps = args.self_play_warmup_steps
     if args.warmstart_q_ratio is not None:

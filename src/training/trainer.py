@@ -21,7 +21,8 @@ from ..model.muzero_net import MuZeroNetwork
 from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar, inverse_scalar_transform
 from .replay_buffer import ReplayBuffer, _iter_shard_games, _shard_record_count, _sparsify_policy
 from .representation_probe import compute_repr_metrics
-from .self_play import run_self_play, get_material_value_weight, get_material_head_weight
+from .self_play import (run_self_play, get_material_value_weight, get_material_head_weight,
+                        get_warmstart_sample_frac)
 
 
 def _negative_cosine_similarity(p: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -745,7 +746,7 @@ class MuZeroTrainer:
             history_frames=getattr(self.config, "history_frames", 1),
             eval_to_wdl_alpha=getattr(self.config, "eval_to_wdl_alpha", 4.0),
             eval_to_wdl_beta=getattr(self.config, "eval_to_wdl_beta", 2.0),
-            warmstart_sample_frac=getattr(self.config, "warmstart_sample_frac", 0.0),
+            warmstart_sample_frac=get_warmstart_sample_frac(self.global_step, self.config),
             decisive_sample_frac=getattr(self.config, "decisive_sample_frac", 0.0),
             q_ratio=getattr(self.config, "q_ratio", 0.0),
             warmstart_q_ratio=getattr(self.config, "warmstart_q_ratio", None),
@@ -1323,6 +1324,8 @@ class MuZeroTrainer:
         ), step)
         # Annealed material weights (the curriculum schedule) — so the decay is
         # visible alongside loss/material_loss. Only when material is active.
+        self.writer.add_scalar("train/warmstart_sample_frac",
+                               get_warmstart_sample_frac(step, self.config), step)
         if getattr(self.config, "material_value_weight", 0.0) > 0 or getattr(self.config, "use_material_head", False):
             self.writer.add_scalar("material/value_blend_weight",
                                    get_material_value_weight(step, self.config), step)
