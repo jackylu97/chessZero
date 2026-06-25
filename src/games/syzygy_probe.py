@@ -75,6 +75,7 @@ class SyzygyRootProber:
         self.draw_score = float(draw_score)
         self._cache: dict[str, dict[int, float]] = {}
         self.last_in_tb = None   # [N] bool — games in TB range on the most recent call
+        self.last_best_action = None  # [N] long — DTZ-optimal winning action, -1 if none
         self.n_probed = 0        # cumulative count of root positions probed
 
     def close(self):
@@ -106,6 +107,7 @@ class SyzygyRootProber:
         if not idxs:
             return out.to(dev)
 
+        best = torch.full((N,), -1, dtype=torch.long)
         legal_cpu = legal_mask.cpu()
         for i in idxs:
             board = state_to_board(state, i)
@@ -118,6 +120,13 @@ class SyzygyRootProber:
                 self._cache[key] = cached
             for action, val in cached.items():
                 out[i, action] = val
+            # DTZ-optimal winning move (highest value) for hard-selection, if the
+            # position is actually won (a move with value > 0 exists).
+            if cached:
+                ba, bv = max(cached.items(), key=lambda kv: kv[1])
+                if bv > 0.0:
+                    best[i] = int(ba)
+        self.last_best_action = best.to(dev)
         return out.to(dev)
 
     def _classify(self, board: chess.Board, legal_row: torch.Tensor) -> dict[int, float]:

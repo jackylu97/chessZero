@@ -673,6 +673,21 @@ def play_games_parallel_gpu_resident(
             )
             value = root_data["root_value"]
 
+            # Tablebase hard-selection: at ≤tb_max_pieces WON positions, override the
+            # sampled move with the DTZ-optimal winning move and make the policy
+            # target a one-hot on it. Guarantees the conversion is played out (the
+            # soft value-bias alone only avoids losing the win — it shuffles), and
+            # records the technique as a clean policy target. Only fires where a
+            # winning TB move exists (best_action >= 0).
+            if tb_prober is not None and tb_prober.last_best_action is not None:
+                ba = tb_prober.last_best_action  # [N] long, -1 where N/A
+                has_tb = ba >= 0
+                if bool(has_tb.any()):
+                    ba_c = ba.clamp(min=0)
+                    action = torch.where(has_tb, ba_c, action)
+                    policy[has_tb] = 0.0
+                    policy[has_tb, ba_c[has_tb]] = 1.0
+
         # 6. Step env. ``step_batch_with_legal`` returns the new state's
         #    legal_mask alongside (already computed inside for terminal
         #    detection); reuse on next ply rather than recomputing.
