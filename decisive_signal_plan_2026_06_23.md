@@ -267,3 +267,119 @@ random** — because it has unlearned blundering without learning converting.
   holdout): <https://en.wikipedia.org/wiki/AlphaZero>
 - Random chess outcome statistics (29.28B games), Labelle:
   <https://wismuth.com/chess/random-games.html>
+
+---
+
+## Next run (queued 2026-06-24) — A/B for the repetition-draw penalty
+
+**MUST include `--resign-enabled`** (user directive 2026-06-24): the warmstart
+value head is calibrated (root↔SF corr +0.93), so resignation now actually fires
+and attacks the won-but-shuffled threefolds from the losing side (loser resigns
+before the winner can shuffle the won position to a draw + locks the decisive
+label). It was wrongly left OFF in `2026_06_23_warmstart_material`.
+
+Arm = warmstart (as before) + the new terminal-aware search + resignation:
+```bash
+scripts/supervise_train.sh --game chess_small --ckpt-game chess \
+  --run-id 2026_06_24_warmstart_repdraw \
+  --train-log logs/2026_06_24_warmstart_repdraw.log \
+  --device cuda --steps 150000 --eval-interval 2000 --mask-illegal-policy \
+  --stockfish-injection-path data/stockfish_injection \
+  --stockfish-injection-games 300 --stockfish-injection-interval 256 \
+  --self-play-warmup-steps 15000 --warmstart-buffer-size 300 \
+  --warmstart-sample-frac 0.4 \
+  --material-value-weight 0.5 --material-value-anneal-frac 0.6 \
+  --use-material-head --material-head-loss-weight 0.25 \
+  --root-terminal-draws \
+  --resign-enabled
+```
+Baseline for the A/B = the current `2026_06_23_warmstart_material` (penalty +
+resignation OFF). Watch `self_play/draw_threefold_rate` (penalty should lower the
+*played* rate) and `self_play/resignation_rate` (should now be > 0).
+
+---
+
+## IMPLEMENTED 2026-06-25 — Root Syzygy tablebase probing (Tier 1 #4, search-time variant)
+
+Commit `41b6fa8`. This is the search-time form of #4 (tablebase rescoring), chosen
+over both the offline endgame seed (compute-heavy) and pure value-only WDL rescoring.
+The decisive distinction (from the analysis that motivated it):
+
+- **Value-only rescoring fixes the value target but NOT the policy.** Relabel a won
+  KQ-K as +1 and, with a *flat* won value, MCTS still has no gradient within the won
+  region → it shuffles, now "confidently winning." The model never learns the moves,
+  so it can't convert against a human.
+- **Root probing fixes the policy.** The TB verdict steers the *search*; the corrected
+  visit distribution becomes the *policy target*, so the policy head learns the
+  conversion technique. Once the policy can convert, self-play games reach real mates →
+  decisive outcomes enter the buffer → the value learns won≠draw for free → the
+  co-evolution loop finally ignites. This is the ignition the warmstart dead zone killed.
+
+### Why root-only (MuZero constraint)
+Leela probes WDL at internal search nodes because it searches the **true** tree.
+MuZero searches in **latent space** — internal nodes are hidden states with no board,
+so they can't be probed. But the root always has a real board, and **self-play visits
+every position as a root**, so root-only probing covers a full conversion (each ply of
+a KQ-K mate is its own root). Root-only is the only kind we *can* do, and it's enough.
+
+### What is overwritten during MCTS
+At each ply, classify the root's legal moves against Syzygy and overwrite the **root
+children's `value_score`** (the Q term of PUCT, `scores = prior_score + value_score`)
+in `tensor_mcts._select` — the exact slot the repetition penalty (`root_terminal_draws`)
+already uses. Per-move TB value (mover POV): winning → ≈+1 minus a small DTZ penalty so
+the **shortest-DTZ (progress) move scores highest**; win-throwing → draw_score/−1; NaN
+(not in TB / not classifiable) → left untouched (net value used). PUCT then piles visits
+on the conversion move → it's both played (argmax visits) and the policy target.
+
+**DTZ, not flat WDL:** flat WDL ties all winning moves → still shuffles. DTZ breaks the
+tie with the within-won-region progress gradient — structurally the same as the existing
+moves-left (MLH) utility, but a ground-truth version injected at the root.
+
+**Soft bias, not a policy boost:** we edit `value_score` (Q), not the prior, and keep
+the override bounded — Lc0 disabled a *direct DTZ policy boost* over KLD-divergence
+issues, so we steer via value and let the visit distribution stay smooth.
+
+### Components (all gated off by default → existing runs byte-identical when off)
+- `src/games/syzygy_probe.py` — `state_to_board(state, i)` (decode GPU batched state →
+  python-chess) + `SyzygyRootProber.root_move_values(state, legal_mask) -> [N, A]`
+  (per-move WDL/DTZ classification; GPU piece-count gate so only ≤`tb_max_pieces` games
+  hit the CPU probe; FEN cache; 50-move rule → cursed/blessed = draw).
+- `src/mcts/tensor_mcts.py` — `run_batch_gpu(root_tb_value=…)` gathers `[N,A]→[N,K]`
+  (same as `forced_draw_mask`); `_select` override; forces non-triton backend when on.
+- `src/training/self_play.py` — builds `root_tb_value` each ply in the GPU-resident loop.
+- config + CLI: `tb_root_probe` / `tb_path` / `tb_max_pieces` / `tb_dtz_weight`.
+
+### GPU-resident property preserved
+The 800-sim simulation loop stays 100% on GPU. Per ply, ONE selective CPU excursion:
+GPU popcount → for ≤N-piece games only, copy boards to CPU, probe, copy an `[N,A]` value
+tensor back. Middlegame plies have zero in-TB games → zero overhead.
+
+### Usage
+Tablebases live in `data/syzygy` (gitignored). python-chess ships a usable small set
+covering the basin endgames (KQvK/KRvK/KPvK/KBNvK + 4-5-man); copy it there, or download
+the full 3-4-5-man (~1 GB). Add to any run:
+```bash
+... scripts/train.py --game chess_small --run-id 2026_06_25_tb_probe \
+  --resume checkpoints/chess/<run>/checkpoint_<step>.pt \
+  --tb-root-probe [--tb-path data/syzygy] [--tb-max-pieces 5] [--tb-dtz-weight 0.05] \
+  [usual flags]
+```
+Resume from a checkpoint that already reaches endgames (the probe only fires at ≤N
+pieces). **Watch:** conversion of reached ≤N-piece endings (`win_natural_rate` ↑,
+`draw_threefold_rate` ↓) and `self_play/games_per_sec` (the per-ply CPU probe is the
+throughput risk; FEN cache mitigates).
+
+### Verified
+Board round-trip; KQvK gives 24 winning moves with the DTZ gradient (1.00→0.95) and
+king-blunders ≤0; end-to-end through the real MCTS the override puts >80% of an untrained
+net's visits on a winning move; self-play wiring runs; terminal-draws + 7 MCTS
+integration/equivalence tests still pass. Tests in `tests/test_tb_root_probe.py`.
+
+### Open / caveats
+- **Generalization** is the real unknown: teaches ≤N-piece conversions; whether the
+  policy generalizes to "+3 in a middlegame" (>N pieces, no TB) is untested. If it
+  doesn't, escalate to broader TB (6-man) or the seed/value-rescoring as a complement.
+- **Throughput** in deep-endgame batches (many simultaneous in-TB games) — monitor; can
+  narrow to winners-only DTZ or a smaller `tb_max_pieces`.
+- Shares the GPU with the live run — a real TB arm wants `qboot_s800` stopped or run
+  alongside; on the A100, copy `data/syzygy` over first.
