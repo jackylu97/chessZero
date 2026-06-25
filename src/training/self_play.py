@@ -583,6 +583,7 @@ def play_games_parallel_gpu_resident(
             max_pieces=int(getattr(config, "tb_max_pieces", 5)),
             dtz_weight=float(getattr(config, "tb_dtz_weight", 0.05)),
             draw_score=float(getattr(config, "draw_score", 0.0)),
+            value_dtz_shape=float(getattr(config, "tb_value_dtz_shape", 0.5)),
         )
 
     # Cap loop length so we always have a static upper bound; ChessGame.max_plies
@@ -614,6 +615,7 @@ def play_games_parallel_gpu_resident(
     values_per_ply: list[torch.Tensor] = []        # [T] of [N] float32
     rewards_per_ply: list[torch.Tensor] = []       # [T] of [N] float32
     legal_masks_per_ply: list[torch.Tensor] = []   # [T] of [N, A] bool
+    tb_values_per_ply: list[torch.Tensor] = []     # [T] of [N] float32 (NaN if not in TB)
 
     alive_mask = torch.ones(num_games, dtype=torch.bool, device=device)
     game_outcome = torch.zeros(num_games, dtype=torch.int32, device=device)
@@ -712,6 +714,14 @@ def play_games_parallel_gpu_resident(
         values_per_ply.append(value)
         rewards_per_ply.append(rewards.to(torch.float32))
         legal_masks_per_ply.append(legal_mask)
+        # Per-position TB value target (DTZ-shaped, STM POV; NaN outside TB / during
+        # random opening). Fresh from this ply's root_move_values call (else branch).
+        if (tb_prober is not None and ply >= n_random
+                and tb_prober.last_position_value is not None):
+            tb_values_per_ply.append(tb_prober.last_position_value.to(torch.float32))
+        else:
+            tb_values_per_ply.append(
+                torch.full((num_games,), float("nan"), device=device, dtype=torch.float32))
 
         # 8. Subtree reuse: advance the MCTS root to the chosen action's
         # subtree, in preparation for the next ply. Only when the prior
@@ -759,6 +769,7 @@ def play_games_parallel_gpu_resident(
     values_stack = torch.stack(values_per_ply, dim=1)                 # [N, T]
     rewards_stack = torch.stack(rewards_per_ply, dim=1)               # [N, T]
     legal_masks_stack = torch.stack(legal_masks_per_ply, dim=1)       # [N, T, A]
+    tb_values_stack = torch.stack(tb_values_per_ply, dim=1)           # [N, T]
 
     obs_cpu = obs_stack.cpu().numpy()
     actions_cpu = actions_stack.cpu().numpy()
@@ -766,6 +777,7 @@ def play_games_parallel_gpu_resident(
     values_cpu = values_stack.cpu().numpy()
     rewards_cpu = rewards_stack.cpu().numpy()
     legal_masks_cpu = legal_masks_stack.cpu().numpy()
+    tb_values_cpu = tb_values_stack.cpu().numpy()
     final_obs_cpu = final_obs.cpu().numpy()
     game_length_cpu = game_length.cpu().numpy()
     game_outcome_cpu = game_outcome.cpu().numpy()
@@ -802,6 +814,12 @@ def play_games_parallel_gpu_resident(
         h_g.game_outcome = int(game_outcome_cpu[g])
         h_g.draw_by_repetition = bool(terminal_threefold_cpu[g])
         h_g.draw_by_no_progress = bool(terminal_no_progress_cpu[g])
+        # Per-ply DTZ-shaped TB value targets (NaN where the ply wasn't in TB).
+        # Only attach when the game actually reached the tablebase (saves memory
+        # + serialization for the majority that never simplify that far).
+        tb_row = tb_values_cpu[g, :L]
+        if np.isfinite(tb_row).any():
+            h_g.tablebase_values = [float(v) for v in tb_row]
         h_g.observations.append(torch.from_numpy(final_obs_cpu[g]).clone())
         histories.append(h_g)
 

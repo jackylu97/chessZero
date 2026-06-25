@@ -486,6 +486,18 @@ class MuZeroConfig:
     tb_path: str = "data/syzygy"
     tb_max_pieces: int = 5
     tb_dtz_weight: float = 0.05   # 0 = flat win value; >0 ranks winners by DTZ (shortest highest)
+    # Tablebase VALUE relabeling (Lc0 rescorer analogue) — distinct from the
+    # search-side bias above. When > 0, make_target blends the DTZ-shaped Syzygy
+    # POSITION value (recorded per-ply during self-play in GameHistory.
+    # tablebase_values) into the VALUE target at TB plies. Fixes the flat/inverted
+    # value head that can't rank winning positions by distance-to-mate. 1.0 = full
+    # Syzygy replacement at TB plies; keep selfplay_q_ratio≈0 so it isn't washed
+    # out by the self-referential root-value blend. WDL value head only.
+    tb_value_weight: float = 0.0
+    # Shaping of the per-position TB value: 0 => flat WDL (win=+1), >0 => winning
+    # positions ranked by their OWN DTZ (closer mate → closer +1, floored at
+    # 1-shape so a win stays clearly above a draw).
+    tb_value_dtz_shape: float = 0.5
     # Auxiliary categorical head predicting the CURRENT side-to-move material
     # margin (pawns) from the LATENT state — incl. after the K dynamics unrolls,
     # so it regularizes the WORLD MODEL to preserve material through latent

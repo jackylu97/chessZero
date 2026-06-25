@@ -97,6 +97,13 @@ class GameHistory:
     # alive. Drives self_play/tb_reach_rate — "how often does the model even reach
     # the stage where root TB probing fires?" Transient, not serialized.
     reached_tb: bool = False
+    # Per-ply STM-relative Syzygy value of the POSITION (DTZ-shaped), in [-1, 1],
+    # NaN where the ply was not in TB range. Empty for games that never reached
+    # the tablebase. When populated, make_target blends it into the VALUE target
+    # at TB plies (tb_value_weight) — Lc0-rescorer-style value relabeling that
+    # gives the value head a distance-to-mate gradient the flat outcome one-hot
+    # lacks. Serialized (NaN survives float32 round-trip).
+    tablebase_values: list[float] = field(default_factory=list)
     # Optional starting position (FEN) for games that do NOT begin from the
     # standard initial position — e.g. endgame-seed curriculum games. When set,
     # from_compact_dict replays actions from this FEN instead of game.reset().
@@ -177,6 +184,8 @@ class GameHistory:
         }
         if self.external_values:
             d["external_values"] = np.asarray(self.external_values, dtype=np.float32)
+        if self.tablebase_values:
+            d["tablebase_values"] = np.asarray(self.tablebase_values, dtype=np.float32)
         if self.start_fen:
             d["start_fen"] = self.start_fen
         if self.reanalyze_count:
@@ -204,6 +213,9 @@ class GameHistory:
         ev = d.get("external_values")
         if ev is not None and len(ev) > 0:
             gh.external_values = [float(v) for v in ev]
+        tbv = d.get("tablebase_values")
+        if tbv is not None and len(tbv) > 0:
+            gh.tablebase_values = [float(v) for v in tbv]
         gh.draw_by_repetition = bool(d.get("draw_by_repetition", False))
         gh.draw_by_no_progress = bool(d.get("draw_by_no_progress", False))
 
@@ -280,7 +292,8 @@ class GameHistory:
                     repetition_penalty_window: int = 0,
                     repetition_penalty_decay: float = 0.0,
                     material_value_weight: float = 0.0,
-                    material_value_scale: float = 5.0):
+                    material_value_scale: float = 5.0,
+                    tb_value_weight: float = 0.0):
         """Create training target for a given position.
 
         Args:
@@ -348,6 +361,10 @@ class GameHistory:
         mat_w = (float(min(max(material_value_weight, 0.0), 1.0))
                  if self.game_name == "chess" else 0.0)
         mat_scale = float(material_value_scale) if material_value_scale > 0.0 else 5.0
+        # Tablebase value-relabel weight (gated purely on tablebase_values being
+        # populated — only chess self-play games carry it). 1.0 = full Syzygy
+        # replacement at TB plies; only applies on the WDL self-play path below.
+        tb_w = float(min(max(tb_value_weight, 0.0), 1.0)) if self.tablebase_values else 0.0
 
         def _wdl_target_at(ply_idx: int) -> np.ndarray:
             """WDL target at ply_idx from side-to-move's POV, with q_ratio blend.
@@ -429,6 +446,22 @@ class GameHistory:
                     m_eval, alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta)
                 material_wdl = np.array([p_w, p_d, p_l], dtype=np.float32)
                 legacy = (1.0 - mat_w) * legacy + mat_w * material_wdl
+            # Tablebase value relabeling (Lc0-rescorer analogue). At plies inside
+            # the Syzygy tablebase, blend the DTZ-shaped position value (an
+            # external oracle → feedback-safe, like the warmstart Stockfish
+            # teacher) into the value target. Gives the value head the distance-
+            # to-mate gradient the flat outcome one-hot lacks; for won-but-shuffled
+            # draws it correctly relabels the draw target toward a win. Already
+            # STM-relative → no parity flip. Applied AFTER the material blend and
+            # BEFORE the q_self blend so a self-referential root-value blend can't
+            # override the oracle (keep selfplay_q_ratio≈0 for TB dominance).
+            if (tb_w > 0.0 and ply_idx < len(self.tablebase_values)):
+                tv = self.tablebase_values[ply_idx]
+                if tv == tv:  # not NaN
+                    p_w, p_d, p_l = _eval_to_wdl(
+                        float(tv), alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta)
+                    tb_wdl = np.array([p_w, p_d, p_l], dtype=np.float32)
+                    legacy = (1.0 - tb_w) * legacy + tb_w * tb_wdl
             if q == 0.0:
                 return legacy.astype(np.float32)
             # Blend in the MCTS root value (STM POV scalar) mapped to WDL.
@@ -761,6 +794,7 @@ class ReplayBuffer:
         repetition_penalty_decay: float = 0.0,
         material_value_weight: float = 0.0,
         material_value_scale: float = 5.0,
+        tb_value_weight: float = 0.0,
         build_legal_masks: bool = False,
         build_material_target: bool = False,
     ) -> tuple[dict, np.ndarray, np.ndarray]:

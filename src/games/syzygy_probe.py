@@ -67,15 +67,28 @@ class SyzygyRootProber:
     """Probe the root board's legal moves against Syzygy; return an [N, A]
     mover-POV value tensor (NaN where not in TB range / not classifiable)."""
 
+    # DTZ horizon (plies) for shaping the per-POSITION value target. ~the
+    # 50-move window; positions deeper than this in the conversion get the floor.
+    DZ_CAP = 100.0
+
     def __init__(self, path: str, max_pieces: int = 5, dtz_weight: float = 0.05,
-                 draw_score: float = 0.0):
+                 draw_score: float = 0.0, value_dtz_shape: float = 0.5):
         self.tb = chess.syzygy.open_tablebase(path)
         self.max_pieces = int(max_pieces)
         self.dtz_weight = float(dtz_weight)
         self.draw_score = float(draw_score)
+        # Per-POSITION value-target shaping (NOT the per-move search bias):
+        # 0 => flat WDL (win=+1/draw=0/loss=-1, Lc0-rescorer-faithful); >0 =>
+        # winning positions ranked by their OWN distance-to-mate (closer mate =>
+        # closer +1, magnitude floored at 1-value_dtz_shape so a win stays clearly
+        # above a draw). This is what gives the VALUE head the progress gradient it
+        # lacks (measured corr(value,-DTZ)=-0.34 without it).
+        self.value_dtz_shape = float(value_dtz_shape)
         self._cache: dict[str, dict[int, float]] = {}
+        self._posval_cache: dict[str, float] = {}
         self.last_in_tb = None   # [N] bool — games in TB range on the most recent call
         self.last_best_action = None  # [N] long — DTZ-optimal winning action, -1 if none
+        self.last_position_value = None  # [N] float — STM-POV DTZ-shaped position value, NaN if not in TB
         self.n_probed = 0        # cumulative count of root positions probed
 
     def close(self):
@@ -91,6 +104,7 @@ class SyzygyRootProber:
         N = state.n
         dev = state.device
         out = torch.full((N, ACTION_SPACE), float("nan"), dtype=torch.float32)
+        posval = torch.full((N,), float("nan"), dtype=torch.float32)
 
         # GPU piece-count gate (cheap): popcount of the union of all piece
         # bitboards = number of occupied squares = piece count.
@@ -105,6 +119,7 @@ class SyzygyRootProber:
         idxs = torch.nonzero(in_tb, as_tuple=False).flatten().tolist()
         self.n_probed += len(idxs)
         if not idxs:
+            self.last_position_value = posval.to(dev)
             return out.to(dev)
 
         best = torch.full((N,), -1, dtype=torch.long)
@@ -120,6 +135,14 @@ class SyzygyRootProber:
                 self._cache[key] = cached
             for action, val in cached.items():
                 out[i, action] = val
+            # Per-position value target (DTZ-shaped, STM POV) — distinct from the
+            # per-move search bias above. board is unmutated here (_classify
+            # restores it via pop), so probing it is safe.
+            pv = self._posval_cache.get(key)
+            if pv is None:
+                pv = self._position_value(board)
+                self._posval_cache[key] = pv
+            posval[i] = pv
             # DTZ-optimal winning move (highest value) for hard-selection, if the
             # position is actually won (a move with value > 0 exists).
             if cached:
@@ -127,7 +150,29 @@ class SyzygyRootProber:
                 if bv > 0.0:
                     best[i] = int(ba)
         self.last_best_action = best.to(dev)
+        self.last_position_value = posval.to(dev)
         return out.to(dev)
+
+    def _position_value(self, board: chess.Board) -> float:
+        """STM-relative tablebase value of the POSITION itself, in [-1, 1], for
+        use as a VALUE TARGET (not per-move). Hard win/loss are shaped by the
+        position's own DTZ so closer-to-mate ranks higher; draws and 50-move
+        cursed/blessed wins map to 0.0 (respecting the 50-move rule, like
+        _wdl_to_mover_value). Returns NaN when the position isn't in the tables."""
+        try:
+            wdl = self.tb.probe_wdl(board)   # STM POV: +2 win .. -2 loss
+        except (KeyError, ValueError, chess.syzygy.MissingTableError):
+            return float("nan")
+        if wdl == 2 or wdl == -2:            # hard win / hard loss
+            mag = 1.0
+            if self.value_dtz_shape > 0.0:
+                try:
+                    dtz = abs(int(self.tb.probe_dtz(board)))
+                    mag = 1.0 - self.value_dtz_shape * min(dtz, self.DZ_CAP) / self.DZ_CAP
+                except (KeyError, ValueError, chess.syzygy.MissingTableError):
+                    mag = 1.0             # WDL known but DTZ table missing → flat win
+            return mag if wdl == 2 else -mag
+        return 0.0  # draw / cursed-win / blessed-loss → draw under the 50-move rule
 
     def _classify(self, board: chess.Board, legal_row: torch.Tensor) -> dict[int, float]:
         """{action_index: mover_value} for the legal moves at ``board``,

@@ -215,6 +215,15 @@ def main():
     parser.add_argument("--tb-dtz-weight", type=float, default=None,
                         help="DTZ ranking weight among winning moves (override config.tb_dtz_weight, "
                              "preset 0.05; 0 = flat win value).")
+    parser.add_argument("--tb-value-weight", type=float, default=None,
+                        help="Tablebase VALUE relabeling weight (Lc0 rescorer analogue): blend the "
+                             "DTZ-shaped Syzygy position value into the VALUE target at TB plies "
+                             "(override config.tb_value_weight, preset 0.0=off; 1.0=full replace). "
+                             "Keep selfplay-q-ratio≈0. WDL value head only.")
+    parser.add_argument("--tb-value-dtz-shape", type=float, default=None,
+                        help="Shaping of the per-position TB value (override config.tb_value_dtz_shape, "
+                             "preset 0.5): 0=flat WDL win=+1; >0 ranks wins by own DTZ "
+                             "(closer mate→closer +1, floored at 1-shape).")
     parser.add_argument("--resign-enabled", action="store_true", default=False,
                         help="Enable post-hoc consecutive-move resignation: if STM root "
                              "value < --resign-threshold for --resign-consecutive own-moves, "
@@ -401,6 +410,10 @@ def main():
         config.tb_max_pieces = args.tb_max_pieces
     if args.tb_dtz_weight is not None:
         config.tb_dtz_weight = args.tb_dtz_weight
+    if args.tb_value_weight is not None:
+        config.tb_value_weight = args.tb_value_weight
+    if args.tb_value_dtz_shape is not None:
+        config.tb_value_dtz_shape = args.tb_value_dtz_shape
     if args.resign_enabled:
         config.resign_enabled = True
     if args.resign_threshold is not None:
