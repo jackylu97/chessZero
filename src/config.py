@@ -517,6 +517,10 @@ class MuZeroConfig:
     # 0 = off. Cures covariate shift (the model trains on its OWN endgame states).
     endgame_seed_frac: float = 0.0
     endgame_seed_archive: str | None = None   # path to the seed FEN list (generate_endgame_seeds.py)
+    # Overlap the ~141ms single-threaded sample_batch with the GPU train step via
+    # a background prefetch thread (double-buffered, lock-guarded against buffer
+    # writes). ~halves per-step time during the training phase. Off by default.
+    prefetch_batches: bool = False
     # Auxiliary categorical head predicting the CURRENT side-to-move material
     # margin (pawns) from the LATENT state — incl. after the K dynamics unrolls,
     # so it regularizes the WORLD MODEL to preserve material through latent

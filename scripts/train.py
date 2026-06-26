@@ -239,6 +239,9 @@ def main():
                              "(on-policy curriculum; override config.endgame_seed_frac, preset 0=off).")
     parser.add_argument("--endgame-seed-archive", type=str, default=None,
                         help="Path to the endgame-seed FEN list (scripts/generate_endgame_seeds.py output .txt).")
+    parser.add_argument("--prefetch-batches", action="store_true", default=False,
+                        help="Overlap sample_batch (CPU) with the GPU train step via a background "
+                             "prefetch thread (~halves training-phase step time). Off by default.")
     parser.add_argument("--resign-enabled", action="store_true", default=False,
                         help="Enable post-hoc consecutive-move resignation: if STM root "
                              "value < --resign-threshold for --resign-consecutive own-moves, "
@@ -439,6 +442,8 @@ def main():
         config.endgame_seed_frac = args.endgame_seed_frac
     if args.endgame_seed_archive is not None:
         config.endgame_seed_archive = args.endgame_seed_archive
+    if args.prefetch_batches:
+        config.prefetch_batches = True
     if args.resign_enabled:
         config.resign_enabled = True
     if args.resign_threshold is not None:

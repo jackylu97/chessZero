@@ -3,7 +3,10 @@
 import ctypes
 import os
 import pickle
+import queue
+import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -160,6 +163,22 @@ class MuZeroTrainer:
         # informativeness metric (repr/* scalars). See representation_probe.py.
         self._repr_probe_set = None
 
+        # --- Batch prefetch (overlap the ~141ms CPU sample_batch with the GPU
+        # step) ---------------------------------------------------------------
+        # sample_batch is single-threaded CPU work that idles the GPU each step.
+        # A background thread samples batch N+1 while the main thread runs the
+        # GPU forward/backward for N; the queue's maxsize provides backpressure
+        # so the prefetcher paces itself to consumption. The lock serializes
+        # buffer reads (sample_batch) against buffer writes (save_game,
+        # update_priorities) — the GPU step holds no lock, so it overlaps fully.
+        # Disabled by default; enable via config.prefetch_batches.
+        self.prefetch_enabled = bool(getattr(config, "prefetch_batches", False))
+        self._buffer_lock = threading.Lock()
+        self._prefetch_queue: queue.Queue | None = None
+        self._prefetch_thread: threading.Thread | None = None
+        self._prefetch_stop = threading.Event()
+        self._prefetch_error: BaseException | None = None
+
     def train(self):
         """Run the full training loop."""
         print(f"Starting MuZero training for {self.config.game}")
@@ -187,6 +206,11 @@ class MuZeroTrainer:
                 self._run_self_play()
 
         start_step = self.global_step
+        # Buffer is guaranteed non-empty here (bootstrap above), so the prefetch
+        # producer can sample immediately. No-op when prefetch is disabled. The
+        # thread is a daemon, so an abnormal exit (crash / KeyboardInterrupt) can't
+        # wedge process shutdown; _stop_prefetch() below handles normal completion.
+        self._start_prefetch()
         pbar = tqdm(range(start_step, self.config.training_steps), desc="Training",
                     initial=start_step, total=self.config.training_steps)
         for step in pbar:
@@ -266,6 +290,7 @@ class MuZeroTrainer:
                     and step % self.config.repr_probe_interval == 0):
                 self._log_representation_probe(step)
 
+        self._stop_prefetch()
         self._save_checkpoint(self.config.training_steps)
         self.writer.close()
         print("Training complete!")
@@ -358,8 +383,9 @@ class MuZeroTrainer:
             training_step=self.global_step,
         )
         sp_secs = time.monotonic() - sp_t0
-        for g in games:
-            self.replay_buffer.save_game(g)
+        with self._buffer_lock:
+            for g in games:
+                self.replay_buffer.save_game(g)
 
         rss_after = proc.memory_info().rss / 1e9
         rss_delta = rss_after - rss_before
@@ -655,7 +681,8 @@ class MuZeroTrainer:
                     self._injection_shards = []
                     break
             g = self._injection_shard_games.pop(0)
-            self.replay_buffer.save_game(g)
+            with self._buffer_lock:
+                self.replay_buffer.save_game(g)
             inserted += 1
             self._injection_loaded += 1
 
@@ -725,42 +752,118 @@ class MuZeroTrainer:
         off = sim[~torch.eye(n, dtype=torch.bool, device=sim.device)]
         return off.mean().item()
 
-    def _train_step(self) -> dict:
-        """Single training step on a batch from the replay buffer."""
-        self.network.train()
-
+    def _sample_batch_now(self):
+        """Sample one training batch (CPU). Holds ``_buffer_lock`` so the read is
+        consistent against concurrent ``save_game`` / ``update_priorities``.
+        Called inline (prefetch off) or from the prefetch thread. Reads
+        ``self.global_step`` for the step-dependent anneals (beta, warmstart/
+        material schedules); when prefetched a step or two ahead that staleness is
+        harmless. Returns ``(batch, game_indices, is_weights)``."""
         # Beta anneals from per_beta_init → 1.0 over training
         beta = self.config.per_beta_init + (1.0 - self.config.per_beta_init) * (
             self.global_step / max(1, self.config.training_steps)
         )
+        with self._buffer_lock:
+            return self.replay_buffer.sample_batch(
+                self.config.batch_size,
+                self.config.num_unroll_steps,
+                self.config.td_steps,
+                self.config.discount,
+                self.game.action_space_size,
+                alpha=self.config.per_alpha,
+                beta=beta,
+                value_head_type=getattr(self.config, "value_head_type", "support"),
+                history_frames=getattr(self.config, "history_frames", 1),
+                eval_to_wdl_alpha=getattr(self.config, "eval_to_wdl_alpha", 4.0),
+                eval_to_wdl_beta=getattr(self.config, "eval_to_wdl_beta", 2.0),
+                warmstart_sample_frac=get_warmstart_sample_frac(self.global_step, self.config),
+                decisive_sample_frac=getattr(self.config, "decisive_sample_frac", 0.0),
+                q_ratio=getattr(self.config, "q_ratio", 0.0),
+                warmstart_q_ratio=getattr(self.config, "warmstart_q_ratio", None),
+                selfplay_q_ratio=getattr(self.config, "selfplay_q_ratio", None),
+                repetition_penalty=getattr(self.config, "repetition_penalty", 0.0),
+                repetition_penalty_window=int(getattr(self.config, "repetition_penalty_window", 0)),
+                repetition_penalty_decay=float(getattr(self.config, "repetition_penalty_decay", 0.0)),
+                material_value_weight=get_material_value_weight(self.global_step, self.config),
+                material_value_scale=float(getattr(self.config, "material_value_scale", 5.0)),
+                tb_value_weight=float(getattr(self.config, "tb_value_weight", 0.0)),
+                tb_moves_left_weight=float(getattr(self.config, "tb_moves_left_weight", 0.0)),
+                build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
+                build_material_target=bool(getattr(self.config, "use_material_head", False)),
+            )
 
-        batch, game_indices, is_weights = self.replay_buffer.sample_batch(
-            self.config.batch_size,
-            self.config.num_unroll_steps,
-            self.config.td_steps,
-            self.config.discount,
-            self.game.action_space_size,
-            alpha=self.config.per_alpha,
-            beta=beta,
-            value_head_type=getattr(self.config, "value_head_type", "support"),
-            history_frames=getattr(self.config, "history_frames", 1),
-            eval_to_wdl_alpha=getattr(self.config, "eval_to_wdl_alpha", 4.0),
-            eval_to_wdl_beta=getattr(self.config, "eval_to_wdl_beta", 2.0),
-            warmstart_sample_frac=get_warmstart_sample_frac(self.global_step, self.config),
-            decisive_sample_frac=getattr(self.config, "decisive_sample_frac", 0.0),
-            q_ratio=getattr(self.config, "q_ratio", 0.0),
-            warmstart_q_ratio=getattr(self.config, "warmstart_q_ratio", None),
-            selfplay_q_ratio=getattr(self.config, "selfplay_q_ratio", None),
-            repetition_penalty=getattr(self.config, "repetition_penalty", 0.0),
-            repetition_penalty_window=int(getattr(self.config, "repetition_penalty_window", 0)),
-            repetition_penalty_decay=float(getattr(self.config, "repetition_penalty_decay", 0.0)),
-            material_value_weight=get_material_value_weight(self.global_step, self.config),
-            material_value_scale=float(getattr(self.config, "material_value_scale", 5.0)),
-            tb_value_weight=float(getattr(self.config, "tb_value_weight", 0.0)),
-            tb_moves_left_weight=float(getattr(self.config, "tb_moves_left_weight", 0.0)),
-            build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
-            build_material_target=bool(getattr(self.config, "use_material_head", False)),
-        )
+    def _next_batch(self):
+        """Next ``(batch, game_indices, is_weights)`` — from the prefetch queue
+        when the prefetch thread is running (re-raising any error it hit), else
+        sampled inline. The timeout loop also detects a silently-dead thread."""
+        if self.prefetch_enabled and self._prefetch_thread is not None:
+            while True:
+                try:
+                    item = self._prefetch_queue.get(timeout=1.0)
+                except queue.Empty:
+                    if not self._prefetch_thread.is_alive():
+                        if self._prefetch_error is not None:
+                            raise self._prefetch_error
+                        raise RuntimeError("batch-prefetch thread died")
+                    continue
+                if item is None:  # sentinel: thread hit an error
+                    if self._prefetch_error is not None:
+                        raise self._prefetch_error
+                    raise RuntimeError("batch-prefetch thread stopped unexpectedly")
+                return item
+        return self._sample_batch_now()
+
+    def _prefetch_loop(self):
+        """Background producer: sample batches into the bounded queue until
+        stopped. A full queue blocks the put (backpressure); the timeout lets the
+        stop flag break the block at shutdown. Errors are surfaced to the consumer
+        via a None sentinel + ``_prefetch_error``."""
+        try:
+            while not self._prefetch_stop.is_set():
+                item = self._sample_batch_now()
+                while not self._prefetch_stop.is_set():
+                    try:
+                        self._prefetch_queue.put(item, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as e:  # noqa: BLE001 — surface to the main thread
+            self._prefetch_error = e
+            traceback.print_exc()
+            try:
+                self._prefetch_queue.put_nowait(None)
+            except Exception:
+                pass
+
+    def _start_prefetch(self):
+        if not self.prefetch_enabled or self._prefetch_thread is not None:
+            return
+        self._prefetch_stop.clear()
+        self._prefetch_error = None
+        self._prefetch_queue = queue.Queue(maxsize=2)
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop, name="batch-prefetch", daemon=True)
+        self._prefetch_thread.start()
+
+    def _stop_prefetch(self):
+        if self._prefetch_thread is None:
+            return
+        self._prefetch_stop.set()
+        # Unblock a put() that's waiting on a full queue so it can see the stop.
+        try:
+            while True:
+                self._prefetch_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._prefetch_thread.join(timeout=5.0)
+        self._prefetch_thread = None
+        self._prefetch_queue = None
+
+    def _train_step(self) -> dict:
+        """Single training step on a batch from the replay buffer."""
+        self.network.train()
+
+        batch, game_indices, is_weights = self._next_batch()
 
         obs = batch["observations"].to(self.device)
         actions = batch["actions"].to(self.device)
@@ -1061,7 +1164,8 @@ class MuZeroTrainer:
                                    if n_warm > 0 else float("nan"))
                 value_loss_self = (value_per_sample[~is_warm].mean().item()
                                    if n_sp > 0 else float("nan"))
-        self.replay_buffer.update_priorities(game_indices, td_errors, self.config.per_epsilon)
+        with self._buffer_lock:
+            self.replay_buffer.update_priorities(game_indices, td_errors, self.config.per_epsilon)
 
         # In-loop action-awareness probe (log steps only): cosine spread of the
         # dynamics output across distinct actions from a fixed root. ~1.0 = the
@@ -1185,26 +1289,30 @@ class MuZeroTrainer:
 
             roots = batched_mcts.run_batch(obs_list, legal_list, add_noise=False)
 
-            for (_, _, game, pos), root in zip(batch, roots):
-                if float(root.child_visits.sum()) > 0:
-                    if use_gumbel:
-                        # Plain Gumbel MuZero: π' = softmax(logits + σ(completedQ)) over legals.
-                        _, action_probs = select_action_gumbel(
-                            root, self.config, action_space_size
-                        )
-                        game.policies[pos] = _sparsify_policy(action_probs)
-                    else:
-                        # temperature=1.0 → raw visit-count normalization. Under
-                        # Sampled MuZero the search prior was renormalized over σ,
-                        # so raw visits already approximate Î_β π (Hubert 2021
-                        # Proposed Modification).
-                        _, action_probs = select_action(root, temperature=1.0)
-                        # Pad to full action space size.
-                        new_policy = np.zeros(action_space_size, dtype=np.float32)
-                        new_policy[: len(action_probs)] = action_probs
-                        game.policies[pos] = _sparsify_policy(new_policy)
-                game.root_values[pos] = root.value
-                positions_updated += 1
+            # Lock the in-place freshening: sample_batch (prefetch thread) reads
+            # these same game.policies/root_values. The GPU run_batch above is
+            # outside the lock; only the cheap write loop holds it.
+            with self._buffer_lock:
+                for (_, _, game, pos), root in zip(batch, roots):
+                    if float(root.child_visits.sum()) > 0:
+                        if use_gumbel:
+                            # Plain Gumbel MuZero: π' = softmax(logits + σ(completedQ)) over legals.
+                            _, action_probs = select_action_gumbel(
+                                root, self.config, action_space_size
+                            )
+                            game.policies[pos] = _sparsify_policy(action_probs)
+                        else:
+                            # temperature=1.0 → raw visit-count normalization. Under
+                            # Sampled MuZero the search prior was renormalized over σ,
+                            # so raw visits already approximate Î_β π (Hubert 2021
+                            # Proposed Modification).
+                            _, action_probs = select_action(root, temperature=1.0)
+                            # Pad to full action space size.
+                            new_policy = np.zeros(action_space_size, dtype=np.float32)
+                            new_policy[: len(action_probs)] = action_probs
+                            game.policies[pos] = _sparsify_policy(new_policy)
+                    game.root_values[pos] = root.value
+                    positions_updated += 1
 
         # Mark each reanalyzed game deterministically (once per pass). Uses the
         # unique games that actually contributed positions to this batch, so a
