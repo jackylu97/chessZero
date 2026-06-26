@@ -498,6 +498,18 @@ class MuZeroConfig:
     # positions ranked by their OWN DTZ (closer mate → closer +1, floored at
     # 1-shape so a win stays clearly above a draw).
     tb_value_dtz_shape: float = 0.5
+    # Moves-left (MovesLeftHead) DTM relabel — Lc0 Gaviota MLH rescoring. When > 0,
+    # the moves-left target at in-TB decisive plies is replaced by |DTM| (Gaviota
+    # plies-to-mate) instead of the policy-rollout plies-to-end (the shuffle length
+    # in unconverted endgames). 1.0 = full replace. Needs tb_gaviota_path + a trained
+    # moves-left head. This is the distance gradient the WDL value head can't supply.
+    tb_moves_left_weight: float = 0.0
+    tb_gaviota_path: str | None = None   # dir of Gaviota .gtb.cp4 DTM tablebases
+    # Search-side policy steering (the old root-probe DTZ value bias in _select).
+    # Default OFF — Lc0 rejected the DTZ policy boost; we keep self-play on-policy
+    # and inject the TB signal only via the value + moves-left relabels. True restores
+    # the soft search bias (needs tb_root_probe to build the prober).
+    tb_steer_policy: bool = False
     # Auxiliary categorical head predicting the CURRENT side-to-move material
     # margin (pawns) from the LATENT state — incl. after the K dynamics unrolls,
     # so it regularizes the WORLD MODEL to preserve material through latent

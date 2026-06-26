@@ -12,6 +12,7 @@ See tb_root_probe_plan_2026_06_25.md.
 import torch
 import chess
 import chess.syzygy
+import chess.gaviota
 
 from src.games.chess import _action_to_move
 from src.games.chess_gpu import CR_WK, CR_WQ, CR_BK, CR_BQ
@@ -72,8 +73,20 @@ class SyzygyRootProber:
     DZ_CAP = 100.0
 
     def __init__(self, path: str, max_pieces: int = 5, dtz_weight: float = 0.05,
-                 draw_score: float = 0.0, value_dtz_shape: float = 0.5):
+                 draw_score: float = 0.0, value_dtz_shape: float = 0.5,
+                 gaviota_path: str | None = None):
         self.tb = chess.syzygy.open_tablebase(path)
+        # Gaviota DTM tablebase (distance-to-MATE) for the moves-left target.
+        # Syzygy gives DTZ (distance-to-zeroing), NOT DTM, so the moves-left head
+        # (plies-to-game-end) must be supervised from Gaviota — exactly Lc0's
+        # Gaviota moves-left rescoring. Optional; None => no DTM (moves-left stays
+        # the policy-rollout plies-to-end).
+        self.gav = None
+        if gaviota_path:
+            try:
+                self.gav = chess.gaviota.open_tablebase(gaviota_path)
+            except Exception:
+                self.gav = None
         self.max_pieces = int(max_pieces)
         self.dtz_weight = float(dtz_weight)
         self.draw_score = float(draw_score)
@@ -86,16 +99,31 @@ class SyzygyRootProber:
         self.value_dtz_shape = float(value_dtz_shape)
         self._cache: dict[str, dict[int, float]] = {}
         self._posval_cache: dict[str, float] = {}
+        self._dtm_cache: dict[str, float] = {}
         self.last_in_tb = None   # [N] bool — games in TB range on the most recent call
         self.last_best_action = None  # [N] long — DTZ-optimal winning action, -1 if none
         self.last_position_value = None  # [N] float — STM-POV DTZ-shaped position value, NaN if not in TB
+        self.last_position_moves_left = None  # [N] float — |DTM| plies-to-mate (Gaviota), NaN if draw/not in TB
         self.n_probed = 0        # cumulative count of root positions probed
 
     def close(self):
+        for t in (self.tb, self.gav):
+            try:
+                t.close()
+            except Exception:
+                pass
+
+    def _position_moves_left(self, board: chess.Board) -> float:
+        """Plies-to-MATE for the moves-left head, from Gaviota DTM. POV-independent
+        (game length is the same for both players) so we return |DTM|. NaN for draws
+        (no mate distance) and when Gaviota is unavailable / position not covered."""
+        if self.gav is None:
+            return float("nan")
         try:
-            self.tb.close()
+            dtm = self.gav.probe_dtm(board)   # +mate-in / -mated-in; 0 = draw
         except Exception:
-            pass
+            return float("nan")
+        return float(abs(int(dtm))) if dtm != 0 else float("nan")
 
     @torch.no_grad()
     def root_move_values(self, state, legal_mask: torch.Tensor) -> torch.Tensor:
@@ -105,6 +133,7 @@ class SyzygyRootProber:
         dev = state.device
         out = torch.full((N, ACTION_SPACE), float("nan"), dtype=torch.float32)
         posval = torch.full((N,), float("nan"), dtype=torch.float32)
+        posml = torch.full((N,), float("nan"), dtype=torch.float32)
 
         # GPU piece-count gate (cheap): popcount of the union of all piece
         # bitboards = number of occupied squares = piece count.
@@ -120,6 +149,7 @@ class SyzygyRootProber:
         self.n_probed += len(idxs)
         if not idxs:
             self.last_position_value = posval.to(dev)
+            self.last_position_moves_left = posml.to(dev)
             return out.to(dev)
 
         best = torch.full((N,), -1, dtype=torch.long)
@@ -143,6 +173,12 @@ class SyzygyRootProber:
                 pv = self._position_value(board)
                 self._posval_cache[key] = pv
             posval[i] = pv
+            # Per-position moves-left target (|DTM| plies-to-mate, Gaviota).
+            ml = self._dtm_cache.get(key)
+            if ml is None:
+                ml = self._position_moves_left(board)
+                self._dtm_cache[key] = ml
+            posml[i] = ml
             # DTZ-optimal winning move (highest value) for hard-selection, if the
             # position is actually won (a move with value > 0 exists).
             if cached:
@@ -151,6 +187,7 @@ class SyzygyRootProber:
                     best[i] = int(ba)
         self.last_best_action = best.to(dev)
         self.last_position_value = posval.to(dev)
+        self.last_position_moves_left = posml.to(dev)
         return out.to(dev)
 
     def _position_value(self, board: chess.Board) -> float:

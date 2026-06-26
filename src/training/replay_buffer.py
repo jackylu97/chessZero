@@ -104,6 +104,12 @@ class GameHistory:
     # gives the value head a distance-to-mate gradient the flat outcome one-hot
     # lacks. Serialized (NaN survives float32 round-trip).
     tablebase_values: list[float] = field(default_factory=list)
+    # Per-ply |DTM| (plies-to-mate, Gaviota), NaN where the ply was not in TB range
+    # or the position is drawn. Empty for games that never reached the tablebase.
+    # When populated, sample_batch substitutes it for the policy-rollout plies-to-end
+    # MOVES-LEFT target at TB plies (tb_moves_left_weight) — Lc0 Gaviota MLH rescoring,
+    # the distance gradient the WDL value head provably can't supply. Serialized.
+    tablebase_moves_left: list[float] = field(default_factory=list)
     # Optional starting position (FEN) for games that do NOT begin from the
     # standard initial position — e.g. endgame-seed curriculum games. When set,
     # from_compact_dict replays actions from this FEN instead of game.reset().
@@ -186,6 +192,8 @@ class GameHistory:
             d["external_values"] = np.asarray(self.external_values, dtype=np.float32)
         if self.tablebase_values:
             d["tablebase_values"] = np.asarray(self.tablebase_values, dtype=np.float32)
+        if self.tablebase_moves_left:
+            d["tablebase_moves_left"] = np.asarray(self.tablebase_moves_left, dtype=np.float32)
         if self.start_fen:
             d["start_fen"] = self.start_fen
         if self.reanalyze_count:
@@ -216,6 +224,9 @@ class GameHistory:
         tbv = d.get("tablebase_values")
         if tbv is not None and len(tbv) > 0:
             gh.tablebase_values = [float(v) for v in tbv]
+        tbm = d.get("tablebase_moves_left")
+        if tbm is not None and len(tbm) > 0:
+            gh.tablebase_moves_left = [float(v) for v in tbm]
         gh.draw_by_repetition = bool(d.get("draw_by_repetition", False))
         gh.draw_by_no_progress = bool(d.get("draw_by_no_progress", False))
 
@@ -795,6 +806,7 @@ class ReplayBuffer:
         material_value_weight: float = 0.0,
         material_value_scale: float = 5.0,
         tb_value_weight: float = 0.0,
+        tb_moves_left_weight: float = 0.0,
         build_legal_masks: bool = False,
         build_material_target: bool = False,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
@@ -911,9 +923,20 @@ class ReplayBuffer:
             # position indices (no make_target ripple); POV-independent; past-end
             # steps clamp to 0 and are zeroed by target_obs_mask in the loss.
             final_idx = len(game) - 1
-            moves_left_batch.append([
-                float(max(0, final_idx - (pos + i))) for i in range(num_unroll_steps + 1)
-            ])
+            tbml = getattr(game, "tablebase_moves_left", None)
+            ml_row = []
+            for i in range(num_unroll_steps + 1):
+                idx = pos + i
+                base = float(max(0, final_idx - idx))
+                # DTM relabel (Lc0 Gaviota MLH rescoring): at in-TB decisive plies,
+                # trust the tablebase plies-to-mate over the policy-rollout plies-to-
+                # end (which is the shuffle length in unconverted endgames). NaN entries
+                # (draws / out of TB) keep the rollout target. weight 1.0 = full replace.
+                if (tb_moves_left_weight > 0.0 and tbml and idx < len(tbml)
+                        and tbml[idx] == tbml[idx]):
+                    base = (1.0 - tb_moves_left_weight) * base + tb_moves_left_weight * float(tbml[idx])
+                ml_row.append(base)
+            moves_left_batch.append(ml_row)
             if build_material_target:
                 # Current STM material margin at each unrolled position (pos+i),
                 # from that position's own observation (already STM-relative).

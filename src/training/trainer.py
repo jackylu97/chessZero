@@ -757,6 +757,7 @@ class MuZeroTrainer:
             material_value_weight=get_material_value_weight(self.global_step, self.config),
             material_value_scale=float(getattr(self.config, "material_value_scale", 5.0)),
             tb_value_weight=float(getattr(self.config, "tb_value_weight", 0.0)),
+            tb_moves_left_weight=float(getattr(self.config, "tb_moves_left_weight", 0.0)),
             build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
             build_material_target=bool(getattr(self.config, "use_material_head", False)),
         )

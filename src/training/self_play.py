@@ -584,6 +584,7 @@ def play_games_parallel_gpu_resident(
             dtz_weight=float(getattr(config, "tb_dtz_weight", 0.05)),
             draw_score=float(getattr(config, "draw_score", 0.0)),
             value_dtz_shape=float(getattr(config, "tb_value_dtz_shape", 0.5)),
+            gaviota_path=getattr(config, "tb_gaviota_path", None),
         )
 
     # Cap loop length so we always have a static upper bound; ChessGame.max_plies
@@ -616,6 +617,7 @@ def play_games_parallel_gpu_resident(
     rewards_per_ply: list[torch.Tensor] = []       # [T] of [N] float32
     legal_masks_per_ply: list[torch.Tensor] = []   # [T] of [N, A] bool
     tb_values_per_ply: list[torch.Tensor] = []     # [T] of [N] float32 (NaN if not in TB)
+    tb_moves_left_per_ply: list[torch.Tensor] = [] # [T] of [N] float32 |DTM| (NaN if draw/not in TB)
 
     alive_mask = torch.ones(num_games, dtype=torch.bool, device=device)
     game_outcome = torch.zeros(num_games, dtype=torch.int32, device=device)
@@ -672,16 +674,22 @@ def play_games_parallel_gpu_resident(
                 gpu_game.repetition_move_mask(state, legal_mask, min_repeats=term_min_repeats)
                 if use_terminal_draws else None
             )
+            # Run the prober to compute per-position RELABEL targets (value + DTM)
+            # and last_in_tb. By default we do NOT feed it into the search: the
+            # Lc0-faithful path removes policy steering (the DTZ policy boost lc0
+            # rejected) and relies on on-policy self-play + value/moves-left relabel.
+            # tb_steer_policy=True restores the old soft search bias.
             root_tb_value = (
                 tb_prober.root_move_values(state, legal_mask)
                 if tb_prober is not None else None
             )
             if tb_prober is not None and tb_prober.last_in_tb is not None:
                 tb_reached |= tb_prober.last_in_tb.to(device) & alive_mask
+            steer = root_tb_value if getattr(config, "tb_steer_policy", False) else None
             root_data = mcts.run_batch_gpu(
                 stacked_obs, legal_mask, add_noise=True,
                 forced_draw_mask=forced_draw_mask,
-                root_tb_value=root_tb_value,
+                root_tb_value=steer,
             )
 
             # 4. Per-game temperature for sampling (AlphaZero schedule).
@@ -695,12 +703,11 @@ def play_games_parallel_gpu_resident(
                 action_space_size,
             )
             value = root_data["root_value"]
-            # NOTE: we deliberately do NOT hard-select the TB move here. The soft
-            # value-bias in tensor_mcts._select shapes the *search*; the policy
-            # target stays the model's own visit distribution, so the model learns
-            # the conversion over training (AlphaZero loop) — KLD-safe. A one-hot
-            # hard-select is Lc0's disabled DTZ-policy-boost. Strength is tuned via
-            # tb_dtz_weight (~1.0 sweet spot; see probe_tb_conversion.py).
+            # Lc0-faithful: no policy steering by default (tb_steer_policy=False).
+            # Self-play is on-policy; the TB signal enters training only via the
+            # value relabel (Syzygy WDL) and the moves-left relabel (Gaviota DTM),
+            # not by biasing search. Mirrors lc0's rescorer (they rejected the
+            # search-side DTZ policy boost). tb_steer_policy=True restores the bias.
 
         # 6. Step env. ``step_batch_with_legal`` returns the new state's
         #    legal_mask alongside (already computed inside for terminal
@@ -719,9 +726,14 @@ def play_games_parallel_gpu_resident(
         if (tb_prober is not None and ply >= n_random
                 and tb_prober.last_position_value is not None):
             tb_values_per_ply.append(tb_prober.last_position_value.to(torch.float32))
+            tb_ml = tb_prober.last_position_moves_left
+            tb_moves_left_per_ply.append(
+                tb_ml.to(torch.float32) if tb_ml is not None
+                else torch.full((num_games,), float("nan"), device=device, dtype=torch.float32))
         else:
-            tb_values_per_ply.append(
-                torch.full((num_games,), float("nan"), device=device, dtype=torch.float32))
+            nanrow = torch.full((num_games,), float("nan"), device=device, dtype=torch.float32)
+            tb_values_per_ply.append(nanrow)
+            tb_moves_left_per_ply.append(nanrow)
 
         # 8. Subtree reuse: advance the MCTS root to the chosen action's
         # subtree, in preparation for the next ply. Only when the prior
@@ -770,6 +782,7 @@ def play_games_parallel_gpu_resident(
     rewards_stack = torch.stack(rewards_per_ply, dim=1)               # [N, T]
     legal_masks_stack = torch.stack(legal_masks_per_ply, dim=1)       # [N, T, A]
     tb_values_stack = torch.stack(tb_values_per_ply, dim=1)           # [N, T]
+    tb_moves_left_stack = torch.stack(tb_moves_left_per_ply, dim=1)   # [N, T]
 
     obs_cpu = obs_stack.cpu().numpy()
     actions_cpu = actions_stack.cpu().numpy()
@@ -778,6 +791,7 @@ def play_games_parallel_gpu_resident(
     rewards_cpu = rewards_stack.cpu().numpy()
     legal_masks_cpu = legal_masks_stack.cpu().numpy()
     tb_values_cpu = tb_values_stack.cpu().numpy()
+    tb_moves_left_cpu = tb_moves_left_stack.cpu().numpy()
     final_obs_cpu = final_obs.cpu().numpy()
     game_length_cpu = game_length.cpu().numpy()
     game_outcome_cpu = game_outcome.cpu().numpy()
@@ -820,6 +834,9 @@ def play_games_parallel_gpu_resident(
         tb_row = tb_values_cpu[g, :L]
         if np.isfinite(tb_row).any():
             h_g.tablebase_values = [float(v) for v in tb_row]
+        tbml_row = tb_moves_left_cpu[g, :L]
+        if np.isfinite(tbml_row).any():
+            h_g.tablebase_moves_left = [float(v) for v in tbml_row]
         h_g.observations.append(torch.from_numpy(final_obs_cpu[g]).clone())
         histories.append(h_g)
 

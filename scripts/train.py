@@ -224,6 +224,16 @@ def main():
                         help="Shaping of the per-position TB value (override config.tb_value_dtz_shape, "
                              "preset 0.5): 0=flat WDL win=+1; >0 ranks wins by own DTZ "
                              "(closer mate→closer +1, floored at 1-shape).")
+    parser.add_argument("--tb-moves-left-weight", type=float, default=None,
+                        help="Moves-left DTM relabel weight (Lc0 Gaviota MLH rescoring): replace the "
+                             "moves-left target at in-TB decisive plies with |DTM| (override "
+                             "config.tb_moves_left_weight, preset 0.0=off; 1.0=full replace). "
+                             "Needs --tb-gaviota-path + a moves-left head.")
+    parser.add_argument("--tb-gaviota-path", type=str, default=None,
+                        help="Directory of Gaviota .gtb.cp4 DTM tablebases (override config.tb_gaviota_path).")
+    parser.add_argument("--tb-steer-policy", action="store_true", default=False,
+                        help="Restore the search-side DTZ value bias (policy steering) in _select. "
+                             "OFF by default — Lc0-faithful: inject TB signal via relabels, not search.")
     parser.add_argument("--resign-enabled", action="store_true", default=False,
                         help="Enable post-hoc consecutive-move resignation: if STM root "
                              "value < --resign-threshold for --resign-consecutive own-moves, "
@@ -414,6 +424,12 @@ def main():
         config.tb_value_weight = args.tb_value_weight
     if args.tb_value_dtz_shape is not None:
         config.tb_value_dtz_shape = args.tb_value_dtz_shape
+    if args.tb_moves_left_weight is not None:
+        config.tb_moves_left_weight = args.tb_moves_left_weight
+    if args.tb_gaviota_path is not None:
+        config.tb_gaviota_path = args.tb_gaviota_path
+    if args.tb_steer_policy:
+        config.tb_steer_policy = True
     if args.resign_enabled:
         config.resign_enabled = True
     if args.resign_threshold is not None:
