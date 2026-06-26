@@ -510,6 +510,13 @@ class MuZeroConfig:
     # and inject the TB signal only via the value + moves-left relabels. True restores
     # the soft search bias (needs tb_root_probe to build the prober).
     tb_steer_policy: bool = False
+    # Endgame SEEDING (on-policy curriculum, gpu-resident path): a fraction of each
+    # self-play round starts from tablebase endgame FENs sampled from the archive, the
+    # model plays them out (no random opening; relabeled with value+DTM truth). Constant
+    # fraction, NO curriculum gate (the value relabel would poison a conversion gate).
+    # 0 = off. Cures covariate shift (the model trains on its OWN endgame states).
+    endgame_seed_frac: float = 0.0
+    endgame_seed_archive: str | None = None   # path to the seed FEN list (generate_endgame_seeds.py)
     # Auxiliary categorical head predicting the CURRENT side-to-move material
     # margin (pawns) from the LATENT state — incl. after the K dynamics unrolls,
     # so it regularizes the WORLD MODEL to preserve material through latent

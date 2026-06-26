@@ -860,6 +860,20 @@ def play_games_parallel_gpu_resident(
     return histories
 
 
+_SEED_ARCHIVE_CACHE: dict[str, list[str]] = {}
+
+
+def _load_seed_archive(path: str) -> list[str]:
+    """Load + cache the endgame-seed FEN archive (one FEN per line)."""
+    if path not in _SEED_ARCHIVE_CACHE:
+        try:
+            with open(path) as f:
+                _SEED_ARCHIVE_CACHE[path] = [ln.strip() for ln in f if ln.strip()]
+        except Exception:
+            _SEED_ARCHIVE_CACHE[path] = []
+    return _SEED_ARCHIVE_CACHE[path]
+
+
 def run_self_play(
     network,
     game: Game,
@@ -892,17 +906,35 @@ def run_self_play(
         )
         desc = "Self-play (gpu-resident)" if use_resident else "Self-play (gpu)"
 
+        # Endgame seeding (Phase 1, resident path only): a fraction of games start
+        # from tablebase endgame FENs (on-policy curriculum) — the model plays them
+        # out and we relabel with value+DTM truth. Seeded games run as a separate
+        # sub-batch (they need n_random=0); normal games run as usual.
+        seed_frac = float(getattr(config, "endgame_seed_frac", 0.0))
+        seed_arch = getattr(config, "endgame_seed_archive", None)
+        seed_fens: list[str] = []
+        if use_resident and seed_frac > 0.0 and seed_arch:
+            pool = _load_seed_archive(seed_arch)
+            if pool:
+                n_seed = int(round(seed_frac * num_games))
+                seed_fens = [random.choice(pool) for _ in range(n_seed)]
+        n_normal = num_games - len(seed_fens)
+
         histories = []
-        remaining = num_games
-        iterator = range(0, num_games, n_parallel)
-        if show_progress:
+        # 1) normal games
+        rem = n_normal
+        iterator = range(0, n_normal, n_parallel) if n_normal > 0 else []
+        if show_progress and n_normal > 0:
             iterator = tqdm(iterator, desc=desc, leave=False)
         for _ in iterator:
-            batch = min(n_parallel, remaining)
-            histories.extend(
-                play_fn(network, config, batch, device, training_step)
-            )
-            remaining -= batch
+            batch = min(n_parallel, rem)
+            histories.extend(play_fn(network, config, batch, device, training_step))
+            rem -= batch
+        # 2) seeded endgame games (start_fens per chunk; resident play_fn only)
+        for s in range(0, len(seed_fens), n_parallel):
+            chunk = seed_fens[s:s + n_parallel]
+            histories.extend(play_fn(
+                network, config, len(chunk), device, training_step, start_fens=chunk))
         return _apply_resignation(histories, config)
 
     if n_parallel > 1:
