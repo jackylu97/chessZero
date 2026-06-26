@@ -978,6 +978,14 @@ class MuZeroTrainer:
             # Histograms are expensive (one tensor copy per add_histogram per step
             # — many MB at batch=256). Throttle to once every N steps.
             log_hist = (self.global_step % max(1, getattr(self.config, "histogram_interval", 100)) == 0)
+            # Logging-only diagnostics are computed only on log steps (each .item()/
+            # .cpu() is a host sync that stalls the GPU). td_errors below is the one
+            # exception — the PER priority update needs it every step.
+            value_mae = value_target_std = float("nan")
+            policy_entropy_pred = policy_entropy_target = float("nan")
+            policy_loss_warm = policy_loss_self = float("nan")
+            value_loss_warm = value_loss_self = float("nan")
+            n_warm = 0
             if getattr(self.config, "value_head_type", "support") == "wdl":
                 # WDL diagnostics: predicted scalar V = P(W) - P(L); target
                 # scalar V = z[W] - z[L] (one-hot, so just +1/0/-1). MAE in
@@ -991,8 +999,9 @@ class MuZeroTrainer:
                 tgt_wdl = target_values[:, 0]  # (B, 3)
                 true_v_scalar = (tgt_wdl[..., 0] - tgt_wdl[..., 2]).float()
                 td_errors = (pred_v_scalar - true_v_scalar).abs().cpu().numpy()
-                value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
-                value_target_std = true_v_scalar.std(unbiased=False).item()
+                if log_now:
+                    value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
+                    value_target_std = true_v_scalar.std(unbiased=False).item()
                 # Histograms: predicted V scalar + each WDL component. A
                 # collapsed value head shows pred_v_scalar histogram tightly
                 # peaked at 0 with little spread; P_D >> P_W ≈ P_L is the
@@ -1015,21 +1024,23 @@ class MuZeroTrainer:
                     true_v_trans = true_v_scalar * scale
                     pred_v_scalar = pred_v_trans / scale if scale != 1.0 else pred_v_trans
                 td_errors = (pred_v_trans - true_v_trans).abs().cpu().numpy()
-                value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
-                value_target_std = true_v_scalar.float().std(unbiased=False).item()
+                if log_now:
+                    value_mae = (pred_v_scalar - true_v_scalar).abs().mean().item()
+                    value_target_std = true_v_scalar.float().std(unbiased=False).item()
 
             # Policy entropy at root (k=0). Tracks how sharp the model's prior
             # is (lower = sharper) and how sharp the training targets are. The
             # gap between them shows model fit; their absolute values show the
             # diffuse-vs-sharp regime. Both in nats over the full action space.
-            pred_probs = F.softmax(policy_logits_k0.detach().float(), dim=-1)
-            policy_entropy_pred = -(
-                pred_probs * (pred_probs + 1e-12).log()
-            ).sum(dim=-1).mean().item()
-            tgt_probs = target_policies[:, 0].float()
-            policy_entropy_target = -(
-                tgt_probs * (tgt_probs + 1e-12).log()
-            ).sum(dim=-1).mean().item()
+            if log_now:
+                pred_probs = F.softmax(policy_logits_k0.detach().float(), dim=-1)
+                policy_entropy_pred = -(
+                    pred_probs * (pred_probs + 1e-12).log()
+                ).sum(dim=-1).mean().item()
+                tgt_probs = target_policies[:, 0].float()
+                policy_entropy_target = -(
+                    tgt_probs * (tgt_probs + 1e-12).log()
+                ).sum(dim=-1).mean().item()
 
             # Per-stratum loss: warmstart vs self-play. Lever-2 health probes:
             #   - both staying high → anchor too small to absorb teaching
@@ -1037,18 +1048,19 @@ class MuZeroTrainer:
             #   - both falling together → working as intended
             # NaN when a stratum is empty in this batch (rare under stratified
             # sampling, common before pool exhaustion / after lever decays).
-            n_warm = int(is_warm.sum().item())
-            n_sp = is_warm.numel() - n_warm
-            policy_per_sample = (outer_scale * policy_loss).detach().float()
-            value_per_sample = (outer_scale * value_loss).detach().float()
-            policy_loss_warm = (policy_per_sample[is_warm].mean().item()
-                                if n_warm > 0 else float("nan"))
-            policy_loss_self = (policy_per_sample[~is_warm].mean().item()
-                                if n_sp > 0 else float("nan"))
-            value_loss_warm = (value_per_sample[is_warm].mean().item()
-                               if n_warm > 0 else float("nan"))
-            value_loss_self = (value_per_sample[~is_warm].mean().item()
-                               if n_sp > 0 else float("nan"))
+            if log_now:
+                n_warm = int(is_warm.sum().item())
+                n_sp = is_warm.numel() - n_warm
+                policy_per_sample = (outer_scale * policy_loss).detach().float()
+                value_per_sample = (outer_scale * value_loss).detach().float()
+                policy_loss_warm = (policy_per_sample[is_warm].mean().item()
+                                    if n_warm > 0 else float("nan"))
+                policy_loss_self = (policy_per_sample[~is_warm].mean().item()
+                                    if n_sp > 0 else float("nan"))
+                value_loss_warm = (value_per_sample[is_warm].mean().item()
+                                   if n_warm > 0 else float("nan"))
+                value_loss_self = (value_per_sample[~is_warm].mean().item()
+                                   if n_sp > 0 else float("nan"))
         self.replay_buffer.update_priorities(game_indices, td_errors, self.config.per_epsilon)
 
         # In-loop action-awareness probe (log steps only): cosine spread of the
