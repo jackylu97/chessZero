@@ -694,13 +694,16 @@ def play_games_parallel_gpu_resident(
             # Lc0-faithful path removes policy steering (the DTZ policy boost lc0
             # rejected) and relies on on-policy self-play + value/moves-left relabel.
             # tb_steer_policy=True restores the old soft search bias.
+            steer_enabled = bool(getattr(config, "tb_steer_policy", False))
+            # per_move=False skips the ~30 probes/position _classify when steering is
+            # off (the dominant self-play CPU cost) — only the relabel targets are kept.
             root_tb_value = (
-                tb_prober.root_move_values(state, legal_mask)
+                tb_prober.root_move_values(state, legal_mask, per_move=steer_enabled)
                 if tb_prober is not None else None
             )
             if tb_prober is not None and tb_prober.last_in_tb is not None:
                 tb_reached |= tb_prober.last_in_tb.to(device) & alive_mask
-            steer = root_tb_value if getattr(config, "tb_steer_policy", False) else None
+            steer = root_tb_value if steer_enabled else None
             root_data = mcts.run_batch_gpu(
                 stacked_obs, legal_mask, add_noise=True,
                 forced_draw_mask=forced_draw_mask,

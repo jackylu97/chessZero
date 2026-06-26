@@ -126,9 +126,16 @@ class SyzygyRootProber:
         return float(abs(int(dtm))) if dtm != 0 else float("nan")
 
     @torch.no_grad()
-    def root_move_values(self, state, legal_mask: torch.Tensor) -> torch.Tensor:
+    def root_move_values(self, state, legal_mask: torch.Tensor,
+                         per_move: bool = True) -> torch.Tensor:
         """``legal_mask``: [N, A] bool. Returns [N, A] float32 (mover POV), NaN
-        where the game isn't in TB range or a move can't be classified."""
+        where the game isn't in TB range or a move can't be classified.
+
+        ``per_move=False`` SKIPS the per-move _classify (the [N,A] ``out`` and
+        ``last_best_action`` — only used by policy steering). When steering is off
+        (Lc0-faithful default) only the per-POSITION value + DTM relabel targets are
+        needed, so this avoids ~30 Syzygy probes/position — the dominant self-play CPU
+        cost. ``out`` stays all-NaN in that mode (and isn't consumed)."""
         N = state.n
         dev = state.device
         out = torch.full((N, ACTION_SPACE), float("nan"), dtype=torch.float32)
@@ -153,21 +160,26 @@ class SyzygyRootProber:
             return out.to(dev)
 
         best = torch.full((N,), -1, dtype=torch.long)
-        legal_cpu = legal_mask.cpu()
+        legal_cpu = legal_mask.cpu() if per_move else None
         for i in idxs:
             board = state_to_board(state, i)
             if not board.is_valid():
                 continue
             key = board.fen()
-            cached = self._cache.get(key)
-            if cached is None:
-                cached = self._classify(board, legal_cpu[i])
-                self._cache[key] = cached
-            for action, val in cached.items():
-                out[i, action] = val
-            # Per-position value target (DTZ-shaped, STM POV) — distinct from the
-            # per-move search bias above. board is unmutated here (_classify
-            # restores it via pop), so probing it is safe.
+            if per_move:
+                # Per-move classification — ONLY consumed by policy steering.
+                cached = self._cache.get(key)
+                if cached is None:
+                    cached = self._classify(board, legal_cpu[i])
+                    self._cache[key] = cached
+                for action, val in cached.items():
+                    out[i, action] = val
+                if cached:  # DTZ-optimal winning move for hard-selection
+                    ba, bv = max(cached.items(), key=lambda kv: kv[1])
+                    if bv > 0.0:
+                        best[i] = int(ba)
+            # Per-position value target (DTZ-shaped, STM POV) — always needed for the
+            # value relabel. board is unmutated by the probes (no push/pop here).
             pv = self._posval_cache.get(key)
             if pv is None:
                 pv = self._position_value(board)
@@ -179,12 +191,6 @@ class SyzygyRootProber:
                 ml = self._position_moves_left(board)
                 self._dtm_cache[key] = ml
             posml[i] = ml
-            # DTZ-optimal winning move (highest value) for hard-selection, if the
-            # position is actually won (a move with value > 0 exists).
-            if cached:
-                ba, bv = max(cached.items(), key=lambda kv: kv[1])
-                if bv > 0.0:
-                    best[i] = int(ba)
         self.last_best_action = best.to(dev)
         self.last_position_value = posval.to(dev)
         self.last_position_moves_left = posml.to(dev)
