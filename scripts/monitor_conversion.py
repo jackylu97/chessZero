@@ -49,10 +49,16 @@ def main():
     ap.add_argument("--buf", required=True)
     ap.add_argument("--tb", default="data/syzygy")
     ap.add_argument("--max-games", type=int, default=4000)
+    ap.add_argument("--recent", action="store_true",
+                    help="Analyze the FRESHEST max-games (buffer TAIL) instead of the oldest "
+                         "(head). Required for trend analysis: the head self-play games are the "
+                         "same oldest games shared across every later checkpoint, so the head "
+                         "rate looks frozen. Use --recent to measure games near this checkpoint.")
     args = ap.parse_args()
     game = ChessGame()
     rb = ReplayBuffer(max_size=10_000_000); rb.load(args.buf, game=game)
-    sp = [g for g in rb.buffer if not getattr(g, "external_values", [])][: args.max_games]
+    _sp_all = [g for g in rb.buffer if not getattr(g, "external_values", [])]
+    sp = _sp_all[-args.max_games:] if args.recent else _sp_all[: args.max_games]
     tb = chess.syzygy.open_tablebase(args.tb)
 
     stats = {"seeded": [0, 0], "self": [0, 0]}   # key -> [had_winning, converted]
