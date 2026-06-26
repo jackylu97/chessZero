@@ -508,7 +508,13 @@ def play_games_parallel_gpu_resident(
     num_games: int,
     device: str = "cuda",
     training_step: int = 0,
+    start_fens: list[str] | None = None,
 ) -> list[GameHistory]:
+    """``start_fens`` (len == num_games): seed each game from a FEN (endgame
+    curriculum) instead of the standard start. Stays fully GPU-resident — only the
+    initial batched state changes (via from_python_chess). Random opening is
+    disabled for seeded games (it would corrupt the endgame); start_fen is stamped
+    on each GameHistory so buffer reconstruction replays from the seed."""
     """Fully GPU-resident batched self-play.
 
     All per-ply state lives on the GPU: observations, legal masks, MCTS
@@ -561,7 +567,10 @@ def play_games_parallel_gpu_resident(
 
     action_space_size = chess_game.action_space_size
     n_frames = int(getattr(config, "history_frames", 1))
-    n_random = int(getattr(config, "random_opening_plies", 0))
+    seeded = start_fens is not None
+    # Seeded endgame games start mid-game; a random opening would wreck the
+    # position, so disable it for them.
+    n_random = 0 if seeded else int(getattr(config, "random_opening_plies", 0))
     temp_init = get_temperature(training_step, config)
     temp_final = float(config.temperature_final)
     temp_drop = int(config.temperature_drop_step)
@@ -591,7 +600,13 @@ def play_games_parallel_gpu_resident(
     # does the in-engine termination, alive_mask handles per-game stopping.
     max_plies_cap = int(getattr(config, "max_plies", getattr(ChessGame, "max_plies", 400)))
 
-    state = gpu_game.reset_batch(num_games, device=device)
+    if seeded:
+        import chess as _chess
+        assert len(start_fens) == num_games, "start_fens must have length num_games"
+        state = gpu_game.from_python_chess(
+            [_chess.Board(f) for f in start_fens], device=device)
+    else:
+        state = gpu_game.reset_batch(num_games, device=device)
 
     # Single-frame observation history for AlphaZero-style stacking. Newest
     # frame at slot 0; rolled forward each ply. Initial all-zero (matches
@@ -811,6 +826,8 @@ def play_games_parallel_gpu_resident(
     for g in range(num_games):
         L = int(game_length_cpu[g])
         h_g = GameHistory(game_name=config.game)
+        if seeded:
+            h_g.start_fen = start_fens[g]   # buffer reconstruction replays from the seed
         h_g.reached_tb = bool(tb_reached_cpu[g])
         for t in range(L):
             # .copy() / torch.from_numpy(...).clone() materializes per-ply slices.
