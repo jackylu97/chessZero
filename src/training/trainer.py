@@ -179,6 +179,11 @@ class MuZeroTrainer:
         self._prefetch_stop = threading.Event()
         self._prefetch_error: BaseException | None = None
 
+        # Seeded-endgame conversion monitoring (TensorBoard seed/*). Lazily-opened
+        # Syzygy handle + per-FEN wdl cache to classify each seed's winning side.
+        self._seed_tb = None
+        self._seed_wdl_cache: dict[str, int] = {}
+
     def train(self):
         """Run the full training loop."""
         print(f"Starting MuZero training for {self.config.game}")
@@ -474,6 +479,10 @@ class MuZeroTrainer:
         if getattr(self.config, "tb_root_probe", False):
             tb_reached = sum(1 for g in games if getattr(g, "reached_tb", False))
             self.writer.add_scalar("self_play/tb_reach_rate", tb_reached / n_games, self.global_step)
+        # Seeded-endgame conversion (seed/* scalars) — no-op unless endgame seeding
+        # is on (games carry start_fen). Measures how often the model converts the
+        # tablebase-winning seeds it was started from, split by winning color.
+        self._log_seed_conversion(games)
         self.writer.add_scalar("self_play/buffer_size", len(self.replay_buffer), self.global_step)
         # Buffer composition: fraction of self-play (non-warmstart) games in the
         # buffer that are decisive — the quantity decisive_retention_multiplier is
@@ -515,6 +524,104 @@ class MuZeroTrainer:
         tqdm.write(
             f"Step {self.global_step}: self-play done | "
             f"RSS {rss_before:.2f} → {rss_after:.2f} GB (Δ {rss_delta:+.2f}){gpu_msg}"
+        )
+
+    def _log_seed_conversion(self, games):
+        """Log seeded-endgame conversion to TensorBoard (``seed/*``).
+
+        For games started from a tablebase seed (``start_fen`` set), classify the
+        seed's winning side via Syzygy WDL and measure how often the model actually
+        won it — split by winning COLOR, which both tracks conversion AND verifies
+        the model trains on both white- and black-advantage endgames.
+
+        ``game_outcome`` is white-POV (+1 white win / -1 black win / 0 draw). A
+        decisive outcome with ``resigned``False is a real checkmate (the only
+        natural decisive chess result; stalemate/threefold/50-move are draws). So:
+          conversion_rate = decisive wins for the winning side / won seeds (incl. resignation)
+          mate_rate       = real checkmates / won seeds (matches the offline monitor)
+          draw_rate       = drawn / won seeds (the failure mode)
+          loss_rate       = winning side actually lost / won seeds (blundered the win)
+        No-op (returns) unless seeding is on. Cheap: one cached WDL probe per seed."""
+        seeded = [g for g in games if getattr(g, "start_fen", None)]
+        if not seeded:
+            return
+        import chess
+        import chess.syzygy
+        if self._seed_tb is None:
+            tb_path = getattr(self.config, "tb_path", None) or "data/syzygy"
+            try:
+                self._seed_tb = chess.syzygy.open_tablebase(tb_path)
+            except Exception:
+                self._seed_tb = False
+        if not self._seed_tb:
+            return
+
+        won = {"white": 0, "black": 0}
+        conv = {"white": 0, "black": 0}
+        mate = {"white": 0, "black": 0}
+        drawn = {"white": 0, "black": 0}
+        lost = {"white": 0, "black": 0}
+        draw_seed = draw_seed_held = 0
+        for g in seeded:
+            fen = g.start_fen
+            board = chess.Board(fen)
+            wdl = self._seed_wdl_cache.get(fen)
+            if wdl is None:
+                try:
+                    wdl = int(self._seed_tb.probe_wdl(board))
+                except Exception:
+                    wdl = -99
+                self._seed_wdl_cache[fen] = wdl
+            o = g.game_outcome
+            resigned = bool(getattr(g, "resigned", False))
+            if wdl == 2:                       # side to move (= winning color) wins
+                color = "white" if board.turn == chess.WHITE else "black"
+                won[color] += 1
+                win_o = 1.0 if board.turn == chess.WHITE else -1.0
+                if o == win_o:
+                    conv[color] += 1
+                    if not resigned:
+                        mate[color] += 1
+                elif o == 0:
+                    drawn[color] += 1
+                else:
+                    lost[color] += 1
+            elif wdl == 0:                     # true draw seed (won/drawn boundary)
+                draw_seed += 1
+                draw_seed_held += int(o == 0)
+
+        tw, tb_ = won["white"], won["black"]
+        total_won = tw + tb_
+        s = self.global_step
+
+        def rate(num, den):
+            return (num / den) if den else float("nan")
+
+        # Balance verification: counts of white- vs black-winning seeds the model
+        # actually played this batch (should track the 50/50 archive).
+        self.writer.add_scalar("seed/won_count", total_won, s)
+        self.writer.add_scalar("seed/white_winning_count", tw, s)
+        self.writer.add_scalar("seed/black_winning_count", tb_, s)
+        self.writer.add_scalar("seed/draw_seed_count", draw_seed, s)
+        if not total_won:
+            return
+        c = conv["white"] + conv["black"]
+        m = mate["white"] + mate["black"]
+        d = drawn["white"] + drawn["black"]
+        l = lost["white"] + lost["black"]
+        self.writer.add_scalar("seed/conversion_rate", rate(c, total_won), s)   # headline
+        self.writer.add_scalar("seed/mate_rate", rate(m, total_won), s)
+        self.writer.add_scalar("seed/draw_rate", rate(d, total_won), s)
+        self.writer.add_scalar("seed/loss_rate", rate(l, total_won), s)
+        self.writer.add_scalar("seed/conversion_white", rate(conv["white"], tw), s)
+        self.writer.add_scalar("seed/conversion_black", rate(conv["black"], tb_), s)
+        if draw_seed:
+            self.writer.add_scalar("seed/draw_seed_hold_rate", rate(draw_seed_held, draw_seed), s)
+        tqdm.write(
+            f"Step {s}: seed conversion — {c}/{total_won} = {rate(c, total_won):.1%} "
+            f"(mate {rate(m, total_won):.1%}, draw {rate(d, total_won):.1%}, "
+            f"loss {rate(l, total_won):.1%}) | won W:{tw} B:{tb_} "
+            f"conv W:{rate(conv['white'], tw):.0%} B:{rate(conv['black'], tb_):.0%}"
         )
 
     def _build_repr_probe_set(self):
