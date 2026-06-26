@@ -1,6 +1,8 @@
 #!/bin/bash
-# TB-VALUE arm: 400 sims / 512 games / 512 parallel (all games in one self-play batch;
-# functionally equivalent to 256-parallel for training, just one GPU pass instead of two)
+# TB-VALUE arm (shape=0.9): 400 sims / 512 games / 512 parallel. STEEPER DTZ value
+# gradient — tb_value_dtz_shape 0.5->0.9 widens the win value band so the DTZ signal
+# survives the eval_to_wdl compression (P(win) gradient 0.117 -> 0.257). The shape=0.5
+# run (2026_06_25_tb_value) showed no value-head effect at 25k (corr -0.35, weak gradient).
 # but ADDS DTZ value-target relabeling (tb_value_weight=1.0, tb_value_dtz_shape=0.5)
 # on top of the search-side probe. Starts FRESH from the SAME 15k warmstart anchor
 # tb_probe used (NOT a continuation of tb_probe's 61k) — so it's a clean parallel A/B
@@ -17,7 +19,7 @@ echo "Starting tb_value FRESH from the warmstart anchor (same start as tb_probe)
 
 .venv/bin/python -u scripts/_faulthandler_bootstrap.py scripts/train.py \
   --game chess_small \
-  --run-id 2026_06_25_tb_value \
+  --run-id 2026_06_26_tb_value_s09 \
   --device cuda \
   --steps 150000 \
   --eval-interval 2000 \
@@ -45,6 +47,6 @@ echo "Starting tb_value FRESH from the warmstart anchor (same start as tb_probe)
   --tb-root-probe \
   --tb-dtz-weight 1.0 \
   --tb-value-weight 1.0 \
-  --tb-value-dtz-shape 0.5 \
+  --tb-value-dtz-shape 0.9 \
   --resume "$RESUME" \
-  2>&1 | tee logs/2026_06_25_tb_value.log
+  2>&1 | tee logs/2026_06_26_tb_value_s09.log
