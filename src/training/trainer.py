@@ -248,14 +248,19 @@ class MuZeroTrainer:
                 anchor = getattr(self.config, "warmstart_buffer_size", None)
                 desired_cap = anchor if selfplay_on else None
                 if self.replay_buffer.warmstart_max_size != desired_cap:
-                    if desired_cap is not None:
-                        n_trimmed = self.replay_buffer.trim_warmstart_to(desired_cap)
-                        tqdm.write(
-                            f"Step {step}: warmstart phase complete — trimmed "
-                            f"{n_trimmed} warmstart games to anchor={desired_cap}, "
-                            f"two-pool enabled, self-play ON."
-                        )
-                    self.replay_buffer.warmstart_max_size = desired_cap
+                    # Lock: trim_warmstart_to mutates the buffer (shrinks it),
+                    # which races the prefetch thread's sample_batch read
+                    # (np.random.choice(n) then buffer[g_idx] -> IndexError if the
+                    # buffer shrank in between). Same lock sample_batch holds.
+                    with self._buffer_lock:
+                        if desired_cap is not None:
+                            n_trimmed = self.replay_buffer.trim_warmstart_to(desired_cap)
+                            tqdm.write(
+                                f"Step {step}: warmstart phase complete — trimmed "
+                                f"{n_trimmed} warmstart games to anchor={desired_cap}, "
+                                f"two-pool enabled, self-play ON."
+                            )
+                        self.replay_buffer.warmstart_max_size = desired_cap
             else:
                 selfplay_on = not bool(self._injection_shards)
 
