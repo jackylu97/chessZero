@@ -254,6 +254,11 @@ def main():
                         help="Softmax temperature of the relabeled policy TARGET over win-preserving moves "
                              "(override config.tb_policy_temp, preset 0.3). Lower = sharper (more mass on the "
                              "DTZ-best winning move). NOT the MCTS search temperature.")
+    parser.add_argument("--tb-relabel-workers", type=int, default=None,
+                        help="Deferred TB relabel pool size (override config.tb_relabel_workers, preset 0). "
+                             "When steering is off the value/DTM/policy targets run in one batched post-game "
+                             "pass; >1 fans the probes across this many spawn workers (each opens its own "
+                             "tablebases). 0/1 = single-process deferred pass. Removes the prober from the hot path.")
     parser.add_argument("--endgame-seed-frac", type=float, default=None,
                         help="Fraction of each self-play round seeded from tablebase endgame FENs "
                              "(on-policy curriculum; override config.endgame_seed_frac, preset 0=off).")
@@ -470,6 +475,8 @@ def main():
         config.tb_policy_anneal_frac = args.tb_policy_anneal_frac
     if args.tb_policy_temp is not None:
         config.tb_policy_temp = args.tb_policy_temp
+    if args.tb_relabel_workers is not None:
+        config.tb_relabel_workers = args.tb_relabel_workers
     if args.endgame_seed_frac is not None:
         config.endgame_seed_frac = args.endgame_seed_frac
     if args.endgame_seed_archive is not None:

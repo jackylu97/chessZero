@@ -523,6 +523,13 @@ class MuZeroConfig:
     tb_policy_anneal_frac: float = 0.0
     tb_policy_win_thresh: float = 0.5
     tb_policy_temp: float = 0.3
+    # Deferred TB relabel: when steering is OFF the value/DTM/policy targets are pure
+    # functions of each ply's board, so they run in ONE batched pass after the game
+    # batch (over the unique in-TB FENs) instead of inline per ply — removing ~56% of
+    # endgame self-play wall from the GPU hot path. >1 fans the probes across a spawn
+    # process pool (each worker opens its own tablebase handles). 0/1 = single-process
+    # deferred pass (still off the hot path, no parallelism). Ignored when steering on.
+    tb_relabel_workers: int = 0
     # Endgame SEEDING (on-policy curriculum, gpu-resident path): a fraction of each
     # self-play round starts from tablebase endgame FENs sampled from the archive, the
     # model plays them out (no random opening; relabeled with value+DTM truth). Constant

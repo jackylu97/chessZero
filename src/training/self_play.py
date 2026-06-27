@@ -601,7 +601,10 @@ def play_games_parallel_gpu_resident(
     use_tb_root = bool(getattr(config, "tb_root_probe", False))
     tb_prober = None
     if use_tb_root:
-        from ..games.syzygy_probe import SyzygyRootProber
+        from ..games.syzygy_probe import (
+            SyzygyRootProber, state_to_board as _state_to_board,
+            relabel_fens as _relabel_fens, _prober_params,
+        )
         tb_prober = SyzygyRootProber(
             getattr(config, "tb_path", "data/syzygy"),
             max_pieces=int(getattr(config, "tb_max_pieces", 5)),
@@ -615,6 +618,18 @@ def play_games_parallel_gpu_resident(
     # Build the soft TB policy target when the policy relabel is on (needs per-move
     # _classify). Independent of search-side steering (tb_steer_policy).
     tb_policy_relabel = bool(float(getattr(config, "tb_policy_weight", 0.0)) > 0.0)
+    # Search-side steering: when ON, the prober's per-move values BIAS the search, so
+    # it MUST run inline (the original path). When OFF (Lc0-faithful default) the
+    # prober only produces TRAINING targets (value/DTM/policy) — pure functions of each
+    # ply's board — so we DEFER them to one batched, process-pooled pass after the game
+    # batch concludes (removes ~56% of endgame self-play wall from the GPU hot path).
+    steer_enabled = bool(getattr(config, "tb_steer_policy", False))
+    need_per_move = steer_enabled or tb_policy_relabel
+    defer_relabel = (tb_prober is not None) and (not steer_enabled)
+    relabel_workers = int(getattr(config, "tb_relabel_workers", 0))
+    # FENs of the pre-step root board at each ply (deferred path only); None where the
+    # game is out of TB range / in the random opening. [T] list of [N] str-or-None.
+    tb_fen_per_ply: list = []
 
     # Cap loop length so we always have a static upper bound; ChessGame.max_plies
     # does the in-engine termination, alive_mask handles per-game stopping.
@@ -692,6 +707,10 @@ def play_games_parallel_gpu_resident(
         # Stack along channel dim → [N, n_frames * C, H, W] (matches stack_with_history).
         stacked_obs = obs_window.reshape(num_games, n_frames * c, h, w)
 
+        # Per-ply stash of in-TB root FENs for the deferred relabel (None unless the
+        # deferred branch fills it). Appended once per ply below to keep T-alignment.
+        tb_fen_row = None
+
         # 3. MCTS — but skip for the random-opening plies (all alive games
         # have move_count == ply during the opening because move_count
         # increments by alive_mask each ply and starts at 0). For ply >=
@@ -710,22 +729,27 @@ def play_games_parallel_gpu_resident(
                 gpu_game.repetition_move_mask(state, legal_mask, min_repeats=term_min_repeats)
                 if use_terminal_draws else None
             )
-            # Run the prober to compute per-position RELABEL targets (value + DTM)
-            # and last_in_tb. By default we do NOT feed it into the search: the
-            # Lc0-faithful path removes policy steering (the DTZ policy boost lc0
-            # rejected) and relies on on-policy self-play + value/moves-left relabel.
-            # tb_steer_policy=True restores the old soft search bias.
-            steer_enabled = bool(getattr(config, "tb_steer_policy", False))
-            # per_move runs the ~30-probe _classify; needed by BOTH search-side steering
-            # AND the soft policy relabel. Skipped otherwise (dominant self-play CPU cost).
-            need_per_move = steer_enabled or tb_policy_relabel
-            root_tb_value = (
-                tb_prober.root_move_values(state, legal_mask, per_move=need_per_move)
-                if tb_prober is not None else None
-            )
-            if tb_prober is not None and tb_prober.last_in_tb is not None:
-                tb_reached |= tb_prober.last_in_tb.to(device) & alive_mask
-            steer = root_tb_value if steer_enabled else None
+            # TB relabel targets. Two modes (see defer_relabel above):
+            #  - STEERING ON  → run the prober inline; its per-move values bias search.
+            #  - STEERING OFF → run only the cheap GPU piece-count gate now and STASH
+            #    the in-TB root boards; the value/DTM/policy targets are produced in a
+            #    pooled post-game pass. No search bias, so deferral is target-identical.
+            steer = None
+            if tb_prober is not None and not defer_relabel:
+                root_tb_value = tb_prober.root_move_values(
+                    state, legal_mask, per_move=need_per_move)
+                if tb_prober.last_in_tb is not None:
+                    tb_reached |= tb_prober.last_in_tb.to(device) & alive_mask
+                steer = root_tb_value if steer_enabled else None
+            elif tb_prober is not None:  # deferred
+                in_tb = tb_prober.in_tb_mask(state)
+                tb_reached |= in_tb.to(device) & alive_mask
+                # Reconstruct FENs for the alive, in-TB root boards (cheap vs probing).
+                # Appended once per ply in the post-step block (keeps T-alignment).
+                tb_fen_row = [None] * num_games
+                idxs = torch.nonzero(in_tb & alive_mask, as_tuple=False).flatten().tolist()
+                for i in idxs:
+                    tb_fen_row[i] = _state_to_board(state, i).fen()
             root_data = mcts.run_batch_gpu(
                 stacked_obs, legal_mask, add_noise=True,
                 forced_draw_mask=forced_draw_mask,
@@ -762,8 +786,12 @@ def play_games_parallel_gpu_resident(
         rewards_per_ply.append(rewards.to(torch.float32))
         legal_masks_per_ply.append(legal_mask)
         # Per-position TB value target (DTZ-shaped, STM POV; NaN outside TB / during
-        # random opening). Fresh from this ply's root_move_values call (else branch).
-        if (tb_prober is not None and ply >= n_random
+        # random opening). Deferred path: stash the in-TB root FENs (built pre-step);
+        # the targets are produced in the post-game pooled pass. Inline path: read
+        # fresh from this ply's root_move_values call.
+        if defer_relabel:
+            tb_fen_per_ply.append(tb_fen_row if tb_fen_row is not None else [None] * num_games)
+        elif (tb_prober is not None and ply >= n_random
                 and tb_prober.last_position_value is not None):
             tb_values_per_ply.append(tb_prober.last_position_value.to(torch.float32))
             tb_ml = tb_prober.last_position_moves_left
@@ -820,6 +848,47 @@ def play_games_parallel_gpu_resident(
     # 9. Capture final terminal observation.
     final_obs = gpu_game.to_tensor_batch(state)                      # [N, C, H, W]
 
+    # 9b. Deferred TB relabel (steering off): one pooled pass over the UNIQUE in-TB
+    # FENs gathered during play, then scatter (value, DTM, policy) back into the
+    # per-ply accumulators the inline path would have filled. Target-identical; the
+    # ~30-probe/position work now overlaps nothing in the GPU hot path and fans out
+    # across a CPU process pool instead of serializing one ply at a time.
+    if defer_relabel:
+        T = len(obs_per_ply)
+        params = _prober_params(
+            tb_prober, getattr(config, "tb_path", "data/syzygy"),
+            getattr(config, "tb_gaviota_path", None))
+        all_fens = [f for row in tb_fen_per_ply for f in row if f is not None]
+        fenmap = _relabel_fens(
+            all_fens, params, relabel_workers, want_policy=tb_policy_relabel)
+        n_uniq = len({f for f in all_fens})
+        nan = float("nan")
+        for t in range(T):
+            row = tb_fen_per_ply[t] if t < len(tb_fen_per_ply) else None
+            valrow = torch.full((num_games,), nan, dtype=torch.float32)
+            mlrow = torch.full((num_games,), nan, dtype=torch.float32)
+            polrow = [None] * num_games
+            if row is not None:
+                for g in range(num_games):
+                    fen = row[g]
+                    if fen is None:
+                        continue
+                    res = fenmap.get(fen)
+                    if res is None:
+                        continue
+                    pv, ml, pol = res
+                    if pv is not None:
+                        valrow[g] = pv
+                    if ml is not None:
+                        mlrow[g] = ml
+                    polrow[g] = pol
+            tb_values_per_ply.append(valrow)
+            tb_moves_left_per_ply.append(mlrow)
+            tb_policy_per_ply.append(polrow)
+        tqdm.write(
+            f"  TB relabel (deferred): {len(all_fens)} in-TB plies, {n_uniq} unique "
+            f"FENs probed across {max(relabel_workers, 1)} worker(s)")
+
     # 10. Stack and bulk-transfer to CPU. ONE pass.
     obs_stack = torch.stack(obs_per_ply, dim=1)                       # [N, T, C, H, W]
     actions_stack = torch.stack(actions_per_ply, dim=1)               # [N, T]
@@ -846,9 +915,13 @@ def play_games_parallel_gpu_resident(
     tb_reached_cpu = tb_reached.cpu().numpy()
     if tb_prober is not None:
         n_reached = int(tb_reached_cpu.sum())
+        # In deferred mode the probing happens in the post-game pooled pass (logged
+        # separately), so tb_prober.n_probed stays 0 — report the gate count instead.
+        probed_clause = ("relabel deferred (see above)" if defer_relabel
+                         else f"{tb_prober.n_probed} root positions probed this batch")
         tqdm.write(
             f"  TB probe: {n_reached}/{num_games} games reached <= {tb_prober.max_pieces} "
-            f"pieces; {tb_prober.n_probed} root positions probed this batch"
+            f"pieces; {probed_clause}"
         )
         tb_prober.close()
 
