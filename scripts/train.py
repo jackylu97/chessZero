@@ -231,6 +231,13 @@ def main():
                              "Needs --tb-gaviota-path + a moves-left head.")
     parser.add_argument("--tb-gaviota-path", type=str, default=None,
                         help="Directory of Gaviota .gtb.cp4 DTM tablebases (override config.tb_gaviota_path).")
+    parser.add_argument("--ml-slope", type=float, default=None,
+                        help="Moves-left MCTS utility slope: ml_term = sign(-Q)·clamp(ml_slope·child_m, "
+                             "max=ml_max_effect) (override config.ml_slope, preset 0.005). Larger = stronger "
+                             "per-move distance-to-mate steering. Raise ml_max_effect with it or it clips.")
+    parser.add_argument("--ml-max-effect", type=float, default=None,
+                        help="Cap on the moves-left MCTS utility magnitude (override config.ml_max_effect, "
+                             "preset 0.1). Raise alongside --ml-slope so the stronger slope isn't clipped.")
     parser.add_argument("--tb-steer-policy", action="store_true", default=False,
                         help="Restore the search-side DTZ value bias (policy steering) in _select. "
                              "OFF by default — Lc0-faithful: inject TB signal via relabels, not search.")
@@ -436,6 +443,10 @@ def main():
         config.tb_moves_left_weight = args.tb_moves_left_weight
     if args.tb_gaviota_path is not None:
         config.tb_gaviota_path = args.tb_gaviota_path
+    if args.ml_slope is not None:
+        config.ml_slope = args.ml_slope
+    if args.ml_max_effect is not None:
+        config.ml_max_effect = args.ml_max_effect
     if args.tb_steer_policy:
         config.tb_steer_policy = True
     if args.endgame_seed_frac is not None:
