@@ -466,6 +466,22 @@ class MuZeroConfig:
     ml_threshold: float = 0.3             # |raw_q| above which the utility engages
     ml_slope: float = 0.005               # per-ply effect before clipping
     ml_max_effect: float = 0.1            # clip magnitude (vs value_score in [0,1])
+    # Lc0 MLH utility: bonus uses (child_m − parent_m) PROGRESS, scaled by a smooth
+    # |Q| ramp above ml_threshold (factor = q_const + q_linear·q' + q_square·q'^2,
+    # q'=clamp((|Q|−thr)/(1−thr),0,1)). Lc0 production: thr 0.8, slope 0.0027, cap
+    # 0.0345, (0, 1.6521, −0.6521). Defaults below keep the bonus a tiebreak.
+    ml_q_const: float = 0.0
+    ml_q_linear: float = 1.6521
+    ml_q_square: float = -0.6521
+    # Auxiliary-head INPUT width. The default 1-plane 1×1 projection crushes the
+    # C-channel latent to a single map before the MLP, starving the head of the
+    # distance-to-mate signal that lives across channels (head→DTZ corr 0.035 vs
+    # MLP-on-full-latent 0.80). >1 widens it; blocks>0 adds pre-projection residual
+    # blocks. value head kept at 1 (Lc0 keeps WDL value simple); widen moves-left.
+    value_head_planes: int = 1
+    value_head_blocks: int = 0
+    moves_left_head_planes: int = 1
+    moves_left_head_blocks: int = 0
 
     # --- Root repetition-draw penalty (terminal-aware search, the AlphaZero
     # property MuZero's latent search lacks) ----------------------------------

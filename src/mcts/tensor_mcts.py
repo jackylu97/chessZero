@@ -234,6 +234,15 @@ class TensorMCTS:
         self._ml_threshold = float(getattr(config, "ml_threshold", 0.3))
         self._ml_slope = float(getattr(config, "ml_slope", 0.005))
         self._ml_max_effect = float(getattr(config, "ml_max_effect", 0.1))
+        # Lc0 MLH search-utility shape (src/search/classic/search.cc MEvaluator):
+        # the M-bonus is scaled by a smooth ramp of |Q| above the threshold,
+        # q' = max(0,|Q|-thr)/(1-thr), factor = a_const + a_lin*q' + a_sq*q'^2.
+        # With Lc0's defaults (a_const=0, a_lin=1.6521, a_sq=-0.6521) the factor
+        # rises 0→1 from threshold→|Q|=1, so the bonus is a pure tiebreak among
+        # already-near-certain wins and peaks at full conviction. Exposed for tuning.
+        self._ml_q_const = float(getattr(config, "ml_q_const", 0.0))
+        self._ml_q_linear = float(getattr(config, "ml_q_linear", 1.6521))
+        self._ml_q_square = float(getattr(config, "ml_q_square", -0.6521))
         self._ml_support = (getattr(network, "moves_left_support_size", 10)
                             if network is not None else 10)
         self._draw_score = float(getattr(config, "draw_score", 0.0))
@@ -1167,9 +1176,12 @@ class TensorMCTS:
 
             scores = prior_score + value_score
 
-            # MLH utility: among same-Q moves prefer the faster win (smaller child M)
-            # / slower loss, gated to |Q| > threshold. Only on expanded children
-            # (child_node_idx >= 0). Lives in the torch path only (not the Triton kernel).
+            # MLH utility (Lc0 MEvaluator::GetMUtility): a tiebreak among already-
+            # near-certain moves that prefers PROGRESS — a smaller child moves-left
+            # RELATIVE TO THE PARENT (child_m − parent_m < 0 = closer to the end).
+            # Gated to |Q| > threshold, capped tiny, and scaled by a smooth ramp of
+            # |Q| above the threshold so it never trades win-probability for speed.
+            # Only on expanded children. Torch path only (not the Triton kernel).
             if self._use_ml_utility:
                 child_idx = self.child_node_idx[arange_n, cur]  # [N, K] int32
                 ml_valid = child_idx >= 0
@@ -1178,10 +1190,21 @@ class TensorMCTS:
                     self.node_moves_left[arange_n.unsqueeze(1), child_idx.clamp(min=0).long()],
                     torch.zeros_like(value_score),
                 )
-                ml_gate = ml_valid & (raw_q.abs() > self._ml_threshold)
+                parent_m = self.node_moves_left[arange_n, cur].unsqueeze(1)  # [N, 1]
+                absq = raw_q.abs()
+                ml_gate = ml_valid & (absq > self._ml_threshold)
+                # Smooth |Q| ramp above threshold (0 at threshold → factor at |Q|=1).
+                denom = max(1.0 - self._ml_threshold, 1e-6)
+                qp = ((absq - self._ml_threshold) / denom).clamp(min=0.0, max=1.0)
+                qscale = self._ml_q_const + self._ml_q_linear * qp + self._ml_q_square * qp * qp
+                # delta < 0 ⇒ this move makes progress; *sign(-Q) makes that a bonus
+                # when winning (Q>0) and a penalty for dragging out a loss (Q<0).
+                delta = child_m - parent_m
+                m = torch.clamp(self._ml_slope * delta,
+                                min=-self._ml_max_effect, max=self._ml_max_effect)
                 ml_term = torch.where(
                     ml_gate,
-                    torch.sign(-raw_q) * torch.clamp(self._ml_slope * child_m, max=self._ml_max_effect),
+                    torch.sign(-raw_q) * m * qscale,
                     torch.zeros_like(value_score),
                 )
                 scores = scores + ml_term

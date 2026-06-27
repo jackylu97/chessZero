@@ -230,6 +230,8 @@ class PredictionNetwork(nn.Module):
         value_head_type: str = "support",
         value_head_init_std: float = 0.0,
         policy_head_type: str = "flat",
+        value_head_planes: int = 1,
+        value_head_blocks: int = 0,
     ):
         super().__init__()
         self.value_support_size = value_support_size
@@ -264,13 +266,26 @@ class PredictionNetwork(nn.Module):
             value_out = 3
         else:
             raise ValueError(f"Unknown value_head_type: {value_head_type!r}")
-        self.value_head = nn.Sequential(
-            nn.Conv2d(hidden_planes, 1, 1, bias=False),
-            norm_layer(1, (latent_h, latent_w)),
+        # Value head input width. The default 1-plane 1×1 projection crushes the
+        # full C-channel latent to a single 8×8 map BEFORE the MLP — a severe
+        # bottleneck that empirically leaves the head unable to extract the
+        # distance-to-mate (DTZ/DTM) signal the latent demonstrably contains
+        # (MLP-on-full-latent reads DTZ at corr 0.80, the 1-plane head at 0.035).
+        # value_head_planes>1 widens the projection; value_head_blocks>0 adds
+        # pre-projection residual blocks at hidden width for dedicated capacity.
+        vhp = int(value_head_planes)
+        value_layers: list[nn.Module] = [
+            ResidualBlock(hidden_planes, (latent_h, latent_w))
+            for _ in range(int(value_head_blocks))
+        ]
+        value_layers += [
+            nn.Conv2d(hidden_planes, vhp, 1, bias=False),
+            norm_layer(vhp, (latent_h, latent_w)),
             nn.ReLU(),
             nn.Flatten(),
-            mlp_head(latent_h * latent_w, fc_hidden, value_out),
-        )
+            mlp_head(vhp * latent_h * latent_w, fc_hidden, value_out),
+        ]
+        self.value_head = nn.Sequential(*value_layers)
         # Value-head output init. Default (std=0.0) zero-inits the last linear —
         # the standard MuZero/LightZero stability trick. BUT zero weights make the
         # head's Jacobian w.r.t. its input zero (grad_to_input = Wᵀ·grad_out = 0),
@@ -389,16 +404,26 @@ class MovesLeftHead(nn.Module):
     """
 
     def __init__(self, hidden_planes: int, latent_h: int, latent_w: int,
-                 fc_hidden: int, support_size: int):
+                 fc_hidden: int, support_size: int,
+                 head_planes: int = 1, head_blocks: int = 0):
         super().__init__()
         self.support_size = support_size
-        self.head = nn.Sequential(
-            nn.Conv2d(hidden_planes, 1, 1, bias=False),
-            norm_layer(1, (latent_h, latent_w)),
+        # Same input-width fix as the value head: the distance-to-mate (DTM)
+        # target this head is trained on lives across the latent's channels, so a
+        # 1-plane projection starves it. head_planes>1 widens it.
+        hp = int(head_planes)
+        layers: list[nn.Module] = [
+            ResidualBlock(hidden_planes, (latent_h, latent_w))
+            for _ in range(int(head_blocks))
+        ]
+        layers += [
+            nn.Conv2d(hidden_planes, hp, 1, bias=False),
+            norm_layer(hp, (latent_h, latent_w)),
             nn.ReLU(),
             nn.Flatten(),
-            mlp_head(latent_h * latent_w, fc_hidden, 2 * support_size + 1),
-        )
+            mlp_head(hp * latent_h * latent_w, fc_hidden, 2 * support_size + 1),
+        ]
+        self.head = nn.Sequential(*layers)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         return self.head(hidden_state)  # (B, 2*support_size + 1) logits
@@ -472,6 +497,10 @@ class MuZeroNetwork(nn.Module):
         moves_left_support_size: int = 10,
         use_material_head: bool = False,
         material_head_support_size: int = 8,
+        value_head_planes: int = 1,
+        value_head_blocks: int = 0,
+        moves_left_head_planes: int = 1,
+        moves_left_head_blocks: int = 0,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -504,6 +533,8 @@ class MuZeroNetwork(nn.Module):
             value_head_type=value_head_type,
             value_head_init_std=value_head_init_std,
             policy_head_type=policy_head_type,
+            value_head_planes=value_head_planes,
+            value_head_blocks=value_head_blocks,
         )
 
         # Inverse-dynamics head (ICM): predicts a_k from (h_k, h_{k+1}). Forces the
@@ -521,6 +552,7 @@ class MuZeroNetwork(nn.Module):
         if use_moves_left:
             self.moves_left_head = MovesLeftHead(
                 hidden_planes, latent_h, latent_w, fc_hidden, moves_left_support_size,
+                head_planes=moves_left_head_planes, head_blocks=moves_left_head_blocks,
             )
         else:
             self.moves_left_head = None

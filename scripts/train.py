@@ -49,6 +49,11 @@ def main():
                         help="Run ID (default: auto-generate YYYY_MM_DD_NNNN). "
                              "Pass an existing ID to continue writing into that run's dirs.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--warmstart-body", type=str, default=None,
+                        help="Warm-start the body (+ shape-matching heads) from a checkpoint whose "
+                             "architecture differs (e.g. after widening the moves-left head). Loads model "
+                             "weights non-strict (changed heads keep fresh init), keeps the buffer and step, "
+                             "fresh optimizer. Mutually exclusive with --resume.")
     parser.add_argument("--sample-k", type=int, default=None,
                         help="Sampled MuZero K. None = deterministic top-K (legacy).")
     parser.add_argument("--use-gumbel", action="store_true",
@@ -237,7 +242,20 @@ def main():
                              "per-move distance-to-mate steering. Raise ml_max_effect with it or it clips.")
     parser.add_argument("--ml-max-effect", type=float, default=None,
                         help="Cap on the moves-left MCTS utility magnitude (override config.ml_max_effect, "
-                             "preset 0.1). Raise alongside --ml-slope so the stronger slope isn't clipped.")
+                             "preset 0.1). Lc0 production uses 0.0345 (a small tiebreak).")
+    parser.add_argument("--ml-threshold", type=float, default=None,
+                        help="|Q| above which the moves-left utility engages (override config.ml_threshold, "
+                             "preset 0.3). Lc0 uses 0.8 so the speed bonus only nudges among already-winning "
+                             "moves and never trades away the win.")
+    parser.add_argument("--moves-left-head-planes", type=int, default=None,
+                        help="Moves-left head input projection width (override config.moves_left_head_planes, "
+                             "preset 1). >1 widens the 1×1 bottleneck so the head can extract DTM from the "
+                             "latent (latent has DTZ at corr 0.80 but the 1-plane head reads 0.035).")
+    parser.add_argument("--moves-left-head-blocks", type=int, default=None,
+                        help="Pre-projection residual blocks on the moves-left head (override "
+                             "config.moves_left_head_blocks, preset 0).")
+    parser.add_argument("--value-head-planes", type=int, default=None,
+                        help="Value head input projection width (override config.value_head_planes, preset 1).")
     parser.add_argument("--tb-steer-policy", action="store_true", default=False,
                         help="Restore the search-side DTZ value bias (policy steering) in _select. "
                              "OFF by default — Lc0-faithful: inject TB signal via relabels, not search.")
@@ -465,6 +483,14 @@ def main():
         config.ml_slope = args.ml_slope
     if args.ml_max_effect is not None:
         config.ml_max_effect = args.ml_max_effect
+    if args.ml_threshold is not None:
+        config.ml_threshold = args.ml_threshold
+    if args.moves_left_head_planes is not None:
+        config.moves_left_head_planes = args.moves_left_head_planes
+    if args.moves_left_head_blocks is not None:
+        config.moves_left_head_blocks = args.moves_left_head_blocks
+    if args.value_head_planes is not None:
+        config.value_head_planes = args.value_head_planes
     if args.tb_steer_policy:
         config.tb_steer_policy = True
     if args.tb_policy_weight is not None:
@@ -577,6 +603,10 @@ def main():
         moves_left_support_size=getattr(config, "moves_left_support_size", 10),
         use_material_head=getattr(config, "use_material_head", False),
         material_head_support_size=getattr(config, "material_head_support_size", 8),
+        value_head_planes=getattr(config, "value_head_planes", 1),
+        value_head_blocks=getattr(config, "value_head_blocks", 0),
+        moves_left_head_planes=getattr(config, "moves_left_head_planes", 1),
+        moves_left_head_blocks=getattr(config, "moves_left_head_blocks", 0),
     )
 
     trainer = MuZeroTrainer(
@@ -586,6 +616,8 @@ def main():
         checkpoints_dir=args.checkpoints_dir,
     )
 
+    if args.warmstart_body:
+        trainer.load_body_warmstart(args.warmstart_body)
     if args.resume:
         trainer.load_checkpoint(args.resume)
         if args.reset_injection_cursor:

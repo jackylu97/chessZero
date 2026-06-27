@@ -1626,6 +1626,44 @@ class MuZeroTrainer:
                 f"re-pass --warmstart-path on resume)"
             )
 
+    def load_body_warmstart(self, checkpoint_path: str):
+        """Warm-start the BODY (+ any shape-matching heads) from a checkpoint whose
+        architecture differs from the current model — e.g. after widening the
+        moves-left head's input. Loads model weights with strict=False (matching
+        keys transfer: representation/dynamics/policy/value; changed heads keep their
+        fresh init), KEEPS the replay buffer (data is model-independent) and the step
+        counter (so anneals/schedules continue), but uses a FRESH optimizer/scheduler
+        (stale moments for reinitialized heads would corrupt their early training)."""
+        from src.config import MuZeroConfig
+        torch.serialization.add_safe_globals([MuZeroConfig])
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        ckpt_sd = ckpt["model_state_dict"]
+        model_sd = self.network.state_dict()
+        # Transfer only keys present in BOTH with MATCHING shape. Shape-changed keys
+        # (e.g. a widened head's convs) error even under strict=False, so filter them
+        # out explicitly; they keep their fresh init.
+        transfer = {k: v for k, v in ckpt_sd.items()
+                    if k in model_sd and model_sd[k].shape == v.shape}
+        fresh = sorted({k.split(".")[0] for k in model_sd if k not in transfer})
+        self.network.load_state_dict(transfer, strict=False)
+        print(f"Body warm-start from {checkpoint_path}:")
+        print(f"  transferred {len(transfer)}/{len(model_sd)} tensors; "
+              f"FRESH (absent or shape-changed): {fresh or 'none'}")
+        self.global_step = int(ckpt.get("step", 0))
+        self._injection_loaded = int(ckpt.get("injection_loaded", 0))
+        buf_path = Path(checkpoint_path).with_suffix(".buf")
+        if buf_path.exists():
+            try:
+                self.replay_buffer.load(buf_path, game=self.game)
+                print(f"  loaded replay buffer ({len(self.replay_buffer)} games)")
+            except (EOFError, pickle.UnpicklingError) as e:
+                print(f"  WARNING: {buf_path.name} corrupt ({type(e).__name__}); empty buffer")
+                self.replay_buffer.buffer = []
+                self.replay_buffer._priorities = []
+        else:
+            print("  no saved buffer found — starting with empty buffer")
+        print(f"  resuming at step {self.global_step} with a FRESH optimizer/scheduler")
+
     def load_checkpoint(self, checkpoint_path: str):
         """Load model, optimizer, scheduler, and replay buffer from a checkpoint."""
         from src.config import MuZeroConfig
