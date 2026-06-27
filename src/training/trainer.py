@@ -424,7 +424,11 @@ class MuZeroTrainer:
             for g in games:
                 if g.game_outcome != 0:
                     continue
-                b = _chess.Board(); ok = True
+                # Replay from the game's OWN start (seeded endgame games begin from a
+                # start_fen, not the standard position) — else every move is illegal
+                # from move 1 and the game falls into the plycap residual, mislabeling
+                # all seeded draws as ply-cap when they actually end by 3fold/insufficient.
+                b = _chess.Board(getattr(g, "start_fen", None) or _chess.STARTING_FEN); ok = True
                 try:
                     for a in g.actions:
                         mv = _a2m(int(a), b)
