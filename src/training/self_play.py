@@ -173,6 +173,21 @@ def get_warmstart_sample_frac(training_step: int, config) -> float:
     return f_init + (f_final - f_init) * t
 
 
+def get_tb_policy_weight(training_step: int, config) -> float:
+    """Annealed soft-TB-policy-relabel weight. Linearly decays ``tb_policy_weight`` →
+    ``tb_policy_weight_final`` over [0, ``tb_policy_anneal_frac`` · training_steps]; with
+    anneal_frac == 0 it's constant. The TB policy boost is a teacher that should FADE so
+    the model internalizes conversion rather than leaning on it (probe-is-a-crutch)."""
+    w_init = float(getattr(config, "tb_policy_weight", 0.0))
+    frac = float(getattr(config, "tb_policy_anneal_frac", 0.0))
+    if frac <= 0.0 or w_init == 0.0:
+        return w_init
+    w_final = float(getattr(config, "tb_policy_weight_final", 0.0))
+    total = max(1, int(getattr(config, "training_steps", 1)))
+    t = min(1.0, max(0.0, training_step / (frac * total)))
+    return w_init + (w_final - w_init) * t
+
+
 def get_material_head_weight(training_step: int, config) -> float:
     """Annealed aux-loss weight for the material-margin head. Shares the
     ``material_value_anneal_frac`` timeline with the value-target blend so the
@@ -594,7 +609,12 @@ def play_games_parallel_gpu_resident(
             draw_score=float(getattr(config, "draw_score", 0.0)),
             value_dtz_shape=float(getattr(config, "tb_value_dtz_shape", 0.5)),
             gaviota_path=getattr(config, "tb_gaviota_path", None),
+            policy_win_thresh=float(getattr(config, "tb_policy_win_thresh", 0.5)),
+            policy_temp=float(getattr(config, "tb_policy_temp", 0.3)),
         )
+    # Build the soft TB policy target when the policy relabel is on (needs per-move
+    # _classify). Independent of search-side steering (tb_steer_policy).
+    tb_policy_relabel = bool(float(getattr(config, "tb_policy_weight", 0.0)) > 0.0)
 
     # Cap loop length so we always have a static upper bound; ChessGame.max_plies
     # does the in-engine termination, alive_mask handles per-game stopping.
@@ -633,6 +653,7 @@ def play_games_parallel_gpu_resident(
     legal_masks_per_ply: list[torch.Tensor] = []   # [T] of [N, A] bool
     tb_values_per_ply: list[torch.Tensor] = []     # [T] of [N] float32 (NaN if not in TB)
     tb_moves_left_per_ply: list[torch.Tensor] = [] # [T] of [N] float32 |DTM| (NaN if draw/not in TB)
+    tb_policy_per_ply: list = []                    # [T] of [N] sparse soft policy (idx[],w[]) or None
 
     alive_mask = torch.ones(num_games, dtype=torch.bool, device=device)
     game_outcome = torch.zeros(num_games, dtype=torch.int32, device=device)
@@ -695,10 +716,11 @@ def play_games_parallel_gpu_resident(
             # rejected) and relies on on-policy self-play + value/moves-left relabel.
             # tb_steer_policy=True restores the old soft search bias.
             steer_enabled = bool(getattr(config, "tb_steer_policy", False))
-            # per_move=False skips the ~30 probes/position _classify when steering is
-            # off (the dominant self-play CPU cost) — only the relabel targets are kept.
+            # per_move runs the ~30-probe _classify; needed by BOTH search-side steering
+            # AND the soft policy relabel. Skipped otherwise (dominant self-play CPU cost).
+            need_per_move = steer_enabled or tb_policy_relabel
             root_tb_value = (
-                tb_prober.root_move_values(state, legal_mask, per_move=steer_enabled)
+                tb_prober.root_move_values(state, legal_mask, per_move=need_per_move)
                 if tb_prober is not None else None
             )
             if tb_prober is not None and tb_prober.last_in_tb is not None:
@@ -748,10 +770,16 @@ def play_games_parallel_gpu_resident(
             tb_moves_left_per_ply.append(
                 tb_ml.to(torch.float32) if tb_ml is not None
                 else torch.full((num_games,), float("nan"), device=device, dtype=torch.float32))
+            # Soft TB policy per game (Python list of (idx[],w[])/None), or all-None if
+            # per_move wasn't run this ply (steering+relabel off).
+            tb_policy_per_ply.append(
+                tb_prober.last_position_policy if tb_prober.last_position_policy is not None
+                else [None] * num_games)
         else:
             nanrow = torch.full((num_games,), float("nan"), device=device, dtype=torch.float32)
             tb_values_per_ply.append(nanrow)
             tb_moves_left_per_ply.append(nanrow)
+            tb_policy_per_ply.append([None] * num_games)
 
         # 8. Subtree reuse: advance the MCTS root to the chosen action's
         # subtree, in preparation for the next ply. Only when the prior
@@ -857,6 +885,11 @@ def play_games_parallel_gpu_resident(
         tbml_row = tb_moves_left_cpu[g, :L]
         if np.isfinite(tbml_row).any():
             h_g.tablebase_moves_left = [float(v) for v in tbml_row]
+        # Per-ply soft TB policy (sparse). tb_policy_per_ply is [T] of [N] lists.
+        if tb_policy_per_ply:
+            pol_row = [tb_policy_per_ply[t][g] for t in range(L)]
+            if any(p is not None for p in pol_row):
+                h_g.tablebase_policy = pol_row
         h_g.observations.append(torch.from_numpy(final_obs_cpu[g]).clone())
         histories.append(h_g)
 

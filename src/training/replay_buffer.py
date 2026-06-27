@@ -110,6 +110,13 @@ class GameHistory:
     # MOVES-LEFT target at TB plies (tb_moves_left_weight) — Lc0 Gaviota MLH rescoring,
     # the distance gradient the WDL value head provably can't supply. Serialized.
     tablebase_moves_left: list[float] = field(default_factory=list)
+    # Per-ply SOFT TB policy target (idx int32[], weight float32[]) over the
+    # win-PRESERVING moves, or None where the ply was not in TB range / had no winning
+    # move. When populated, sample_batch blends it into the policy target at TB plies
+    # (tb_policy_weight) — the Lc0 DTZ policy boost, safe for us because we don't run
+    # KLDGain (see kld_adaptive_search_analysis). Annealed. Fixes the policy prior that
+    # mass-loads the win-throwing move (move-selection diagnosis 2026-06-27).
+    tablebase_policy: list = field(default_factory=list)
     # Optional starting position (FEN) for games that do NOT begin from the
     # standard initial position — e.g. endgame-seed curriculum games. When set,
     # from_compact_dict replays actions from this FEN instead of game.reset().
@@ -194,6 +201,20 @@ class GameHistory:
             d["tablebase_values"] = np.asarray(self.tablebase_values, dtype=np.float32)
         if self.tablebase_moves_left:
             d["tablebase_moves_left"] = np.asarray(self.tablebase_moves_left, dtype=np.float32)
+        if self.tablebase_policy and any(p is not None for p in self.tablebase_policy):
+            # Flat encoding of the per-ply sparse soft policy: lengths[ply]=0 => None.
+            lengths, flat_idx, flat_w = [], [], []
+            for p in self.tablebase_policy:
+                if p is None:
+                    lengths.append(0)
+                else:
+                    idx, w = p
+                    lengths.append(len(idx))
+                    flat_idx.append(np.asarray(idx, dtype=np.int32))
+                    flat_w.append(np.asarray(w, dtype=np.float32))
+            d["tbp_lengths"] = np.asarray(lengths, dtype=np.int32)
+            d["tbp_idx"] = (np.concatenate(flat_idx) if flat_idx else np.zeros(0, dtype=np.int32))
+            d["tbp_w"] = (np.concatenate(flat_w) if flat_w else np.zeros(0, dtype=np.float32))
         if self.start_fen:
             d["start_fen"] = self.start_fen
         if self.reanalyze_count:
@@ -227,6 +248,19 @@ class GameHistory:
         tbm = d.get("tablebase_moves_left")
         if tbm is not None and len(tbm) > 0:
             gh.tablebase_moves_left = [float(v) for v in tbm]
+        tbp_lengths = d.get("tbp_lengths")
+        if tbp_lengths is not None and len(tbp_lengths) > 0:
+            tbp_idx = np.asarray(d["tbp_idx"], dtype=np.int32)
+            tbp_w = np.asarray(d["tbp_w"], dtype=np.float32)
+            pol, off = [], 0
+            for L in tbp_lengths:
+                L = int(L)
+                if L == 0:
+                    pol.append(None)
+                else:
+                    pol.append((tbp_idx[off:off + L].copy(), tbp_w[off:off + L].copy()))
+                    off += L
+            gh.tablebase_policy = pol
         gh.draw_by_repetition = bool(d.get("draw_by_repetition", False))
         gh.draw_by_no_progress = bool(d.get("draw_by_no_progress", False))
 
@@ -304,7 +338,8 @@ class GameHistory:
                     repetition_penalty_decay: float = 0.0,
                     material_value_weight: float = 0.0,
                     material_value_scale: float = 5.0,
-                    tb_value_weight: float = 0.0):
+                    tb_value_weight: float = 0.0,
+                    tb_policy_weight: float = 0.0):
         """Create training target for a given position.
 
         Args:
@@ -554,6 +589,25 @@ class GameHistory:
                         policy = padded
                     elif len(policy) > action_space_size:
                         policy = policy[:action_space_size]
+                # Soft TB policy relabel (Lc0 DTZ boost, safe sans KLDGain): blend the
+                # win-preserving distribution into the visit policy at TB plies —
+                # (1-w)*visits + w*tb. Only where a real visit policy exists (skip the
+                # terminal-zeros case so we inject no spurious gradient).
+                if (tb_policy_weight > 0.0 and self.tablebase_policy
+                        and idx < len(self.tablebase_policy)
+                        and self.tablebase_policy[idx] is not None
+                        and float(policy.sum()) > 0.0):
+                    tbp_idx, tbp_w = self.tablebase_policy[idx]
+                    tbp_idx = np.asarray(tbp_idx, dtype=np.int64)
+                    valid = tbp_idx < action_space_size
+                    if valid.any():
+                        tb_dense = np.zeros(action_space_size, dtype=np.float32)
+                        tb_dense[tbp_idx[valid]] = np.asarray(tbp_w, dtype=np.float32)[valid]
+                        s = float(tb_dense.sum())
+                        if s > 0.0:
+                            tb_dense /= s
+                            policy = ((1.0 - tb_policy_weight) * policy
+                                      + tb_policy_weight * tb_dense).astype(np.float32)
                 policies.append(policy)
                 last_obs = self._stack_history(idx, history_frames)
                 obs_list.append(last_obs)
@@ -807,6 +861,7 @@ class ReplayBuffer:
         material_value_scale: float = 5.0,
         tb_value_weight: float = 0.0,
         tb_moves_left_weight: float = 0.0,
+        tb_policy_weight: float = 0.0,
         build_legal_masks: bool = False,
         build_material_target: bool = False,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
@@ -912,6 +967,8 @@ class ReplayBuffer:
                 repetition_penalty_decay=repetition_penalty_decay,
                 material_value_weight=material_value_weight,
                 material_value_scale=material_value_scale,
+                tb_value_weight=tb_value_weight,
+                tb_policy_weight=tb_policy_weight,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)

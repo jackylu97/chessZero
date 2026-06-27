@@ -74,7 +74,8 @@ class SyzygyRootProber:
 
     def __init__(self, path: str, max_pieces: int = 5, dtz_weight: float = 0.05,
                  draw_score: float = 0.0, value_dtz_shape: float = 0.5,
-                 gaviota_path: str | None = None):
+                 gaviota_path: str | None = None,
+                 policy_win_thresh: float = 0.5, policy_temp: float = 0.3):
         self.tb = chess.syzygy.open_tablebase(path)
         # Gaviota DTM tablebase (distance-to-MATE) for the moves-left target.
         # Syzygy gives DTZ (distance-to-zeroing), NOT DTM, so the moves-left head
@@ -97,13 +98,22 @@ class SyzygyRootProber:
         # above a draw). This is what gives the VALUE head the progress gradient it
         # lacks (measured corr(value,-DTZ)=-0.34 without it).
         self.value_dtz_shape = float(value_dtz_shape)
+        # Per-move SOFT POLICY target (Lc0 rejected the DTZ policy boost only because
+        # of its KLDGain search-stopper, which we don't run): build a distribution with
+        # mass on the win-PRESERVING moves (per-move value > policy_win_thresh),
+        # softmax-weighted by DTZ rank (policy_temp), and ~0 on the win-throwing moves.
+        # Blended into the policy TARGET in make_target (not the search) and annealed.
+        self.policy_win_thresh = float(policy_win_thresh)
+        self.policy_temp = float(policy_temp)
         self._cache: dict[str, dict[int, float]] = {}
         self._posval_cache: dict[str, float] = {}
         self._dtm_cache: dict[str, float] = {}
+        self._polcache: dict[str, object] = {}
         self.last_in_tb = None   # [N] bool — games in TB range on the most recent call
         self.last_best_action = None  # [N] long — DTZ-optimal winning action, -1 if none
         self.last_position_value = None  # [N] float — STM-POV DTZ-shaped position value, NaN if not in TB
         self.last_position_moves_left = None  # [N] float — |DTM| plies-to-mate (Gaviota), NaN if draw/not in TB
+        self.last_position_policy = None  # [N] list — soft TB policy (idx[],w[]) per game, None if not in TB / no win move
         self.n_probed = 0        # cumulative count of root positions probed
 
     def close(self):
@@ -157,9 +167,11 @@ class SyzygyRootProber:
         if not idxs:
             self.last_position_value = posval.to(dev)
             self.last_position_moves_left = posml.to(dev)
+            self.last_position_policy = None
             return out.to(dev)
 
         best = torch.full((N,), -1, dtype=torch.long)
+        pol = [None] * N if per_move else None  # soft TB policy per game
         legal_cpu = legal_mask.cpu() if per_move else None
         for i in idxs:
             board = state_to_board(state, i)
@@ -167,7 +179,8 @@ class SyzygyRootProber:
                 continue
             key = board.fen()
             if per_move:
-                # Per-move classification — ONLY consumed by policy steering.
+                # Per-move classification — consumed by policy steering AND the soft
+                # policy relabel.
                 cached = self._cache.get(key)
                 if cached is None:
                     cached = self._classify(board, legal_cpu[i])
@@ -178,6 +191,12 @@ class SyzygyRootProber:
                     ba, bv = max(cached.items(), key=lambda kv: kv[1])
                     if bv > 0.0:
                         best[i] = int(ba)
+                # Soft policy target (win-preserving moves, DTZ-softmax), cached by FEN.
+                p = self._polcache.get(key)
+                if p is None and key not in self._polcache:
+                    p = self._classify_to_policy(cached)
+                    self._polcache[key] = p
+                pol[i] = p
             # Per-position value target (DTZ-shaped, STM POV) — always needed for the
             # value relabel. board is unmutated by the probes (no push/pop here).
             pv = self._posval_cache.get(key)
@@ -194,7 +213,24 @@ class SyzygyRootProber:
         self.last_best_action = best.to(dev)
         self.last_position_value = posval.to(dev)
         self.last_position_moves_left = posml.to(dev)
+        self.last_position_policy = pol
         return out.to(dev)
+
+    def _classify_to_policy(self, cached: dict[int, float]):
+        """Soft policy target from the per-move TB values: mass on win-PRESERVING moves
+        (value > policy_win_thresh), softmax-weighted by DTZ rank (policy_temp), and ~0
+        on the win-throwing moves. Returns (idx int32[], weight float32[]) summing to 1,
+        or None if there is no winning move (then don't relabel that ply)."""
+        import numpy as np
+        wins = [(a, v) for a, v in cached.items() if v > self.policy_win_thresh]
+        if not wins:
+            return None
+        acts = np.fromiter((a for a, _ in wins), dtype=np.int32, count=len(wins))
+        vals = np.fromiter((v for _, v in wins), dtype=np.float32, count=len(wins))
+        z = (vals - vals.max()) / max(self.policy_temp, 1e-6)
+        w = np.exp(z)
+        w /= w.sum()
+        return acts, w.astype(np.float32)
 
     def _position_value(self, board: chess.Board) -> float:
         """STM-relative tablebase value of the POSITION itself, in [-1, 1], for

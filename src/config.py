@@ -510,6 +510,19 @@ class MuZeroConfig:
     # and inject the TB signal only via the value + moves-left relabels. True restores
     # the soft search bias (needs tb_root_probe to build the prober).
     tb_steer_policy: bool = False
+    # Soft TB POLICY relabel (the Lc0 DTZ policy boost — safe for us because we don't run
+    # KLDGain, the only reason Lc0 disabled it; see kld_adaptive_search_analysis). When > 0,
+    # blends a soft distribution over the win-PRESERVING moves into the policy TARGET at TB
+    # plies: (1-w)*visits + w*tb_policy. Directly fixes the policy prior that mass-loads the
+    # win-throwing move (move-selection diagnosis 2026-06-27). Annealed to *_final over
+    # tb_policy_anneal_frac so the teacher fades (avoids the probe-is-a-crutch trap). Needs
+    # tb_root_probe (per-move _classify). win_thresh splits winning moves from drawn/losing
+    # ones; temp sharpens the DTZ-softmax among winners.
+    tb_policy_weight: float = 0.0
+    tb_policy_weight_final: float = 0.0
+    tb_policy_anneal_frac: float = 0.0
+    tb_policy_win_thresh: float = 0.5
+    tb_policy_temp: float = 0.3
     # Endgame SEEDING (on-policy curriculum, gpu-resident path): a fraction of each
     # self-play round starts from tablebase endgame FENs sampled from the archive, the
     # model plays them out (no random opening; relabeled with value+DTM truth). Constant

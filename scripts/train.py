@@ -241,6 +241,15 @@ def main():
     parser.add_argument("--tb-steer-policy", action="store_true", default=False,
                         help="Restore the search-side DTZ value bias (policy steering) in _select. "
                              "OFF by default — Lc0-faithful: inject TB signal via relabels, not search.")
+    parser.add_argument("--tb-policy-weight", type=float, default=None,
+                        help="Soft TB POLICY relabel weight (Lc0 DTZ policy boost, safe sans KLDGain): "
+                             "blend a win-preserving distribution into the policy TARGET at TB plies, "
+                             "(1-w)*visits + w*tb (override config.tb_policy_weight, preset 0=off). Needs --tb-root-probe.")
+    parser.add_argument("--tb-policy-weight-final", type=float, default=None,
+                        help="Final TB policy-relabel weight after annealing (override config.tb_policy_weight_final).")
+    parser.add_argument("--tb-policy-anneal-frac", type=float, default=None,
+                        help="Fraction of training over which tb_policy_weight decays to its final "
+                             "(override config.tb_policy_anneal_frac; 0=constant). Fade the teacher to avoid crutch.")
     parser.add_argument("--endgame-seed-frac", type=float, default=None,
                         help="Fraction of each self-play round seeded from tablebase endgame FENs "
                              "(on-policy curriculum; override config.endgame_seed_frac, preset 0=off).")
@@ -449,6 +458,12 @@ def main():
         config.ml_max_effect = args.ml_max_effect
     if args.tb_steer_policy:
         config.tb_steer_policy = True
+    if args.tb_policy_weight is not None:
+        config.tb_policy_weight = args.tb_policy_weight
+    if args.tb_policy_weight_final is not None:
+        config.tb_policy_weight_final = args.tb_policy_weight_final
+    if args.tb_policy_anneal_frac is not None:
+        config.tb_policy_anneal_frac = args.tb_policy_anneal_frac
     if args.endgame_seed_frac is not None:
         config.endgame_seed_frac = args.endgame_seed_frac
     if args.endgame_seed_archive is not None:

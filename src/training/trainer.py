@@ -25,7 +25,7 @@ from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar
 from .replay_buffer import ReplayBuffer, _iter_shard_games, _shard_record_count, _sparsify_policy
 from .representation_probe import compute_repr_metrics
 from .self_play import (run_self_play, get_material_value_weight, get_material_head_weight,
-                        get_warmstart_sample_frac)
+                        get_warmstart_sample_frac, get_tb_policy_weight)
 
 
 def _negative_cosine_similarity(p: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -900,6 +900,7 @@ class MuZeroTrainer:
                 material_value_scale=float(getattr(self.config, "material_value_scale", 5.0)),
                 tb_value_weight=float(getattr(self.config, "tb_value_weight", 0.0)),
                 tb_moves_left_weight=float(getattr(self.config, "tb_moves_left_weight", 0.0)),
+                tb_policy_weight=get_tb_policy_weight(self.global_step, self.config),
                 build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
                 build_material_target=bool(getattr(self.config, "use_material_head", False)),
             )
