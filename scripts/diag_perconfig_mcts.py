@@ -17,6 +17,7 @@ DEV="cuda"; cfg=get_config("chess_small"); game=ChessGame(); AS=game.action_spac
 gg=GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
 import os
 CKPT=os.environ.get("CKPT","checkpoints/tb5_seq_ml.pt"); ATTN=os.environ.get("USE_ATTENTION","0")=="1"
+SMOL=os.environ.get("USE_SMOLGEN","1")=="1"; PREDATTN=os.environ.get("USE_PRED_ATTENTION","0")=="1"
 N_WON=400; MAX_PLIES=80; SIMS=200
 net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS, hidden_planes=cfg.hidden_planes,
     num_blocks=cfg.num_residual_blocks, latent_h=cfg.latent_h, latent_w=cfg.latent_w, input_h=game.board_size[0],
@@ -27,9 +28,15 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     draw_score=0.0, policy_head_type=cfg.policy_head_type, use_material_head=False,
     use_moves_left=True, moves_left_support_size=cfg.moves_left_support_size,
     moves_left_head_planes=16, moves_left_head_blocks=1,
-    use_repr_attention=ATTN, attn_layers=4, attn_heads=4, use_smolgen=True).to(DEV)
-net.load_state_dict(torch.load(CKPT, map_location=DEV)["model_state_dict"]); net.eval()
-print(f"loaded {CKPT}  (rep={'attn' if ATTN else 'conv'})", flush=True)
+    use_repr_attention=ATTN, attn_layers=4, attn_heads=4, use_smolgen=SMOL,
+    use_pred_attention=PREDATTN, pred_attn_layers=2).to(DEV)
+# strict=False: the checkpoint may carry training-only heads (projection/predictor/inverse)
+# that the inference backbone lacks; those are ignored. Missing keys => arch mismatch (fatal).
+_res=net.load_state_dict(torch.load(CKPT, map_location=DEV)["model_state_dict"], strict=False)
+assert not _res.missing_keys, f"ARCH MISMATCH, missing keys: {_res.missing_keys[:6]}"
+net.eval()
+print(f"loaded {CKPT}  (rep={'attn' if ATTN else 'conv'} smol={SMOL} predattn={PREDATTN}); "
+      f"ignored {len(_res.unexpected_keys)} training-only keys", flush=True)
 te=pickle.load(open("data/tb5_test.pkl","rb")); te_fen=[x[0] for x in te]; te_v=np.array([x[1] for x in te])
 
 def encode(fens):

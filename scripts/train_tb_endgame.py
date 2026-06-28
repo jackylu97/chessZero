@@ -18,13 +18,20 @@ from src.model.utils import scalar_transform, scalar_to_support, inverse_scalar_
 
 DEV="cuda"; cfg=get_config("chess_small"); game=ChessGame(); AS=game.action_space_size; NF=cfg.history_frames
 K=5; gg=GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
-STEPS=30000; B=384; ML_W=float(cfg.moves_left_loss_weight)
+STEPS=int(os.environ.get("STEPS","30000")); B=384; ML_W=float(cfg.moves_left_loss_weight)
 EVAL_CHEAP=1000; EVAL_MCTS=3000; CKPT_INT=6000; N_MCTS=300; MAX_PLIES=80; SIMS=200
-ATTN=os.environ.get("USE_ATTENTION","0")=="1"    # smolgen attention rep
-CONS=os.environ.get("USE_CONSISTENCY","0")=="1"  # EfficientZero SimSiam consistency loss (align dynamics latent -> repr(next))
-INV=os.environ.get("USE_INVERSE","0")=="1"       # ICM inverse-dynamics loss (recover action from h_k,h_k+1)
+ATTN=os.environ.get("USE_ATTENTION","0")=="1"        # smolgen attention representation
+SMOL=os.environ.get("USE_SMOLGEN","1")=="1"          # smolgen on/off (only matters with ATTN)
+PREDATTN=os.environ.get("USE_PRED_ATTENTION","0")=="1"  # shared attention body in the policy/value model
+CONS=os.environ.get("USE_CONSISTENCY","0")=="1"      # EfficientZero SimSiam consistency loss
+INV=os.environ.get("USE_INVERSE","0")=="1"           # ICM inverse-dynamics loss
 CONS_W=float(cfg.consistency_loss_weight); INV_W=float(cfg.inverse_dynamics_loss_weight)
-TAG=("attn" if ATTN else "conv")+("_ssl" if CONS else "")+("_inv" if INV else "")
+_parts=["attn" if ATTN else "conv"]
+if ATTN and not SMOL: _parts.append("nosmol")
+if PREDATTN: _parts.append("predattn")
+if CONS: _parts.append("ssl")
+if INV: _parts.append("inv")
+TAG="_".join(_parts)
 def _neg_cos(p, z):   # SimSiam negative cosine, per-sample
     p=F.normalize(p, dim=-1); z=F.normalize(z, dim=-1); return -(p*z).sum(-1)
 print("loading sequences...", flush=True)
@@ -42,10 +49,11 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     use_moves_left=True, moves_left_support_size=cfg.moves_left_support_size,
     moves_left_head_planes=16, moves_left_head_blocks=1,
     use_inverse_dynamics_loss=INV, inverse_dynamics_hidden=cfg.inverse_dynamics_hidden,
-    use_repr_attention=ATTN, attn_layers=4, attn_heads=4, use_smolgen=True).to(DEV)
+    use_repr_attention=ATTN, attn_layers=4, attn_heads=4, use_smolgen=SMOL,
+    use_pred_attention=PREDATTN, pred_attn_layers=2).to(DEV)
 opt=torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
 print(f"params {sum(p.numel() for p in net.parameters())/1e6:.2f}M (FROM SCRATCH, TAG={TAG}; "
-      f"attn={ATTN} consistency={CONS} inverse={INV})", flush=True)
+      f"attn={ATTN} smolgen={SMOL} predattn={PREDATTN} consistency={CONS} inverse={INV} STEPS={STEPS})", flush=True)
 
 def encode(fens):
     st=gg.from_python_chess([chess.Board(f) for f in fens], device=DEV); obs=gg.to_tensor_batch(st)

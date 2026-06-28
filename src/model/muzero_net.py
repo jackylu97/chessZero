@@ -247,11 +247,27 @@ class PredictionNetwork(nn.Module):
         policy_head_type: str = "flat",
         value_head_planes: int = 1,
         value_head_blocks: int = 0,
+        use_pred_attention: bool = False,
+        pred_attn_layers: int = 2,
+        pred_attn_heads: int = 4,
+        pred_use_smolgen: bool = True,
     ):
         super().__init__()
         self.value_support_size = value_support_size
         self.value_head_type = value_head_type
         self.policy_head_type = policy_head_type
+
+        # Shared attention body over the latent tokens, applied BEFORE the policy/value
+        # heads split — gives both heads attention-refined features and (unlike the
+        # representation's attention) re-attends at EVERY node, including interior MCTS
+        # nodes reached via the conv dynamics. Runs in the ~num_simulations/move hot path.
+        if use_pred_attention:
+            from .attention import BoardAttentionEncoder
+            self.pred_body = BoardAttentionEncoder(
+                dim=hidden_planes, h=latent_h, w=latent_w,
+                n_layers=pred_attn_layers, n_heads=pred_attn_heads, use_smolgen=pred_use_smolgen)
+        else:
+            self.pred_body = None
 
         # Policy head. "flat" (default, AlphaGo-style): a Conv(C->2) channel
         # squeeze + Linear to the full action space — fine for small/point-move
@@ -322,6 +338,8 @@ class PredictionNetwork(nn.Module):
               - support head: (B, 2*support_size+1)
               - wdl head:     (B, 3)  — order (W, D, L)
         """
+        if self.pred_body is not None:
+            hidden_state = self.pred_body(hidden_state)
         return self.policy_head(hidden_state), self.value_head(hidden_state)
 
 
@@ -520,6 +538,8 @@ class MuZeroNetwork(nn.Module):
         attn_layers: int = 4,
         attn_heads: int = 4,
         use_smolgen: bool = True,
+        use_pred_attention: bool = False,
+        pred_attn_layers: int = 2,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -556,6 +576,10 @@ class MuZeroNetwork(nn.Module):
             policy_head_type=policy_head_type,
             value_head_planes=value_head_planes,
             value_head_blocks=value_head_blocks,
+            use_pred_attention=use_pred_attention,
+            pred_attn_layers=pred_attn_layers,
+            pred_attn_heads=attn_heads,
+            pred_use_smolgen=use_smolgen,
         )
 
         # Inverse-dynamics head (ICM): predicts a_k from (h_k, h_{k+1}). Forces the
