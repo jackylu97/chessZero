@@ -20,7 +20,13 @@ DEV="cuda"; cfg=get_config("chess_small"); game=ChessGame(); AS=game.action_spac
 K=5; gg=GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
 STEPS=30000; B=384; ML_W=float(cfg.moves_left_loss_weight)
 EVAL_CHEAP=1000; EVAL_MCTS=3000; CKPT_INT=6000; N_MCTS=300; MAX_PLIES=80; SIMS=200
-ATTN=os.environ.get("USE_ATTENTION","0")=="1"; TAG="attn" if ATTN else "conv"   # USE_ATTENTION=1 -> smolgen attention rep
+ATTN=os.environ.get("USE_ATTENTION","0")=="1"    # smolgen attention rep
+CONS=os.environ.get("USE_CONSISTENCY","0")=="1"  # EfficientZero SimSiam consistency loss (align dynamics latent -> repr(next))
+INV=os.environ.get("USE_INVERSE","0")=="1"       # ICM inverse-dynamics loss (recover action from h_k,h_k+1)
+CONS_W=float(cfg.consistency_loss_weight); INV_W=float(cfg.inverse_dynamics_loss_weight)
+TAG=("attn" if ATTN else "conv")+("_ssl" if CONS else "")+("_inv" if INV else "")
+def _neg_cos(p, z):   # SimSiam negative cosine, per-sample
+    p=F.normalize(p, dim=-1); z=F.normalize(z, dim=-1); return -(p*z).sum(-1)
 print("loading sequences...", flush=True)
 SEQ=pickle.load(open("data/tb5_seq.pkl","rb")); assert len(SEQ[0])==5, "need 5-tuple (moves-left) data"
 te=pickle.load(open("data/tb5_test.pkl","rb")); te_fen=[x[0] for x in te]; te_v=np.array([x[1] for x in te]); te_p=[np.array(x[2]) for x in te]
@@ -29,16 +35,17 @@ print(f"sequences {len(SEQ)}  test {len(te_fen)}  STEPS {STEPS}", flush=True)
 net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS, hidden_planes=cfg.hidden_planes,
     num_blocks=cfg.num_residual_blocks, latent_h=cfg.latent_h, latent_w=cfg.latent_w, input_h=game.board_size[0],
     input_w=game.board_size[1], fc_hidden=cfg.fc_hidden, value_support_size=cfg.value_support_size,
-    reward_support_size=cfg.reward_support_size, action_embed_dim=cfg.action_embed_dim, use_consistency_loss=False,
+    reward_support_size=cfg.reward_support_size, action_embed_dim=cfg.action_embed_dim, use_consistency_loss=CONS,
     proj_hid=cfg.proj_hid, proj_out=cfg.proj_out, pred_hid=cfg.pred_hid, pred_out=cfg.pred_out,
     use_scalar_transform=cfg.use_scalar_transform, value_target_scale=cfg.value_target_scale, value_head_type="wdl",
     draw_score=0.0, policy_head_type=cfg.policy_head_type, use_material_head=False,
     use_moves_left=True, moves_left_support_size=cfg.moves_left_support_size,
     moves_left_head_planes=16, moves_left_head_blocks=1,
+    use_inverse_dynamics_loss=INV, inverse_dynamics_hidden=cfg.inverse_dynamics_hidden,
     use_repr_attention=ATTN, attn_layers=4, attn_heads=4, use_smolgen=True).to(DEV)
 opt=torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
-print(f"params {sum(p.numel() for p in net.parameters())/1e6:.2f}M (FROM SCRATCH, rep={TAG}"
-      f"{', smolgen+posemb attention' if ATTN else ''})", flush=True)
+print(f"params {sum(p.numel() for p in net.parameters())/1e6:.2f}M (FROM SCRATCH, TAG={TAG}; "
+      f"attn={ATTN} consistency={CONS} inverse={INV})", flush=True)
 
 def encode(fens):
     st=gg.from_python_chess([chess.Board(f) for f in fens], device=DEV); obs=gg.to_tensor_batch(st)
@@ -130,10 +137,18 @@ for step in range(1, STEPS+1):
         if k==0:
             pl,vl=net.prediction(h)
         else:
+            h_in=h
             h,rl,pl,vl=net.recurrent_inference_logits(h, act_k[k-1]); h.register_hook(lambda g: g*0.5)
-            with torch.no_grad(): ht=net.representation(obs_k[k])
-            cons=(1 - F.cosine_similarity(h.flatten(1), ht.flatten(1), dim=1)) * mask_k[k]
-            loss=loss + mloss*cons.mean()
+            if CONS:   # EfficientZero SimSiam: online dyn proj vs stop-grad repr(next) proj
+                dyn_proj=net.project(h, with_grad=True)
+                with torch.no_grad():
+                    ht=net.representation(obs_k[k]); tgt_proj=net.project(ht, with_grad=False)
+                cons=_neg_cos(dyn_proj, tgt_proj) * mask_k[k]
+                loss=loss + mloss*CONS_W*cons.mean()
+            if INV:    # ICM inverse-dynamics: recover act_k[k-1] from (h_{k-1}, h_k)
+                inv_logits=net.predict_inverse_action(h_in, h)
+                invce=F.cross_entropy(inv_logits, act_k[k-1], reduction='none') * mask_k[k]
+                loss=loss + mloss*INV_W*invce.mean()
         vce=F.cross_entropy(vl, vc_k[k], reduction='none')*mask_k[k]
         pce=-(pol_k[k]*F.log_softmax(pl,1)).sum(1)*mask_k[k]
         ml_logits=net.predict_moves_left(h)
