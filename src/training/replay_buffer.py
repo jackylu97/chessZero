@@ -339,7 +339,8 @@ class GameHistory:
                     material_value_weight: float = 0.0,
                     material_value_scale: float = 5.0,
                     tb_value_weight: float = 0.0,
-                    tb_policy_weight: float = 0.0):
+                    tb_policy_weight: float = 0.0,
+                    tb_value_hard: bool = False):
         """Create training target for a given position.
 
         Args:
@@ -504,9 +505,25 @@ class GameHistory:
             if (tb_w > 0.0 and ply_idx < len(self.tablebase_values)):
                 tv = self.tablebase_values[ply_idx]
                 if tv == tv:  # not NaN
-                    p_w, p_d, p_l = _eval_to_wdl(
-                        float(tv), alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta)
-                    tb_wdl = np.array([p_w, p_d, p_l], dtype=np.float32)
+                    if tb_value_hard:
+                        # Lc0-style HARD WDL: the tablebase outcome is certain, so
+                        # train the value head on a one-hot (win/draw/loss) instead of
+                        # softening it through eval_to_wdl (which caps W-L at ~0.88 and
+                        # never saturates). Saturates Q near ±1 → crisp win/draw
+                        # separation (refutes throws) + activates the |Q|-gated MLH,
+                        # which then carries the within-win distance. tv is the STM-POV
+                        # TB scalar (±1 / 0, or ±dtz-shaped if dtz_shape>0); threshold on
+                        # sign. Draw / cursed-win / blessed-loss → draw one-hot.
+                        if tv > 0.5:
+                            tb_wdl = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                        elif tv < -0.5:
+                            tb_wdl = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                        else:
+                            tb_wdl = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    else:
+                        p_w, p_d, p_l = _eval_to_wdl(
+                            float(tv), alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta)
+                        tb_wdl = np.array([p_w, p_d, p_l], dtype=np.float32)
                     legacy = (1.0 - tb_w) * legacy + tb_w * tb_wdl
             if q == 0.0:
                 return legacy.astype(np.float32)
@@ -862,6 +879,7 @@ class ReplayBuffer:
         tb_value_weight: float = 0.0,
         tb_moves_left_weight: float = 0.0,
         tb_policy_weight: float = 0.0,
+        tb_value_hard: bool = False,
         build_legal_masks: bool = False,
         build_material_target: bool = False,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
@@ -969,6 +987,7 @@ class ReplayBuffer:
                 material_value_scale=material_value_scale,
                 tb_value_weight=tb_value_weight,
                 tb_policy_weight=tb_policy_weight,
+                tb_value_hard=tb_value_hard,
             )
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)

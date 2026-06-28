@@ -905,6 +905,7 @@ class MuZeroTrainer:
                 tb_value_weight=float(getattr(self.config, "tb_value_weight", 0.0)),
                 tb_moves_left_weight=float(getattr(self.config, "tb_moves_left_weight", 0.0)),
                 tb_policy_weight=get_tb_policy_weight(self.global_step, self.config),
+                tb_value_hard=bool(getattr(self.config, "tb_value_hard", False)),
                 build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
                 build_material_target=bool(getattr(self.config, "use_material_head", False)),
             )

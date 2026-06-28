@@ -225,6 +225,11 @@ def main():
                              "DTZ-shaped Syzygy position value into the VALUE target at TB plies "
                              "(override config.tb_value_weight, preset 0.0=off; 1.0=full replace). "
                              "Keep selfplay-q-ratio≈0. WDL value head only.")
+    parser.add_argument("--tb-value-hard", action="store_true", default=False,
+                        help="Lc0-style HARD WDL value target at TB plies: one-hot win/draw/loss "
+                             "instead of soft eval_to_wdl (which caps W-L ~0.88). Saturates Q near ±1, "
+                             "crisp win/draw separation, activates the |Q|-gated MLH. Pair with "
+                             "--tb-value-dtz-shape 0.0. Warmstart stays soft.")
     parser.add_argument("--tb-value-dtz-shape", type=float, default=None,
                         help="Shaping of the per-position TB value (override config.tb_value_dtz_shape, "
                              "preset 0.5): 0=flat WDL win=+1; >0 ranks wins by own DTZ "
@@ -473,6 +478,8 @@ def main():
         config.tb_dtz_weight = args.tb_dtz_weight
     if args.tb_value_weight is not None:
         config.tb_value_weight = args.tb_value_weight
+    if args.tb_value_hard:
+        config.tb_value_hard = True
     if args.tb_value_dtz_shape is not None:
         config.tb_value_dtz_shape = args.tb_value_dtz_shape
     if args.tb_moves_left_weight is not None:

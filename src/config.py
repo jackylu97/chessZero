@@ -514,6 +514,12 @@ class MuZeroConfig:
     # positions ranked by their OWN DTZ (closer mate → closer +1, floored at
     # 1-shape so a win stays clearly above a draw).
     tb_value_dtz_shape: float = 0.5
+    # Lc0-style HARD WDL value target at TB plies. False (default): blend the TB
+    # scalar through eval_to_wdl (soft, caps W-L at ~0.88, never saturates). True:
+    # one-hot win/draw/loss — saturates Q near ±1, crisp win/draw separation, and
+    # activates the |Q|-gated MLH which then carries within-win distance. Pair with
+    # tb_value_dtz_shape=0. Warmstart (per-position Stockfish evals) stays soft.
+    tb_value_hard: bool = False
     # Moves-left (MovesLeftHead) DTM relabel — Lc0 Gaviota MLH rescoring. When > 0,
     # the moves-left target at in-TB decisive plies is replaced by |DTM| (Gaviota
     # plies-to-mate) instead of the policy-rollout plies-to-end (the shuffle length
