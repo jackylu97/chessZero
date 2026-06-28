@@ -499,6 +499,12 @@ class MuZeroConfig:
     # torch path. Off by default. chess / GPU-resident self-play only.
     root_terminal_draws: bool = False
     root_terminal_draws_min_repeats: int = 2   # 2 = avoid any repeat; 3 = only block threefold
+    # Extend the terminal-draw mask beyond repetition to STALEMATE + insufficient
+    # material (GpuChessGame.terminal_draw_move_mask, a bounded one-ply lookahead
+    # gated to <= 6-piece positions). This is the direct fix for the dominant
+    # endgame failure: the winning side walking the lone king into stalemate (79%
+    # of won <=5-man positions per the 2026-06-28 per-config diagnostic).
+    root_terminal_draws_include_stalemate: bool = True
     # Root Syzygy tablebase probing: at each self-play ply, classify the root's
     # legal moves vs tablebases (≤ tb_max_pieces) and overwrite the root children's
     # value_score toward the DTZ-optimal conversion move (tensor_mcts._select).

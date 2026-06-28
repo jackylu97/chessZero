@@ -594,6 +594,7 @@ def play_games_parallel_gpu_resident(
     # to draw_score in the search (TensorMCTS root-terminal-draws). Off by default.
     use_terminal_draws = bool(getattr(config, "root_terminal_draws", False))
     term_min_repeats = int(getattr(config, "root_terminal_draws_min_repeats", 2))
+    term_include_stalemate = bool(getattr(config, "root_terminal_draws_include_stalemate", True))
 
     # Root Syzygy probing: at each ply, classify the root's legal moves against
     # tablebases (≤ tb_max_pieces) and overwrite the root children's value_score
@@ -726,7 +727,9 @@ def play_games_parallel_gpu_resident(
             value = torch.zeros(num_games, device=device, dtype=torch.float32)
         else:
             forced_draw_mask = (
-                gpu_game.repetition_move_mask(state, legal_mask, min_repeats=term_min_repeats)
+                gpu_game.terminal_draw_move_mask(
+                    state, legal_mask, min_repeats=term_min_repeats,
+                    include_stalemate=term_include_stalemate)
                 if use_terminal_draws else None
             )
             # TB relabel targets. Two modes (see defer_relabel above):
