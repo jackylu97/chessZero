@@ -294,10 +294,14 @@ class MuZeroConfig:
     # Stockfish per-position eval (in [-1,+1] STM POV) into a soft (P_W, P_D,
     # P_L) target via parameterized 3-way logistic. ``alpha`` controls
     # sharpness (4.0 ≈ Stockfish-cp-like steepness); ``beta`` controls draw-
-    # zone width (2.0 ≈ P_D=0.76 at eval=0). Restores per-position teacher
-    # signal density during warmstart that pure-z one-hot targets discarded.
-    eval_to_wdl_alpha: float = 4.0
-    eval_to_wdl_beta: float = 2.0
+    # zone width. Calibrated against the Lichess real-game win-rate logistic given
+    # our normalization eval=tanh(cp/800) (so eval=1 == mate, eval=0.3 == +2.5 pawns):
+    # α=5.6/β=1.7 gives P_D≈0.69 at eval=0, W-L≈0.43 at eval=0.3, and P_W≈0.98 at
+    # eval=1 (mate → near-certain win) — ~4× better calibration than the old 4.0/2.0
+    # which under-confidenced the whole range (capped W-L at 0.88 even for mate).
+    # Restores per-position teacher signal density that pure-z one-hot targets discard.
+    eval_to_wdl_alpha: float = 5.6
+    eval_to_wdl_beta: float = 1.7
 
     # --- Material / score-margin value utility (KataGo c_score analogue) ------
     # Tier-0 root-cause fix for the draw basin (see decisive_signal_plan_2026_06_23.md).
