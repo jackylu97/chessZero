@@ -24,6 +24,8 @@ The per-config diagnostic (greedy, on the supervised TB checkpoint) reframed the
 - The #1 (moves-left/DTM head) + #2 (terminal-aware search) fixes did their narrow jobs — terminal-mask ON cut stalemate **71.8% → 62.0%** — but conversion stayed ~5% because the freed games **shuffle** instead of converting. The failure shifted from stalemate-draw to shuffle-draw.
 - **Conclusion: the binding constraint is the representation/policy's inability to *execute* the mating procedure**, which is the architecture lever — not more target/search tweaks.
 
+**Empirical confirmation (2026-06-28, `train_tb_endgame.py`):** a from-scratch 30k-step TB-endgame run with BOTH #1+#2 on did NOT learn to convert over time. value_acc (~0.89), policy_acc (plateaus at **0.76**), and the DTM head's won/draw separation (~12 vs ~93 plies) all converge early — but **MCTS conversion stays flat at ~4% the entire run** (range 2–6%, no upward trend). Terminal-mask ON held stalemate to ~53–59% (vs ~72% OFF), but the trade is more shuffling (cap 30%→40%). The heads converge and the *outcome does not*: more training does not break the basin → the lever is architecture.
+
 This is precisely the regime where CNNs are known to struggle, and exactly why Leela moved to attention. From the Lc0 transformer blog: *"For the a1 square to learn about what piece is on h8, the information must make at least 7 trips from square to square."* Endgame mating nets are about long-range relations between distant pieces — the diagonal between two kings, a rook cutting off a file across the board — which a 3×3-conv tower propagates slowly and lossily.
 
 ### Why the CNN underperforms in the endgame regime (mechanism)
@@ -143,6 +145,57 @@ Replace the conv 8×8×73 head with Lc0's from→to Q·K head over the latent to
 2. Re-run the same from-scratch TB-endgame curve + the per-config MCTS diagnostic (`diag_perconfig_mcts.py`).
 3. **Success metric:** at equal-or-smaller params, does the attention representation **raise conversion / cut (stalemate + shuffle)** beyond this session's conv baseline (conversion ~5%, stalemate 62% with terminal-ON)? Specifically watch whether KQvK / KRvK conversion climbs — those are the pure long-range-geometry mates.
 4. If yes, add Phase B (smolgen) and re-measure; then decide on C/D.
+
+---
+
+## 8. Positional embeddings — mechanics & where they apply
+
+**What they are.** A learned positional embedding is just a parameter table: 64 vectors (one per square), each of dimension = the attention embed dim. In PyTorch, `nn.Parameter(torch.zeros(1, 64, embed_dim))` (added to the flattened tokens) or equivalently `nn.Embedding(64, embed_dim)` indexed by square id. Tiny — 64×embed_dim params (≈8k at embed 128), negligible vs the backbone.
+
+**Are they trained in our loop?** Yes — they are ordinary parameters, trained jointly by the *same* Adam optimizer and the *same* loss (value/policy/moves-left CE), via the *same* backprop. There is no separate stage or pre-training. They sit in the forward path (added to each square's token before the attention layers), so gradients flow into them from the heads like any other weight. They start random (small init) and the network learns, e.g., "the a1 vector should encode corner-ness."
+
+**Do they work with our CURRENT (CNN) setup, or do they need attention?** **They are paired with attention — they are essentially meaningless in the current pure-conv network.** The reason: self-attention is *permutation-equivariant* — it flattens the 64 squares into a set and has no inherent notion of which token is which square, so you must re-inject position via the embedding. A **convolution does not have this problem**: the feature map stays spatially laid out (the activation at grid cell (r,c) *is* square (r,c)), so a CNN already "knows where things are" structurally. Adding token-style positional embeddings to a conv net is a no-op (there are no tokens). So: **introduce positional embeddings exactly when you introduce attention, as one package.**
+
+**The CNN analogue (if you want absolute position WITHOUT attention).** Convolutions are *translation-equivariant* — they slide the same kernel everywhere, so they get only weak absolute-position information (from zero-padding at the board edges). If we suspect the current CNN's failure is partly "it can't tell a1 from e4," the cheap fix is **CoordConv**: append 2 constant coordinate planes (normalized row, col) — and optionally a 3rd "is-edge/corner" plane — to the input. This hands the conv net absolute position for ~0 params and **no attention required**. It's worth running as a standalone cheap probe (does absolute-position awareness alone move conversion?) before committing to the attention rewrite.
+
+---
+
+## 9. Full menu of architectural improvements (ranked by what we're seeing)
+
+What the evidence points at: the heads converge (value 0.89, policy 0.76, DTM clean) but the model **cannot execute the precise long-range mating procedure** — it avoids stalemate then shuffles. That implicates four distinct targets; here is the full menu, grouped by target, with cost and expected leverage.
+
+### Group 1 — Long-range geometry (the primary diagnosis)
+| # | Improvement | Mechanism | Cost | Leverage |
+|---|---|---|---|---|
+| 1.1 | **Self-attention encoder in the Representation + learned pos-emb** | global receptive field over the 64 latent tokens; a1↔h8 in one hop | med (0.5–1.5M params; rep runs once/position) | **HIGH** — directly targets the long-range geometry the CNN propagates slowly |
+| 1.2 | **Static learned relative-position bias** | dedicated additive logit per (i,j) relation (diagonal/file/rank/distance) — geometry decoupled from content | low (~tens of k) | **HIGH per cost** — hands the model board geometry instead of making it rediscover it through QKᵀ |
+| 1.3 | **Smolgen (scaled down)** | data-dependent version of 1.2 — bias changes per board (this diagonal is hot in this position) | med (shrink bottleneck→~64, ~4 heads, low-rank the 64×64 output → ~50–250k) | MED — adds position-specificity; only if 1.2 plateaus |
+| 1.4 | **CoordConv coordinate channels** | 2–3 constant row/col/edge planes → absolute position for the *current CNN*, no attention | ~0 | **probe** — cheapest test of whether absolute-position awareness alone helps |
+
+### Group 2 — Capacity & extraction (the jagged value + the policy ceiling)
+| # | Improvement | Mechanism | Cost | Leverage |
+|---|---|---|---|---|
+| 2.1 | **Wider/deeper backbone** (`hidden_planes` 64→128, more blocks) | more capacity to fit the high-frequency endgame value/policy surface | med | MED — the jagged value needs capacity; but KQvK already fails, so capacity alone is not the whole story |
+| 2.2 | **Deeper value head** (`value_head_planes/blocks` > 1/0, as we did for MLH) | the `endgame-latent-entangled` finding: the latent *has* the DTZ signal but the 1-plane head can't extract it | low | MED — pairs with the distance targets; cheap |
+| 2.3 | **Less-lossy latent** (more latent channels / higher fidelity) | win vs draw = one square; the lossy 8×8×C latent discards the exact-position info that decides it | med | MED — addresses the compression that destroys the win/draw distinction |
+
+### Group 3 — Search reaching deeper (the shuffle)
+| # | Improvement | Mechanism | Cost | Leverage |
+|---|---|---|---|---|
+| 3.1 | **Learned terminal/"done" head** → interior terminal-awareness | #2 is root-only (real board); a learned done-head lets MCTS see stalemate/draw at *latent* interior nodes, so search avoids the cliff several plies deep, not just at the root | med | MED — converts "avoid stalemate at the root" into "steer the whole line away from no-progress" |
+
+### Group 4 — Policy strength (the proximate compounding bottleneck)
+| # | Improvement | Mechanism | Cost | Leverage |
+|---|---|---|---|---|
+| 4.1 | **Attention policy head** (Lc0 from→to Q·K → moves) | a move as a relation between two squares; better move geometry than the 8×8×73 conv head | med | MED — but our conv head works; defer until 1.x shows attention helps |
+
+### Recommended ordering (cheap probes → main bet → residual-driven)
+1. **CoordConv probe (1.4)** — ~0 cost, tests whether absolute position alone helps the current CNN. A quick read on "is it geometry-awareness or genuinely capacity/attention."
+2. **Deeper value head (2.2)** — cheap, pairs with the DTM head we already added; rules in/out the extraction bottleneck.
+3. **Main bet: attention rep + pos-emb + static relative bias (1.1 + 1.2)** on `train_tb_endgame.py`, vs this session's conv baseline (conversion ~4%, stalemate ~55%). Watch KQvK/KRvK specifically — the pure long-range-geometry mates.
+4. **Then, residual-driven:** smolgen (1.3) if geometry is still the gap; wider backbone (2.1) / less-lossy latent (2.3) if it looks capacity-bound; learned terminal head (3.1) if the failure is still deep-tree shuffling; attention policy (4.1) last.
+
+Each step re-runs the same instrument: the from-scratch TB-endgame learning curve + the per-config MCTS diagnostic (stalemate / conversion / shuffle), so every change is measured against the identical baseline.
 
 ---
 
