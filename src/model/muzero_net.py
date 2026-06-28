@@ -29,22 +29,37 @@ class RepresentationNetwork(nn.Module):
         latent_w: int,
         input_h: int,
         input_w: int,
+        use_attention: bool = False,
+        attn_layers: int = 4,
+        attn_heads: int = 4,
+        use_smolgen: bool = True,
     ):
         super().__init__()
         self.latent_h = latent_h
         self.latent_w = latent_w
         self.needs_resize = (input_h != latent_h) or (input_w != latent_w)
+        self.use_attention = use_attention
 
         # Projection norm operates at the raw input resolution (may differ from
-        # latent if needs_resize); residual blocks operate at the latent size.
+        # latent if needs_resize); the body operates at the latent size.
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_planes, 3, padding=1, bias=False),
             norm_layer(hidden_planes, (input_h, input_w)),
             nn.ReLU(),
         )
-        self.blocks = nn.Sequential(
-            *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
-        )
+        if use_attention:
+            # Self-attention encoder over the latent_h*latent_w board tokens: learned
+            # positional embeddings + global self-attention + (optional) smolgen. Replaces
+            # the conv residual tower to give the representation long-range board geometry.
+            from .attention import BoardAttentionEncoder
+            self.blocks = BoardAttentionEncoder(
+                dim=hidden_planes, h=latent_h, w=latent_w,
+                n_layers=attn_layers, n_heads=attn_heads, use_smolgen=use_smolgen,
+            )
+        else:
+            self.blocks = nn.Sequential(
+                *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
+            )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         x = self.projection(obs)
@@ -501,6 +516,10 @@ class MuZeroNetwork(nn.Module):
         value_head_blocks: int = 0,
         moves_left_head_planes: int = 1,
         moves_left_head_blocks: int = 0,
+        use_repr_attention: bool = False,
+        attn_layers: int = 4,
+        attn_heads: int = 4,
+        use_smolgen: bool = True,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -520,6 +539,8 @@ class MuZeroNetwork(nn.Module):
         self.representation = RepresentationNetwork(
             observation_channels, hidden_planes, num_blocks,
             latent_h, latent_w, input_h, input_w,
+            use_attention=use_repr_attention, attn_layers=attn_layers,
+            attn_heads=attn_heads, use_smolgen=use_smolgen,
         )
         self.dynamics = DynamicsNetwork(
             hidden_planes, num_blocks, action_space_size,

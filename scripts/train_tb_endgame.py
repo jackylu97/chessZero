@@ -20,6 +20,7 @@ DEV="cuda"; cfg=get_config("chess_small"); game=ChessGame(); AS=game.action_spac
 K=5; gg=GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
 STEPS=30000; B=384; ML_W=float(cfg.moves_left_loss_weight)
 EVAL_CHEAP=1000; EVAL_MCTS=3000; CKPT_INT=6000; N_MCTS=300; MAX_PLIES=80; SIMS=200
+ATTN=os.environ.get("USE_ATTENTION","0")=="1"; TAG="attn" if ATTN else "conv"   # USE_ATTENTION=1 -> smolgen attention rep
 print("loading sequences...", flush=True)
 SEQ=pickle.load(open("data/tb5_seq.pkl","rb")); assert len(SEQ[0])==5, "need 5-tuple (moves-left) data"
 te=pickle.load(open("data/tb5_test.pkl","rb")); te_fen=[x[0] for x in te]; te_v=np.array([x[1] for x in te]); te_p=[np.array(x[2]) for x in te]
@@ -33,9 +34,11 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     use_scalar_transform=cfg.use_scalar_transform, value_target_scale=cfg.value_target_scale, value_head_type="wdl",
     draw_score=0.0, policy_head_type=cfg.policy_head_type, use_material_head=False,
     use_moves_left=True, moves_left_support_size=cfg.moves_left_support_size,
-    moves_left_head_planes=16, moves_left_head_blocks=1).to(DEV)
+    moves_left_head_planes=16, moves_left_head_blocks=1,
+    use_repr_attention=ATTN, attn_layers=4, attn_heads=4, use_smolgen=True).to(DEV)
 opt=torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
-print(f"params {sum(p.numel() for p in net.parameters())/1e6:.2f}M (FROM SCRATCH)", flush=True)
+print(f"params {sum(p.numel() for p in net.parameters())/1e6:.2f}M (FROM SCRATCH, rep={TAG}"
+      f"{', smolgen+posemb attention' if ATTN else ''})", flush=True)
 
 def encode(fens):
     st=gg.from_python_chess([chess.Board(f) for f in fens], device=DEV); obs=gg.to_tensor_batch(st)
@@ -146,7 +149,7 @@ for step in range(1, STEPS+1):
         print(f"step {step:5d} ({time.time()-t0:.0f}s) loss {loss.item():.3f} | value_acc {vacc:.3f} "
               f"policy_acc {pacc:.3f} | ml_won {mlw:.0f} ml_draw {mld:.0f}{extra}", flush=True)
     if step % CKPT_INT == 0:
-        torch.save({"model_state_dict": net.state_dict(), "step": step}, f"checkpoints/tb5_endgame_{step}.pt")
-        print(f"  saved checkpoints/tb5_endgame_{step}.pt", flush=True)
-torch.save({"model_state_dict": net.state_dict(), "step": STEPS}, "checkpoints/tb5_endgame_final.pt")
-print("saved checkpoints/tb5_endgame_final.pt", flush=True); print("DONE", flush=True)
+        torch.save({"model_state_dict": net.state_dict(), "step": step}, f"checkpoints/tb5_endgame_{TAG}_{step}.pt")
+        print(f"  saved checkpoints/tb5_endgame_{TAG}_{step}.pt", flush=True)
+torch.save({"model_state_dict": net.state_dict(), "step": STEPS}, f"checkpoints/tb5_endgame_{TAG}_final.pt")
+print(f"saved checkpoints/tb5_endgame_{TAG}_final.pt", flush=True); print("DONE", flush=True)
