@@ -779,6 +779,11 @@ def get_config(game: str) -> MuZeroConfig:
                                         # positions get a small negative push during search,
                                         # encouraging decisive moves over solid draws. Doesn't
                                         # affect training targets.
+            root_terminal_draws=True,   # Terminal-aware search: pin root children whose move leads
+                                        # to a draw to draw_score (mover-POV; winning side avoids,
+                                        # losing side keeps). Covers repetition + (once the GPU mask
+                                        # is extended) stalemate/insufficient. ON 2026-06-28 (was
+                                        # off) per the 79%-stalemate-conversion diagnosis.
             repetition_penalty=0.35,    # Training-TARGET anti-repetition (distinct from draw_score
             repetition_penalty_decay=0.93,  # above, which is tree-only). For games drawn by 3-fold /
                                         # 50-move, rewrites the value target toward loss
