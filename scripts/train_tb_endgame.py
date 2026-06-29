@@ -19,6 +19,7 @@ from src.model.utils import scalar_transform, scalar_to_support, inverse_scalar_
 DEV="cuda"; cfg=get_config("chess_small"); game=ChessGame(); AS=game.action_space_size; NF=cfg.history_frames
 K=5; gg=GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
 STEPS=int(os.environ.get("STEPS","30000")); B=384; ML_W=float(cfg.moves_left_loss_weight)
+ATTNL=int(os.environ.get("ATTN_LAYERS","4")); DATA=os.environ.get("DATA","data/tb5_seq.pkl")
 EVAL_CHEAP=1000; EVAL_MCTS=3000; CKPT_INT=6000; N_MCTS=300; MAX_PLIES=80; SIMS=200
 ATTN=os.environ.get("USE_ATTENTION","0")=="1"        # smolgen attention representation
 SMOL=os.environ.get("USE_SMOLGEN","1")=="1"          # smolgen on/off (only matters with ATTN)
@@ -33,11 +34,11 @@ if DYNATTN: _parts.append("dynattn")
 if PREDATTN: _parts.append("predattn")
 if CONS: _parts.append("ssl")
 if INV: _parts.append("inv")
-TAG="_".join(_parts)
+TAG="_".join(_parts) + os.environ.get("TAG_SUFFIX","")
 def _neg_cos(p, z):   # SimSiam negative cosine, per-sample
     p=F.normalize(p, dim=-1); z=F.normalize(z, dim=-1); return -(p*z).sum(-1)
 print("loading sequences...", flush=True)
-SEQ=pickle.load(open("data/tb5_seq.pkl","rb")); assert len(SEQ[0])==5, "need 5-tuple (moves-left) data"
+SEQ=pickle.load(open(DATA,"rb")); assert len(SEQ[0])==5, "need 5-tuple (moves-left) data"
 te=pickle.load(open("data/tb5_test.pkl","rb")); te_fen=[x[0] for x in te]; te_v=np.array([x[1] for x in te]); te_p=[np.array(x[2]) for x in te]
 print(f"sequences {len(SEQ)}  test {len(te_fen)}  STEPS {STEPS}", flush=True)
 
@@ -51,11 +52,11 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     use_moves_left=True, moves_left_support_size=cfg.moves_left_support_size,
     moves_left_head_planes=16, moves_left_head_blocks=1,
     use_inverse_dynamics_loss=INV, inverse_dynamics_hidden=cfg.inverse_dynamics_hidden,
-    use_repr_attention=ATTN, attn_layers=4, attn_heads=4, use_smolgen=SMOL,
+    use_repr_attention=ATTN, attn_layers=ATTNL, attn_heads=4, use_smolgen=SMOL,
     use_pred_attention=PREDATTN, pred_attn_layers=2, use_dyn_attention=DYNATTN).to(DEV)
 opt=torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
 print(f"params {sum(p.numel() for p in net.parameters())/1e6:.2f}M (FROM SCRATCH, TAG={TAG}; "
-      f"attn={ATTN} smolgen={SMOL} dynattn={DYNATTN} predattn={PREDATTN} consistency={CONS} inverse={INV} STEPS={STEPS})", flush=True)
+      f"attn={ATTN}(L{ATTNL}) smolgen={SMOL} dynattn={DYNATTN} predattn={PREDATTN} consistency={CONS} inverse={INV} STEPS={STEPS} DATA={DATA})", flush=True)
 
 def encode(fens):
     st=gg.from_python_chess([chess.Board(f) for f in fens], device=DEV); obs=gg.to_tensor_batch(st)
