@@ -3,8 +3,8 @@
 # contend with the GPU training). Appends to logs/dashboard_tbvalue.log so the
 # value-DTZ-corr trend is visible over training. Poll every 10 min.
 cd /workspace/chessZero
-CKPT_DIR=checkpoints/chess/2026_06_26_tb_value_s09
-LOG=logs/dashboard_tbvalue_s09.log
+CKPT_DIR=checkpoints/chess/2026_06_26_leela_relabel
+LOG=logs/dashboard_leela.log
 EVERY_STEPS=${1:-5000}   # only dashboard every N steps (default 5k) to keep it cheap
 mkdir -p logs
 echo "watching $CKPT_DIR (dashboard every ${EVERY_STEPS} steps) -> $LOG"

@@ -21,9 +21,9 @@ POSITIONS = {
 }
 
 
-def play(net, cg, gpu, game_dev, fen, dtz_weight, sims, max_plies=120, hard=False):
+def play(net, cg, gpu, game_dev, fen, dtz_weight, sims, max_plies=120, hard=False, no_probe=False):
     cfg = get_config("chess_small"); cfg.device = game_dev
-    cfg.num_simulations = sims; cfg.tb_root_probe = True
+    cfg.num_simulations = sims; cfg.tb_root_probe = not no_probe
     cfg.tensor_mcts_select_backend = "eager"
     mcts = TensorMCTS(net, cg, cfg, device=game_dev, select_backend="eager")
     prober = SyzygyRootProber("data/syzygy", max_pieces=5, dtz_weight=dtz_weight)
@@ -41,7 +41,7 @@ def play(net, cg, gpu, game_dev, fen, dtz_weight, sims, max_plies=120, hard=Fals
         legal_mask = gpu.legal_mask(gstate)
         if isinstance(legal_mask, tuple):
             legal_mask = legal_mask[0]
-        root_tb = prober.root_move_values(gstate, legal_mask)
+        root_tb = None if no_probe else prober.root_move_values(gstate, legal_mask)
         out = mcts.run_batch_gpu(obs, legal_mask, add_noise=False, root_tb_value=root_tb)
         # hard=True: hard-select the DTZ-optimal TB move (one-hot, KLD-risky).
         # hard=False: soft — take the search's argmax-visit move (the value bias
@@ -70,6 +70,9 @@ def main():
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--dtz-weights", type=float, nargs="+", default=[0.05, 0.5])
     ap.add_argument("--hard", action="store_true", help="hard-select TB move (default: soft).")
+    ap.add_argument("--no-probe", action="store_true",
+                    help="disable the TB probe entirely — pure MCTS, tests the model's LEARNED "
+                         "conversion (how it plays in play_web).")
     ap.add_argument("--max-plies", type=int, default=120)
     args = ap.parse_args()
     dev = args.device
@@ -83,7 +86,8 @@ def main():
     for name, fen in POSITIONS.items():
         for w in args.dtz_weights:
             res, ply, dtz0, final = play(net, cg, gpu, dev, fen, w, args.sims,
-                                          max_plies=args.max_plies, hard=args.hard)
+                                          max_plies=args.max_plies, hard=args.hard,
+                                          no_probe=args.no_probe)
             print(f"{name:>8} {w:>6.2f} {res:>16} {ply:>6} {dtz0:>9}")
     print("\n  MATE in ~startDTZ plies => probe converts. unfinished/draw50 => it shuffles "
           "(DTZ gradient too weak).")

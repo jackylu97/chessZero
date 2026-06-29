@@ -24,7 +24,6 @@ exec .venv/bin/python -u scripts/_faulthandler_bootstrap.py scripts/train.py \
   --material-value-weight 0.5 --material-value-anneal-frac 0.6 \
   --use-material-head --material-head-loss-weight 0.25 \
   --root-terminal-draws --root-terminal-draws-min-repeats 2 \
-  --resign-enabled --resign-holdout-frac 0.20 \
   --num-simulations 400 --num-self-play-games 512 --num-parallel-games 512 \
   --reanalyze-interval 0 \
   --tb-root-probe --tb-path data/syzygy --tb-gaviota-path data/gaviota \
