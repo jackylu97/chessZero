@@ -23,11 +23,13 @@ EVAL_CHEAP=1000; EVAL_MCTS=3000; CKPT_INT=6000; N_MCTS=300; MAX_PLIES=80; SIMS=2
 ATTN=os.environ.get("USE_ATTENTION","0")=="1"        # smolgen attention representation
 SMOL=os.environ.get("USE_SMOLGEN","1")=="1"          # smolgen on/off (only matters with ATTN)
 PREDATTN=os.environ.get("USE_PRED_ATTENTION","0")=="1"  # shared attention body in the policy/value model
+DYNATTN=os.environ.get("USE_DYN_ATTENTION","0")=="1"    # attention body in the DYNAMICS (matches the rep so consistency is reachable)
 CONS=os.environ.get("USE_CONSISTENCY","0")=="1"      # EfficientZero SimSiam consistency loss
 INV=os.environ.get("USE_INVERSE","0")=="1"           # ICM inverse-dynamics loss
 CONS_W=float(cfg.consistency_loss_weight); INV_W=float(cfg.inverse_dynamics_loss_weight)
 _parts=["attn" if ATTN else "conv"]
 if ATTN and not SMOL: _parts.append("nosmol")
+if DYNATTN: _parts.append("dynattn")
 if PREDATTN: _parts.append("predattn")
 if CONS: _parts.append("ssl")
 if INV: _parts.append("inv")
@@ -50,10 +52,10 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     moves_left_head_planes=16, moves_left_head_blocks=1,
     use_inverse_dynamics_loss=INV, inverse_dynamics_hidden=cfg.inverse_dynamics_hidden,
     use_repr_attention=ATTN, attn_layers=4, attn_heads=4, use_smolgen=SMOL,
-    use_pred_attention=PREDATTN, pred_attn_layers=2).to(DEV)
+    use_pred_attention=PREDATTN, pred_attn_layers=2, use_dyn_attention=DYNATTN).to(DEV)
 opt=torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
 print(f"params {sum(p.numel() for p in net.parameters())/1e6:.2f}M (FROM SCRATCH, TAG={TAG}; "
-      f"attn={ATTN} smolgen={SMOL} predattn={PREDATTN} consistency={CONS} inverse={INV} STEPS={STEPS})", flush=True)
+      f"attn={ATTN} smolgen={SMOL} dynattn={DYNATTN} predattn={PREDATTN} consistency={CONS} inverse={INV} STEPS={STEPS})", flush=True)
 
 def encode(fens):
     st=gg.from_python_chess([chess.Board(f) for f in fens], device=DEV); obs=gg.to_tensor_batch(st)

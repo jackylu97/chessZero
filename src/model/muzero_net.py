@@ -110,6 +110,10 @@ class DynamicsNetwork(nn.Module):
         fc_hidden: int,
         action_embed_dim: int = 16,
         reward_support_size: int = 1,
+        use_attention: bool = False,
+        attn_layers: int = 4,
+        attn_heads: int = 4,
+        use_smolgen: bool = True,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -127,9 +131,18 @@ class DynamicsNetwork(nn.Module):
         )
         self.bn_in = norm_layer(hidden_planes, (latent_h, latent_w))
 
-        self.blocks = nn.Sequential(
-            *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
-        )
+        # Body: conv residual tower, or a smolgen attention encoder (matching the
+        # representation so the consistency loss can align dynamics->repr — a conv
+        # dynamics cannot reproduce a smolgen-rich repr target, which craters MCTS).
+        if use_attention:
+            from .attention import BoardAttentionEncoder
+            self.blocks = BoardAttentionEncoder(
+                dim=hidden_planes, h=latent_h, w=latent_w,
+                n_layers=attn_layers, n_heads=attn_heads, use_smolgen=use_smolgen)
+        else:
+            self.blocks = nn.Sequential(
+                *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
+            )
 
         # Reward head outputs categorical distribution
         reward_out = 2 * reward_support_size + 1
@@ -540,6 +553,7 @@ class MuZeroNetwork(nn.Module):
         use_smolgen: bool = True,
         use_pred_attention: bool = False,
         pred_attn_layers: int = 2,
+        use_dyn_attention: bool = False,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -567,6 +581,8 @@ class MuZeroNetwork(nn.Module):
             latent_h, latent_w, fc_hidden,
             action_embed_dim=action_embed_dim,
             reward_support_size=reward_support_size,
+            use_attention=use_dyn_attention, attn_layers=attn_layers,
+            attn_heads=attn_heads, use_smolgen=use_smolgen,
         )
         self.prediction = PredictionNetwork(
             hidden_planes, action_space_size,
