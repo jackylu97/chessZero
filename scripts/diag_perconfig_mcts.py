@@ -20,6 +20,9 @@ CKPT=os.environ.get("CKPT","checkpoints/tb5_seq_ml.pt"); ATTN=os.environ.get("US
 SMOL=os.environ.get("USE_SMOLGEN","1")=="1"; PREDATTN=os.environ.get("USE_PRED_ATTENTION","0")=="1"
 DYNATTN=os.environ.get("USE_DYN_ATTENTION","0")=="1"
 ATTNL=int(os.environ.get("ATTN_LAYERS","4"))
+ML_SUPPORT=int(os.environ.get("ML_SUPPORT", str(cfg.moves_left_support_size)))
+ML_LINEAR=os.environ.get("ML_LINEAR","0")=="1"
+cfg.moves_left_support_size=ML_SUPPORT; cfg.moves_left_use_transform=not ML_LINEAR
 N_WON=400; MAX_PLIES=80; SIMS=200
 net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS, hidden_planes=cfg.hidden_planes,
     num_blocks=cfg.num_residual_blocks, latent_h=cfg.latent_h, latent_w=cfg.latent_w, input_h=game.board_size[0],

@@ -461,6 +461,12 @@ class MuZeroConfig:
     # the other aux heads. The gated MCTS utility is a separate step.
     use_moves_left: bool = False
     moves_left_support_size: int = 10
+    # Whether the moves-left head uses the value-style sqrt scalar_transform before
+    # binning. False = LINEAR (raw plies → support), which keeps 1-ply resolution
+    # across the whole range instead of compressing the long-mate (15-30 ply) region
+    # into ~1.5 bins. The sqrt squash is right for value (resolution near zero) but
+    # wrong for moves-left (we need resolution at large DTM). See measure_ml_accuracy.
+    moves_left_use_transform: bool = True
     moves_left_loss_weight: float = 0.25
     # MLH MCTS utility (Lc0): among same-Q moves, prefer the faster win (and drag out
     # a loss). Added to the selection score as sign(-Q)*clip(slope*M, 0, max_effect),

@@ -20,6 +20,12 @@ DEV="cuda"; cfg=get_config("chess_small"); game=ChessGame(); AS=game.action_spac
 K=5; gg=GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
 STEPS=int(os.environ.get("STEPS","30000")); B=384; ML_W=float(cfg.moves_left_loss_weight)
 ATTNL=int(os.environ.get("ATTN_LAYERS","4")); DATA=os.environ.get("DATA","data/tb5_seq.pkl")
+# Moves-left head encoding. ML_LINEAR=1 drops the value-style sqrt scalar_transform
+# (raw plies -> support) and ML_SUPPORT widens the bins, restoring 1-ply resolution
+# across the long-mate range that the sqrt squash + size-10 support destroyed.
+ML_SUPPORT=int(os.environ.get("ML_SUPPORT", str(cfg.moves_left_support_size)))
+ML_LINEAR=os.environ.get("ML_LINEAR","0")=="1"
+cfg.moves_left_support_size=ML_SUPPORT; cfg.moves_left_use_transform=not ML_LINEAR
 EVAL_CHEAP=1000; EVAL_MCTS=3000; CKPT_INT=6000; N_MCTS=300; MAX_PLIES=80; SIMS=200
 ATTN=os.environ.get("USE_ATTENTION","0")=="1"        # smolgen attention representation
 SMOL=os.environ.get("USE_SMOLGEN","1")=="1"          # smolgen on/off (only matters with ATTN)
@@ -34,6 +40,7 @@ if DYNATTN: _parts.append("dynattn")
 if PREDATTN: _parts.append("predattn")
 if CONS: _parts.append("ssl")
 if INV: _parts.append("inv")
+if ML_LINEAR: _parts.append(f"mllin{ML_SUPPORT}")
 TAG="_".join(_parts) + os.environ.get("TAG_SUFFIX","")
 def _neg_cos(p, z):   # SimSiam negative cosine, per-sample
     p=F.normalize(p, dim=-1); z=F.normalize(z, dim=-1); return -(p*z).sum(-1)
@@ -56,7 +63,8 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     use_pred_attention=PREDATTN, pred_attn_layers=2, use_dyn_attention=DYNATTN).to(DEV)
 opt=torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
 print(f"params {sum(p.numel() for p in net.parameters())/1e6:.2f}M (FROM SCRATCH, TAG={TAG}; "
-      f"attn={ATTN}(L{ATTNL}) smolgen={SMOL} dynattn={DYNATTN} predattn={PREDATTN} consistency={CONS} inverse={INV} STEPS={STEPS} DATA={DATA})", flush=True)
+      f"attn={ATTN}(L{ATTNL}) smolgen={SMOL} dynattn={DYNATTN} predattn={PREDATTN} consistency={CONS} inverse={INV} "
+      f"ml_linear={ML_LINEAR}(support={ML_SUPPORT}) STEPS={STEPS} DATA={DATA})", flush=True)
 
 def encode(fens):
     st=gg.from_python_chess([chess.Board(f) for f in fens], device=DEV); obs=gg.to_tensor_batch(st)
@@ -87,7 +95,9 @@ def cheap_eval():
     for s in range(0, min(len(te_fen), 8000), 1024):
         fb=te_fen[s:s+1024]; h=net.representation(encode(fb)); pl,vl=net.prediction(h)
         vcorr+=(vl.argmax(1).cpu().numpy()==te_v[s:s+1024]).sum()
-        mlp=inverse_scalar_transform(support_to_scalar(net.predict_moves_left(h), cfg.moves_left_support_size)).clamp(min=0).cpu().numpy().reshape(-1)
+        mlp=support_to_scalar(net.predict_moves_left(h), cfg.moves_left_support_size)
+        if not ML_LINEAR: mlp=inverse_scalar_transform(mlp)
+        mlp=mlp.clamp(min=0).cpu().numpy().reshape(-1)
         vb=te_v[s:s+1024]; ml_won.extend(mlp[vb==0].tolist()); ml_draw.extend(mlp[vb==1].tolist())
         soft=pl.cpu().numpy()
         for i,f in enumerate(fb):
@@ -163,7 +173,8 @@ for step in range(1, STEPS+1):
         vce=F.cross_entropy(vl, vc_k[k], reduction='none')*mask_k[k]
         pce=-(pol_k[k]*F.log_softmax(pl,1)).sum(1)*mask_k[k]
         ml_logits=net.predict_moves_left(h)
-        ml_tgt=scalar_to_support(scalar_transform(ml_k[k]), cfg.moves_left_support_size).to(ml_logits.device)
+        ml_scalar=ml_k[k] if ML_LINEAR else scalar_transform(ml_k[k])
+        ml_tgt=scalar_to_support(ml_scalar, cfg.moves_left_support_size).to(ml_logits.device)
         mlce=-(ml_tgt*F.log_softmax(ml_logits,1)).sum(1)*mask_k[k]
         loss=loss + mloss*(vce.mean()+pce.mean()+ML_W*mlce.mean())
     opt.zero_grad(); loss.backward(); opt.step()

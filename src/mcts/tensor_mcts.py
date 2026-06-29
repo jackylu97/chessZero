@@ -245,6 +245,9 @@ class TensorMCTS:
         self._ml_q_square = float(getattr(config, "ml_q_square", -0.6521))
         self._ml_support = (getattr(network, "moves_left_support_size", 10)
                             if network is not None else 10)
+        # Must match how the moves-left head was TRAINED: linear (raw plies) vs the
+        # value-style sqrt transform. Mismatch here silently corrupts the ML utility.
+        self._ml_use_transform = bool(getattr(config, "moves_left_use_transform", True))
         self._draw_score = float(getattr(config, "draw_score", 0.0))
         # MLH utility is now implemented in the Triton kernel (parity-tested vs the
         # torch _select path), so it no longer forces a downgrade. root-terminal-draws
@@ -1370,8 +1373,10 @@ class TensorMCTS:
         self.node_reward[arange_n, new_l] = rewards_f32
         if self._use_ml_utility:
             ml_logits = self._predict_moves_left(next_hidden)
-            m = inverse_scalar_transform(
-                support_to_scalar(ml_logits, self._ml_support)).clamp(min=0.0)
+            m = support_to_scalar(ml_logits, self._ml_support)
+            if self._ml_use_transform:
+                m = inverse_scalar_transform(m)
+            m = m.clamp(min=0.0)
             self.node_moves_left[arange_n, new_l] = m.view(-1).to(torch.float32)
         self.parent_idx[arange_n, new_l] = leaf_parent_node
         self.parent_child_slot[arange_n, new_l] = leaf_slot
