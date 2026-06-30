@@ -106,7 +106,17 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
         if resign_ply is None or resign_ply < 1:
             continue
         p = resign_ply
-        white_resigns = (p & 1) == 0
+        # Which COLOR is to move at ply p? Normal games start white-to-move (ply 0 =
+        # white), but endgame-seeded games can start from a BLACK-to-move FEN — so derive
+        # the start side from start_fen rather than assuming ply 0 == white. Without this,
+        # black-start seeded games get their resignation OUTCOME LABEL inverted (game_outcome
+        # feeds the value target) and their correct resignations miscounted as false
+        # positives. FEN field [1] is 'w'/'b'. The cnt[] parity counters above are
+        # color-agnostic (each side owns one ply parity), so only the color attribution here
+        # needs the start side.
+        sf = getattr(h, "start_fen", None)
+        start_white = (sf.split()[1] == "w") if sf else True
+        white_resigns = (start_white == (p % 2 == 0))
         # Calibration holdout: leave this game un-resigned (natural outcome) and
         # record whether resignation WOULD have been a false positive — i.e. the
         # would-have-resigned side did NOT actually lose. resign_false_positive
