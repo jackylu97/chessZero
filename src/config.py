@@ -454,6 +454,24 @@ class MuZeroConfig:
     inverse_dynamics_loss_weight: float = 1.0
     inverse_dynamics_hidden: int = 256
 
+    # Self-attention (smolgen) backbone. Validated on the ≤5-man endgame proxy
+    # (endgame_attention_findings_2026_06_28.md): attention in BOTH the representation
+    # and the dynamics broke the conv tower's flat ~4% MCTS conversion plateau →
+    # rising 4%→41% (KQvK 0.44→0.91) at ~equal param count — a representation win, not
+    # capacity. The encoder REPLACES the conv residual tower in rep/dyn (a conv stem
+    # remains). use_dyn_attention matters because the SimSiam consistency target is a
+    # smolgen-rich repr latent the conv dynamics can't reproduce; matching the bodies
+    # keeps geometry flowing through the MCTS rollout. pred-attention was tested and
+    # did NOT help (off). NOTE: dyn-attention runs ~num_simulations/move in the search
+    # hot path — a self-play throughput cost to weigh (probe before scaling depth).
+    use_repr_attention: bool = False
+    use_dyn_attention: bool = False
+    use_pred_attention: bool = False
+    use_smolgen: bool = True          # only active when an attention body is on
+    attn_layers: int = 4              # encoder depth in rep & dyn (supervised proxy: L6 > L4)
+    attn_heads: int = 4
+    pred_attn_layers: int = 2         # only used if use_pred_attention
+
     # Moves-left head (Lc0): aux categorical head predicting plies-to-game-end.
     # Breaks value saturation so search prefers faster wins over shuffling. Default
     # OFF (head not built → fully inert). support_size 10 ≈ covers ~120 plies with
@@ -856,6 +874,14 @@ def get_config(game: str) -> MuZeroConfig:
                                              # dynamics (probe: cross-action cos 1.0→0.61). Predicts
                                              # a_k from (h_k, h_{k+1}); forces action-conditioned dynamics.
             inverse_dynamics_loss_weight=1.0,
+            # Smolgen self-attention rep+dyn backbone — the validated endgame-conversion
+            # win (see field defs above). attn_layers=4 is the throughput-friendlier
+            # starting point; the supervised proxy's best was L6 (the natural scale-up
+            # after a clean self-play loop confirms throughput). pred-attention stays off.
+            use_repr_attention=True,
+            use_dyn_attention=True,
+            use_smolgen=True,
+            attn_layers=4,
             value_head_init_std=0.0,    # #4 cold-start gradient-block mitigation; off by default,
                                         # enable via --value-head-init-std 0.01 to A/B.
             stockfish_injection_games=0,       # Cold-start mode (2026-05-07): no Stockfish injection.

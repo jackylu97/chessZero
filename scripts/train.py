@@ -614,6 +614,13 @@ def main():
         value_head_blocks=getattr(config, "value_head_blocks", 0),
         moves_left_head_planes=getattr(config, "moves_left_head_planes", 1),
         moves_left_head_blocks=getattr(config, "moves_left_head_blocks", 0),
+        use_repr_attention=getattr(config, "use_repr_attention", False),
+        use_dyn_attention=getattr(config, "use_dyn_attention", False),
+        use_pred_attention=getattr(config, "use_pred_attention", False),
+        use_smolgen=getattr(config, "use_smolgen", True),
+        attn_layers=getattr(config, "attn_layers", 4),
+        attn_heads=getattr(config, "attn_heads", 4),
+        pred_attn_layers=getattr(config, "pred_attn_layers", 2),
     )
 
     trainer = MuZeroTrainer(
