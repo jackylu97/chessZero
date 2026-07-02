@@ -87,6 +87,7 @@ def spearman(a,b):
 print(f"loaded {CKPT}", flush=True)
 print(f"\n== SCALAR DTM accuracy on {len(roots)} won positions ==", flush=True)
 print(f"  MAE {np.mean(np.abs(err)):.2f} plies | median |err| {np.median(np.abs(err)):.2f} | bias(mean err) {np.mean(err):+.2f}", flush=True)
+print(f"  bias-corrected MAE (after removing the constant offset) {np.mean(np.abs(err-err.mean())):.2f} plies", flush=True)
 print(f"  within +/-2 plies: {np.mean(np.abs(err)<=2):.1%} | within +/-4: {np.mean(np.abs(err)<=4):.1%}", flush=True)
 print(f"  Spearman(pred, true DTM): {spearman(pml, true_dtm):.3f}", flush=True)
 print(f"  true DTM mean {true_dtm.mean():.1f}  pred mean {pml.mean():.1f}", flush=True)

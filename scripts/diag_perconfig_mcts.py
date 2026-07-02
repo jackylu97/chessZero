@@ -32,7 +32,8 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     use_scalar_transform=cfg.use_scalar_transform, value_target_scale=cfg.value_target_scale, value_head_type="wdl",
     draw_score=0.0, policy_head_type=cfg.policy_head_type, use_material_head=False,
     use_moves_left=True, moves_left_support_size=cfg.moves_left_support_size,
-    moves_left_head_planes=16, moves_left_head_blocks=1,
+    moves_left_head_planes=int(os.environ.get("MLH_PLANES", getattr(cfg,"moves_left_head_planes",16))),
+    moves_left_head_blocks=int(os.environ.get("MLH_BLOCKS", getattr(cfg,"moves_left_head_blocks",1))),
     use_repr_attention=ATTN, attn_layers=ATTNL, attn_heads=4, use_smolgen=SMOL,
     use_pred_attention=PREDATTN, pred_attn_layers=2, use_dyn_attention=DYNATTN).to(DEV)
 # strict=False: the checkpoint may carry training-only heads (projection/predictor/inverse)
