@@ -261,6 +261,20 @@ def main():
                              "config.moves_left_head_blocks, preset 0).")
     parser.add_argument("--value-head-planes", type=int, default=None,
                         help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--tb-anchor-path", type=str, default=None,
+                        help="Directory of TB anchor shards (scripts/gen_tb_anchor_games.py): "
+                             "tablebase-optimal demonstration games injected into the rolling "
+                             "buffer on an interval, cycling forever (persistent endgame anchor).")
+    parser.add_argument("--tb-anchor-games", type=int, default=64,
+                        help="TB anchor games injected per interval (default 64).")
+    parser.add_argument("--tb-anchor-interval", type=int, default=256,
+                        help="Training steps between TB anchor injections (default 256).")
+    parser.add_argument("--tb-rollout-fill", action="store_true", default=False,
+                        help="Win adjudication by demonstration: truncate a non-seeded self-play "
+                             "game at its first decisive in-TB ply when the played outcome "
+                             "contradicts the TB verdict, and finish it with TB-optimal play by "
+                             "both sides (true decisive z for the whole trajectory + an "
+                             "on-distribution conversion demonstration). Needs --tb-root-probe.")
     parser.add_argument("--tb-steer-policy", action="store_true", default=False,
                         help="Restore the search-side DTZ value bias (policy steering) in _select. "
                              "OFF by default — Lc0-faithful: inject TB signal via relabels, not search.")
@@ -498,6 +512,12 @@ def main():
         config.moves_left_head_blocks = args.moves_left_head_blocks
     if args.value_head_planes is not None:
         config.value_head_planes = args.value_head_planes
+    if args.tb_anchor_path is not None:
+        config.tb_anchor_path = args.tb_anchor_path
+        config.tb_anchor_games = args.tb_anchor_games
+        config.tb_anchor_interval = args.tb_anchor_interval
+    if args.tb_rollout_fill:
+        config.tb_rollout_fill = True
     if args.tb_steer_policy:
         config.tb_steer_policy = True
     if args.tb_policy_weight is not None:

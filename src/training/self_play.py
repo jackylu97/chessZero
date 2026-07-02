@@ -1,6 +1,7 @@
 """Self-play game generation for MuZero."""
 
 import random
+import time
 
 import numpy as np
 import torch
@@ -90,6 +91,10 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
     holdout_frac = min(max(float(getattr(config, "resign_holdout_frac", 0.0)), 0.0), 1.0)
 
     for h in histories:
+        if getattr(h, "tb_filled", False):
+            # TB-rollout-filled games already carry the true (tablebase) decisive
+            # outcome and end in an actual mate demonstration — never re-truncate.
+            continue
         rv = h.root_values
         n_ply = min(len(h.actions), len(rv))
         cnt = [0, 0]                 # consecutive own-move counters: [even, odd]
@@ -141,6 +146,98 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
         h.legal_actions_list = h.legal_actions_list[:p]
         h.observations = h.observations[:p + 1]
     return histories
+
+
+def _apply_tb_rollout_fill(histories: list[GameHistory], prober_params: dict) -> int:
+    """Win adjudication by demonstration (tb_rollout_fill, strategy_2026_07_02.md).
+
+    For each NON-seeded game whose deferred-relabel ``tablebase_values`` reveal a
+    decisive in-TB ply whose verdict CONTRADICTS the played outcome (the classic
+    won-but-shuffled-to-a-draw game): truncate the history at the first such ply
+    and finish the game with TB-optimal play by BOTH sides (``tb_playout``).
+
+    Two effects the per-ply value relabel cannot deliver:
+    (1) ``game_outcome`` becomes the TRUE result for the ENTIRE trajectory — the
+        pre-TB middlegame plies get a decisive z instead of the V^π draw poison.
+    (2) The appended tail is an on-distribution conversion demonstration
+        (soft win-preserving DTZ policy targets at states the model itself
+        reached) — no search-side steering, no covariate shift.
+
+    Seeded games are exempt: they START in a decisive TB position, so filling
+    would replace the model's own practice data at ply 0 (the anchor archive
+    already supplies pure demonstrations). Mutates histories in place; returns
+    the number of games filled.
+    """
+    from ..games.chess import ChessGame
+    from ..games.syzygy_probe import _get_local_prober
+    from .tb_playout import tb_playout, TBPlayoutError
+
+    prober = _get_local_prober(prober_params)
+    game = ChessGame()
+    nan = float("nan")
+    n_filled = 0
+    for h in histories:
+        if h.start_fen is not None or not h.tablebase_values:
+            continue
+        # First decisive in-TB ply. Win magnitudes are >= 1 - value_dtz_shape
+        # (>= 0.5 at the production shape 0.5); draws are exactly 0.
+        fill_idx = None
+        for i, tv in enumerate(h.tablebase_values):
+            if tv == tv and abs(tv) >= 0.45:
+                fill_idx = i
+                break
+        if fill_idx is None or fill_idx >= len(h.actions):
+            continue
+        # TB verdict in white POV (non-seeded games start white-to-move, so ply
+        # parity gives the side to move). Skip when the played outcome already
+        # matches — the model's own conversion is on-policy gold.
+        stm_white = (fill_idx % 2 == 0)
+        verdict = 1.0 if ((h.tablebase_values[fill_idx] > 0) == stm_white) else -1.0
+        if float(h.game_outcome) == verdict:
+            continue
+        # Reconstruct the board at fill_idx by replaying the stored actions
+        # (same replay path buffer serialization uses — proven action encoding).
+        state = game.reset()
+        for a in h.actions[:fill_idx]:
+            state, _, _ = game.step(state, a)
+        try:
+            res = tb_playout(state.board.copy(), prober)
+        except TBPlayoutError:
+            continue  # missing table / 50-move risk — leave the game untouched
+        # Truncate every per-ply list at fill_idx (obs keeps the fill-start
+        # position at index fill_idx: len(obs) == len(actions) + 1 invariant).
+        L_old = len(h.actions)
+        h.actions = h.actions[:fill_idx]
+        h.policies = h.policies[:fill_idx]
+        h.root_values = h.root_values[:fill_idx]
+        h.rewards = h.rewards[:fill_idx]
+        h.legal_actions_list = h.legal_actions_list[:fill_idx]
+        h.observations = h.observations[:fill_idx + 1]
+        tbv = h.tablebase_values[:fill_idx]
+        tbm = (h.tablebase_moves_left[:fill_idx] if h.tablebase_moves_left
+               else [nan] * fill_idx)
+        tbm += [nan] * (fill_idx - len(tbm))
+        tbp = (h.tablebase_policy[:fill_idx] if h.tablebase_policy
+               else [None] * fill_idx)
+        tbp += [None] * (fill_idx - len(tbp))
+        # Append the demonstration tail, stepping ChessGame for obs + legals.
+        for k, a in enumerate(res["actions"]):
+            h.legal_actions_list.append(game.legal_actions(state))
+            h.actions.append(a)
+            h.policies.append(res["policies"][k])
+            h.root_values.append(res["root_values"][k])
+            h.rewards.append(res["rewards"][k])
+            state, _, _ = game.step(state, a)
+            h.observations.append(game.to_tensor(state))
+        h.tablebase_values = tbv + res["tablebase_values"]
+        h.tablebase_moves_left = tbm + res["tablebase_moves_left"]
+        h.tablebase_policy = tbp + res["tablebase_policy"]
+        h.game_outcome = verdict
+        h.draw_by_repetition = False
+        h.draw_by_no_progress = False
+        h.tb_filled = True
+        n_filled += 1
+    return n_filled
 
 
 def get_material_value_weight(training_step: int, config) -> float:
@@ -978,6 +1075,22 @@ def play_games_parallel_gpu_resident(
                 h_g.tablebase_policy = pol_row
         h_g.observations.append(torch.from_numpy(final_obs_cpu[g]).clone())
         histories.append(h_g)
+
+    # 12. TB rollout fill (win adjudication by demonstration): won-but-unconverted
+    # NON-seeded games are truncated at their first decisive in-TB ply and finished
+    # with TB-optimal play. Runs BEFORE resignation (callers apply it after us);
+    # filled games are exempted there via h.tb_filled.
+    if getattr(config, "tb_rollout_fill", False) and tb_prober is not None:
+        _fill_params = _prober_params(
+            tb_prober, getattr(config, "tb_path", "data/syzygy"),
+            getattr(config, "tb_gaviota_path", None))
+        t_fill = time.time()
+        n_filled = _apply_tb_rollout_fill(histories, _fill_params)
+        if n_filled:
+            tqdm.write(
+                f"  TB rollout fill: {n_filled}/{num_games} games truncated at their "
+                f"first decisive TB ply + finished with TB-optimal play "
+                f"({time.time() - t_fill:.1f}s)")
 
     return histories
 

@@ -238,9 +238,10 @@ class SyzygyRootProber:
         which carries only the FEN, not the per-ply legal mask. Produces the identical
         {action: mover_value} mapping the inline ``_classify`` does for the same board."""
         vals: dict[int, float] = {}
-        winners: list[tuple[int, int]] = []  # (action, |child_dtz|)
+        winners: list[tuple[int, int]] = []  # (action, zeroing-aware DTZ rank)
         for move in board.legal_moves:
             action = _move_to_action(move, board.turn)
+            zeroing = board.is_zeroing(move)
             board.push(move)
             try:
                 if board.is_checkmate():
@@ -250,7 +251,13 @@ class SyzygyRootProber:
                 else:
                     mv = _wdl_to_mover_value(self.tb.probe_wdl(board))
                     if mv > 0.0:
-                        winners.append((action, abs(int(self.tb.probe_dtz(board)))))
+                        # Zeroing-aware rank: a win-keeping ZEROING move completes
+                        # the DTZ phase NOW (rank 0); a non-zeroing move completes
+                        # it in child-DTZ more plies. Plain |child_dtz| ranks the
+                        # repetition shuffle ABOVE the pawn push at cur_dtz==1
+                        # (the min-DTZ trap) — the policy target must not teach it.
+                        d = 0 if zeroing else abs(int(self.tb.probe_dtz(board)))
+                        winners.append((action, d))
                     else:
                         vals[action] = mv if mv < 0.0 else self.draw_score
             except (KeyError, ValueError, chess.syzygy.MissingTableError):
@@ -330,11 +337,12 @@ class SyzygyRootProber:
         """{action_index: mover_value} for the legal moves at ``board``,
         DTZ-ranked among winning moves (shortest → +1)."""
         vals: dict[int, float] = {}
-        winners: list[tuple[int, int]] = []  # (action, |child_dtz|)
+        winners: list[tuple[int, int]] = []  # (action, zeroing-aware DTZ rank)
         for action in torch.nonzero(legal_row, as_tuple=False).flatten().tolist():
             move = _action_to_move(action, board)
             if move is None or move not in board.legal_moves:
                 continue
+            zeroing = board.is_zeroing(move)
             board.push(move)
             try:
                 if board.is_checkmate():
@@ -344,7 +352,9 @@ class SyzygyRootProber:
                 else:
                     mv = _wdl_to_mover_value(self.tb.probe_wdl(board))
                     if mv > 0.0:
-                        winners.append((action, abs(int(self.tb.probe_dtz(board)))))
+                        # Zeroing-aware rank — see _classify_board (kept identical).
+                        d = 0 if zeroing else abs(int(self.tb.probe_dtz(board)))
+                        winners.append((action, d))
                     else:
                         vals[action] = mv if mv < 0.0 else self.draw_score
             except (KeyError, ValueError, chess.syzygy.MissingTableError):

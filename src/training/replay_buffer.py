@@ -97,6 +97,12 @@ class GameHistory:
     # alive. Drives self_play/tb_reach_rate — "how often does the model even reach
     # the stage where root TB probing fires?" Transient, not serialized.
     reached_tb: bool = False
+    # True iff this game was truncated at its first decisive in-TB ply and
+    # finished with a TB-optimal rollout (tb_rollout_fill): game_outcome is the
+    # tablebase verdict and the tail plies are demonstration targets. Exempted
+    # from resignation (the demonstration must not be re-truncated). Transient
+    # self-play stat (self_play/tb_fill_rate); not serialized.
+    tb_filled: bool = False
     # Per-ply STM-relative Syzygy value of the POSITION (DTZ-shaped), in [-1, 1],
     # NaN where the ply was not in TB range. Empty for games that never reached
     # the tablebase. When populated, make_target blends it into the VALUE target

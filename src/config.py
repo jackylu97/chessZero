@@ -593,6 +593,23 @@ class MuZeroConfig:
     # 0 = off. Cures covariate shift (the model trains on its OWN endgame states).
     endgame_seed_frac: float = 0.0
     endgame_seed_archive: str | None = None   # path to the seed FEN list (generate_endgame_seeds.py)
+    # TB endgame ANCHOR (strategy_2026_07_02.md): inject tb_anchor_games TB-optimal
+    # demonstration games (scripts/gen_tb_anchor_games.py archive) into the rolling
+    # buffer every tb_anchor_interval steps, cycling the archive forever. This is the
+    # validated supervised-proxy signal (KQvK 0.91) as a PERSISTENT anchor — the
+    # direct TB→policy teaching channel self-play lacks. 0/None = off.
+    tb_anchor_path: str | None = None
+    tb_anchor_games: int = 0
+    tb_anchor_interval: int = 0
+    # TB ROLLOUT FILL (win adjudication by demonstration): truncate a NON-seeded
+    # self-play game at its first decisive in-TB ply when the played outcome
+    # contradicts the tablebase verdict, and finish it with TB-optimal play by both
+    # sides. The stored game_outcome becomes the TRUE result for the WHOLE trajectory
+    # (decisive z for the pre-TB middlegame plies — the channel the per-ply value
+    # relabel can't reach) and the appended tail is an on-distribution conversion
+    # demonstration. Seeded games are exempt (they'd be adjudicated at ply 0,
+    # deleting the practice data they exist to generate).
+    tb_rollout_fill: bool = False
     # Overlap the ~141ms single-threaded sample_batch with the GPU train step via
     # a background prefetch thread (double-buffered, lock-guarded against buffer
     # writes). ~halves per-step time during the training phase. Off by default.

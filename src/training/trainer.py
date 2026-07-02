@@ -22,7 +22,10 @@ from ..config import MuZeroConfig
 from ..games.base import Game
 from ..model.muzero_net import MuZeroNetwork
 from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar, inverse_scalar_transform
-from .replay_buffer import ReplayBuffer, _iter_shard_games, _shard_record_count, _sparsify_policy
+from .replay_buffer import (
+    GameHistory, ReplayBuffer, _iter_shard_games, _shard_record_count,
+    _sparsify_policy,
+)
 from .representation_probe import compute_repr_metrics
 from .self_play import (run_self_play, get_material_value_weight, get_material_head_weight,
                         get_warmstart_sample_frac, get_tb_policy_weight)
@@ -159,6 +162,19 @@ class MuZeroTrainer:
         # at a time by _inject_stockfish_games to avoid re-reading each shard.
         self._injection_shard_idx: int = 0
         self._injection_shard_games: list = []
+
+        # TB endgame ANCHOR injection state (strategy_2026_07_02.md). Unlike the
+        # bounded Stockfish pool, the anchor CYCLES its archive forever — a
+        # persistent, never-annealed supply of tablebase-optimal demonstration
+        # games (the supervised-proxy signal, KQvK 0.91) injected into the
+        # rolling self-play pool. Compact dicts stay in RAM; each injection
+        # reconstructs a FRESH GameHistory so buffer entries never alias.
+        self._tb_anchor_dicts: list[dict] = []
+        self._tb_anchor_cursor: int = 0
+        self._tb_anchor_injected: int = 0
+        tb_anchor_path = getattr(config, "tb_anchor_path", None)
+        if tb_anchor_path:
+            self._load_tb_anchor(tb_anchor_path)
         # Lazily-built fixed held-out probe set for the in-loop representation
         # informativeness metric (repr/* scalars). See representation_probe.py.
         self._repr_probe_set = None
@@ -231,6 +247,19 @@ class MuZeroTrainer:
                 and step % self.config.stockfish_injection_interval == 0
             ):
                 self._inject_stockfish_games(self.config.stockfish_injection_games)
+
+            # TB endgame anchor injection: a cycling, never-exhausting supply of
+            # tablebase-optimal demonstration games (the validated supervised-
+            # proxy signal) mixed into the rolling buffer at a constant rate.
+            tb_anchor_interval = int(getattr(self.config, "tb_anchor_interval", 0))
+            if (
+                self._tb_anchor_dicts
+                and tb_anchor_interval > 0
+                and step > 0
+                and step % tb_anchor_interval == 0
+            ):
+                self._inject_tb_anchor_games(
+                    int(getattr(self.config, "tb_anchor_games", 0)))
 
             # Self-play / reanalyze gating. Two modes:
             #   (A) Explicit two-phase: if ``self_play_warmup_steps`` is set,
@@ -482,6 +511,12 @@ class MuZeroTrainer:
         self.writer.add_scalar("self_play/resign_holdout_rate", holdout_triggered / n_games, self.global_step)
         self.writer.add_scalar("self_play/resign_false_positive_rate",
                                resign_fp / max(1, holdout_triggered), self.global_step)
+        # TB rollout fill: fraction of games truncated at a decisive in-TB ply and
+        # finished with TB-optimal play (won-but-unconverted adjudications).
+        if getattr(self.config, "tb_rollout_fill", False):
+            filled = sum(1 for g in games if getattr(g, "tb_filled", False))
+            self.writer.add_scalar(
+                "self_play/tb_fill_rate", filled / n_games, self.global_step)
         # Root tablebase reach rate: fraction of games that ever simplified into a
         # ≤tb_max_pieces position (where root TB probing can fire). Tells us how
         # often the model even reaches the endgame stage the probe targets.
@@ -763,6 +798,50 @@ class MuZeroTrainer:
                 drop = target - skipped
                 self._injection_shard_games = self._injection_shard_games[drop:]
                 return
+
+    def _load_tb_anchor(self, path: str) -> None:
+        """Load the TB anchor archive (v2 compact shards) as raw compact dicts.
+
+        Dicts (not GameHistories) are cached: observations are rebuilt per
+        injection via ``from_compact_dict`` so repeated injections of the same
+        game never share mutable state (birth stamps, reanalyze, priorities).
+        """
+        import random as _random
+        shards = sorted(Path(path).glob("*.pkl"))
+        for shard in shards:
+            with open(shard, "rb") as f:
+                header = pickle.load(f)
+                if not (isinstance(header, dict) and header.get("version") == 2):
+                    raise ValueError(f"{shard}: expected v2 compact shard")
+                for _ in range(int(header["n_records"])):
+                    self._tb_anchor_dicts.append(pickle.load(f))
+        _random.Random(0).shuffle(self._tb_anchor_dicts)
+        print(f"TB anchor archive: {len(self._tb_anchor_dicts)} games "
+              f"from {len(shards)} shard(s) at {path}")
+
+    def _inject_tb_anchor_games(self, n: int) -> None:
+        """Inject ``n`` TB anchor games into the rolling buffer, cycling the
+        archive (reshuffled each wrap). See _load_tb_anchor."""
+        if not self._tb_anchor_dicts:
+            return
+        import random as _random
+        for _ in range(n):
+            if self._tb_anchor_cursor >= len(self._tb_anchor_dicts):
+                _random.shuffle(self._tb_anchor_dicts)
+                self._tb_anchor_cursor = 0
+            d = self._tb_anchor_dicts[self._tb_anchor_cursor]
+            self._tb_anchor_cursor += 1
+            g = GameHistory.from_compact_dict(d, self.game)
+            with self._buffer_lock:
+                self.replay_buffer.save_game(g)
+            self._tb_anchor_injected += 1
+        self.writer.add_scalar(
+            "injection/tb_anchor_total", self._tb_anchor_injected, self.global_step
+        )
+        tqdm.write(
+            f"Step {self.global_step}: injected {n} TB anchor games "
+            f"(total {self._tb_anchor_injected}, buffer {len(self.replay_buffer)})"
+        )
 
     def _inject_stockfish_games(self, n: int) -> None:
         """Inject up to ``n`` next-un-consumed Stockfish games into the buffer.
