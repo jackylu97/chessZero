@@ -261,6 +261,10 @@ def main():
                              "config.moves_left_head_blocks, preset 0).")
     parser.add_argument("--value-head-planes", type=int, default=None,
                         help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--no-attention", action="store_true", default=False,
+                        help="Disable the attention backbone (use the conv residual tower) even "
+                             "when the game preset enables it — for conv-vs-attention A/Bs and "
+                             "resuming conv-era checkpoints.")
     parser.add_argument("--tb-anchor-path", type=str, default=None,
                         help="Directory of TB anchor shards (scripts/gen_tb_anchor_games.py): "
                              "tablebase-optimal demonstration games injected into the rolling "
@@ -512,6 +516,10 @@ def main():
         config.moves_left_head_blocks = args.moves_left_head_blocks
     if args.value_head_planes is not None:
         config.value_head_planes = args.value_head_planes
+    if args.no_attention:
+        config.use_repr_attention = False
+        config.use_dyn_attention = False
+        config.use_pred_attention = False
     if args.tb_anchor_path is not None:
         config.tb_anchor_path = args.tb_anchor_path
         config.tb_anchor_games = args.tb_anchor_games
