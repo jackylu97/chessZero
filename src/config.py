@@ -346,6 +346,15 @@ class MuZeroConfig:
     # false-positive rate (self_play/resign_false_positive_rate) is measurable.
     # AlphaZero played ~20% to completion; tune resign_threshold to keep FP < 5%.
     resign_holdout_frac: float = 0.15
+    # Exempt SEEDED games (start_fen set) from resignation. On seeds resignation
+    # is all cost, no benefit: value labels are already TB-true (all plies in-TB
+    # at tb_value_weight=1.0), truncation is post-hoc (no compute saved), and it
+    # fires precisely in the games where the model is about to practice the
+    # conversion — deleting the finishing sequence seeding exists to generate,
+    # while reducing seed/conversion to a value-calibration proxy (~95% of
+    # "conversions" were resignations). With the exemption, seed/conversion and
+    # seed/mate_rate become honest on-policy skill metrics.
+    resign_exempt_seeded: bool = False
 
     # Stratified sampling: at every training batch, sample
     # floor(batch_size * warmstart_sample_frac) games from warmstart-only

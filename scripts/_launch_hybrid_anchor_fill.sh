@@ -13,12 +13,21 @@
 # defaults. Watch: eval/win_rate_vs_random vs BOTH conv_anchor_fill and seed30
 # at matched steps; raw diag at 30k (CFG=chess_hybrid USE_ATTENTION=1
 # USE_DYN_ATTENTION=1 USE_PRED_ATTENTION=1).
+# v2 (2026-07-03): restart from v1's checkpoint_15000 (warmstart complete) with
+# --resign-exempt-seeded — on seeds resignation is all cost, no benefit (value
+# labels TB-true regardless; truncation post-hoc; it deletes exactly the
+# conversion-practice tails and reduces seed/conversion to a value-calibration
+# proxy). Whole self-play phase now runs under one policy; seed/conversion and
+# seed/mate_rate are honest skill metrics. NOTE vs conv run: differs by arch AND
+# seed-resign policy — the raw diag remains the clean arch instrument.
 set -uo pipefail
 cd /workspace/chessZero
-RUN=2026_07_03_hybrid_anchor_fill
+RUN=2026_07_03_hybrid_anchor_fill_v2
 tmux kill-session -t selfplay 2>/dev/null
 tmux new-session -d -s selfplay "PYTHONPATH=. .venv/bin/python -u scripts/_faulthandler_bootstrap.py scripts/train.py \
   --game chess_hybrid --run-id $RUN --device cuda \
+  --resume checkpoints/chess/2026_07_03_hybrid_anchor_fill/checkpoint_15000.pt \
+  --resign-exempt-seeded \
   --steps 150000 --eval-interval 2000 --mask-illegal-policy \
   --stockfish-injection-path data/stockfish_injection \
   --stockfish-injection-games 300 --stockfish-injection-interval 256 \
@@ -36,5 +45,5 @@ tmux new-session -d -s selfplay "PYTHONPATH=. .venv/bin/python -u scripts/_fault
   --endgame-seed-frac 0.30 --endgame-seed-archive data/endgame_seeds_train.txt \
   --tb-anchor-path data/tb_anchor --tb-anchor-games 64 --tb-anchor-interval 256 \
   --tb-rollout-fill \
-  2>&1 | tee /workspace/chessZero/selfplay_hybrid_anchor_fill.log"
+  2>&1 | tee /workspace/chessZero/selfplay_hybrid_anchor_fill_v2.log"
 echo "launched tmux 'selfplay' (run $RUN); attach: tmux attach -t selfplay"

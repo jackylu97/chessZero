@@ -90,10 +90,16 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
     # (value head said "lost" but the side did NOT actually lose) is measurable.
     holdout_frac = min(max(float(getattr(config, "resign_holdout_frac", 0.0)), 0.0), 1.0)
 
+    exempt_seeded = bool(getattr(config, "resign_exempt_seeded", False))
     for h in histories:
         if getattr(h, "tb_filled", False):
             # TB-rollout-filled games already carry the true (tablebase) decisive
             # outcome and end in an actual mate demonstration — never re-truncate.
+            continue
+        if exempt_seeded and h.start_fen is not None:
+            # Seeded games: value labels are TB-true regardless (all plies in-TB),
+            # and resignation would truncate exactly the conversion-practice tails
+            # seeding exists to generate. See config.resign_exempt_seeded.
             continue
         rv = h.root_values
         n_ply = min(len(h.actions), len(rv))

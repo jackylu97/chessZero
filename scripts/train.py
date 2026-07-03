@@ -262,6 +262,11 @@ def main():
                              "config.moves_left_head_blocks, preset 0).")
     parser.add_argument("--value-head-planes", type=int, default=None,
                         help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--resign-exempt-seeded", action="store_true", default=False,
+                        help="Exempt seeded (start_fen) games from resignation: their value labels "
+                             "are TB-true regardless, and resignation truncates exactly the "
+                             "conversion-practice tails seeding exists to generate. Makes "
+                             "seed/conversion and seed/mate_rate honest skill metrics.")
     parser.add_argument("--no-attention", action="store_true", default=False,
                         help="Disable the attention backbone (use the conv residual tower) even "
                              "when the game preset enables it — for conv-vs-attention A/Bs and "
@@ -517,6 +522,8 @@ def main():
         config.moves_left_head_blocks = args.moves_left_head_blocks
     if args.value_head_planes is not None:
         config.value_head_planes = args.value_head_planes
+    if args.resign_exempt_seeded:
+        config.resign_exempt_seeded = True
     if args.no_attention:
         config.use_repr_attention = False
         config.use_dyn_attention = False
