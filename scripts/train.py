@@ -28,7 +28,7 @@ def get_game(name: str):
     if name == "connect4":
         from src.games.connect4 import Connect4
         return Connect4()
-    if name in ("chess", "chess_small"):
+    if name in ("chess", "chess_small", "chess_hybrid"):
         from src.games.chess import ChessGame
         return ChessGame()
     if name == "checkers":
@@ -40,7 +40,8 @@ def get_game(name: str):
 def main():
     parser = argparse.ArgumentParser(description="Train MuZero")
     parser.add_argument("--game", type=str, default="tictactoe",
-                        choices=["tictactoe", "connect4", "chess", "chess_small", "checkers"])
+                        choices=["tictactoe", "connect4", "chess", "chess_small",
+                                 "chess_hybrid", "checkers"])
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--log-dir", type=str, default="runs")
@@ -649,6 +650,7 @@ def main():
         attn_layers=getattr(config, "attn_layers", 4),
         attn_heads=getattr(config, "attn_heads", 4),
         pred_attn_layers=getattr(config, "pred_attn_layers", 2),
+        hybrid_stem_blocks=getattr(config, "hybrid_stem_blocks", 0),
     )
 
     trainer = MuZeroTrainer(

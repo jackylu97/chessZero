@@ -48,6 +48,42 @@ class ResidualBlock(nn.Module):
         return torch.relu(out + residual)
 
 
+class SEResidualBlock(nn.Module):
+    """Residual block with a Squeeze-Excitation channel gate (Lc0's conv-era
+    upgrade): Conv -> Norm -> ReLU -> Conv -> Norm -> SE-gate, add, ReLU.
+
+    The SE gate (global average pool -> FC(C->C/r) -> ReLU -> FC(C/r->C) ->
+    sigmoid, applied as a per-channel scale) gives every conv block a cheap
+    global-context signal — the standard mitigation for the conv effective-
+    receptive-field dilution problem on chess boards (long-range slider/king
+    relations). ~2k params at C=128, r=16. Used as the conv STEM of the hybrid
+    body (strategy_2026_07_02.md §8 follow-up): local tactical primitives with
+    global channel context, feeding the attention encoder.
+    """
+
+    def __init__(self, planes: int, spatial_shape: tuple[int, int], se_ratio: int = 16):
+        super().__init__()
+        self.conv1 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
+        self.bn1 = norm_layer(planes, spatial_shape)
+        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
+        self.bn2 = norm_layer(planes, spatial_shape)
+        squeezed = max(4, planes // se_ratio)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(planes, squeezed, 1),
+            nn.ReLU(),
+            nn.Conv2d(squeezed, planes, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out * self.se(out)
+        return torch.relu(out + residual)
+
+
 def mlp_head(in_features: int, hidden: int, out_features: int) -> nn.Sequential:
     """Simple MLP: Linear-ReLU-Linear."""
     return nn.Sequential(

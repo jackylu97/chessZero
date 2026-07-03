@@ -471,6 +471,12 @@ class MuZeroConfig:
     attn_layers: int = 4              # encoder depth in rep & dyn (supervised proxy: L6 > L4)
     attn_heads: int = 4
     pred_attn_layers: int = 2         # only used if use_pred_attention
+    # HYBRID body (strategy_2026_07_02.md §8): when >0 and an attention body is on,
+    # prepend this many SE-residual conv blocks (local tactical primitives + Lc0-style
+    # global channel gating) before the attention encoder in rep AND dyn. Conv's
+    # data-efficient local prior for the midgame + attention's global mixing for
+    # long-range geometry, at a 2x (not 10x) parameter budget.
+    hybrid_stem_blocks: int = 0
 
     # Moves-left head (Lc0): aux categorical head predicting plies-to-game-end.
     # Breaks value saturation so search prefers faster wins over shuffling. Default
@@ -1073,5 +1079,34 @@ def get_config(game: str) -> MuZeroConfig:
         max_plies=750,               # 1024 -> 750: match the 384-parallel GPU-memory
                                      #   envelope (384*750=288k < the fitted 512*680 sweep;
                                      #   1024 would exceed the tested size and risk OOM).
+    )
+    # chess_hybrid (2026-07-03, strategy doc §8): the ~2x HYBRID — conv-SE stem +
+    # attention body in rep AND dyn (matched bodies per the EXP-0 lesson), a shared
+    # 1-layer attention prediction body before the heads split, and widened value /
+    # moves-left projections (the 1-plane heads provably under-read the latent).
+    # d128 with 4 heads fixes the head-dim-16 thinness of chess_small's d64 attention.
+    # Rationale: conv's data-efficient local prior for the midgame (the conv-vs-attn
+    # production gap at matched steps) + attention's global mixing for endgame
+    # geometry (the 4%-vs-41% supervised proxy gap), at a size the current data
+    # budget can feed. Aux SSL/inverse-dynamics heads grow with d128 (training-only);
+    # slim them further if VRAM binds.
+    configs["chess_hybrid"] = replace(
+        configs["chess_small"],
+        hidden_planes=128,           # attention d_model; 4 heads x head-dim 32
+        fc_hidden=128,
+        use_repr_attention=True,
+        use_dyn_attention=True,
+        use_smolgen=True,
+        attn_layers=4,
+        attn_heads=4,
+        hybrid_stem_blocks=2,        # conv-SE stem depth in rep & dyn
+        use_pred_attention=True,     # shared pre-head attention body (PredictionNetwork);
+                                     #   feeds policy + value + moves-left (material stays
+                                     #   on the raw latent — it's a world-model regularizer)
+        pred_attn_layers=2,          # ~12 MFLOPs/layer vs ~100 for one dynamics apply:
+                                     #   +~10%/sim per layer — depth 2 is affordable
+        value_head_planes=8,         # 1 -> 8: un-bottleneck the value projection
+        moves_left_head_planes=8,    # 1 -> 8: latent holds DTZ at corr 0.80, the
+                                     #   1-plane head reads it at 0.035
     )
     return configs.get(game, configs["tictactoe"])

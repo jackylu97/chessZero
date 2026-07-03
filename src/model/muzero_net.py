@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from .utils import (
     ResidualBlock,
+    SEResidualBlock,
     inverse_scalar_transform,
     mlp_head,
     norm_layer,
@@ -33,6 +34,7 @@ class RepresentationNetwork(nn.Module):
         attn_layers: int = 4,
         attn_heads: int = 4,
         use_smolgen: bool = True,
+        hybrid_stem_blocks: int = 0,
     ):
         super().__init__()
         self.latent_h = latent_h
@@ -51,11 +53,22 @@ class RepresentationNetwork(nn.Module):
             # Self-attention encoder over the latent_h*latent_w board tokens: learned
             # positional embeddings + global self-attention + (optional) smolgen. Replaces
             # the conv residual tower to give the representation long-range board geometry.
+            # hybrid_stem_blocks > 0 prepends SE-residual conv blocks (the HYBRID body,
+            # strategy_2026_07_02.md §8): the conv stem supplies local tactical primitives
+            # + absolute-position anchoring; the attention encoder composes them globally.
             from .attention import BoardAttentionEncoder
-            self.blocks = BoardAttentionEncoder(
+            encoder = BoardAttentionEncoder(
                 dim=hidden_planes, h=latent_h, w=latent_w,
                 n_layers=attn_layers, n_heads=attn_heads, use_smolgen=use_smolgen,
             )
+            if hybrid_stem_blocks > 0:
+                self.blocks = nn.Sequential(
+                    *[SEResidualBlock(hidden_planes, (latent_h, latent_w))
+                      for _ in range(hybrid_stem_blocks)],
+                    encoder,
+                )
+            else:
+                self.blocks = encoder
         else:
             self.blocks = nn.Sequential(
                 *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
@@ -114,6 +127,7 @@ class DynamicsNetwork(nn.Module):
         attn_layers: int = 4,
         attn_heads: int = 4,
         use_smolgen: bool = True,
+        hybrid_stem_blocks: int = 0,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -136,9 +150,21 @@ class DynamicsNetwork(nn.Module):
         # dynamics cannot reproduce a smolgen-rich repr target, which craters MCTS).
         if use_attention:
             from .attention import BoardAttentionEncoder
-            self.blocks = BoardAttentionEncoder(
+            encoder = BoardAttentionEncoder(
                 dim=hidden_planes, h=latent_h, w=latent_w,
                 n_layers=attn_layers, n_heads=attn_heads, use_smolgen=use_smolgen)
+            if hybrid_stem_blocks > 0:
+                # Hybrid body (see RepresentationNetwork): conv-SE stem before the
+                # attention encoder. In the DYNAMICS this matters most — one move's
+                # consequences are global, and dilution compounds over the K-step
+                # unroll and the search depth (matched bodies per the EXP-0 lesson).
+                self.blocks = nn.Sequential(
+                    *[SEResidualBlock(hidden_planes, (latent_h, latent_w))
+                      for _ in range(hybrid_stem_blocks)],
+                    encoder,
+                )
+            else:
+                self.blocks = encoder
         else:
             self.blocks = nn.Sequential(
                 *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
@@ -554,6 +580,7 @@ class MuZeroNetwork(nn.Module):
         use_pred_attention: bool = False,
         pred_attn_layers: int = 2,
         use_dyn_attention: bool = False,
+        hybrid_stem_blocks: int = 0,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -575,6 +602,7 @@ class MuZeroNetwork(nn.Module):
             latent_h, latent_w, input_h, input_w,
             use_attention=use_repr_attention, attn_layers=attn_layers,
             attn_heads=attn_heads, use_smolgen=use_smolgen,
+            hybrid_stem_blocks=hybrid_stem_blocks,
         )
         self.dynamics = DynamicsNetwork(
             hidden_planes, num_blocks, action_space_size,
@@ -583,6 +611,7 @@ class MuZeroNetwork(nn.Module):
             reward_support_size=reward_support_size,
             use_attention=use_dyn_attention, attn_layers=attn_layers,
             attn_heads=attn_heads, use_smolgen=use_smolgen,
+            hybrid_stem_blocks=hybrid_stem_blocks,
         )
         self.prediction = PredictionNetwork(
             hidden_planes, action_space_size,
@@ -663,15 +692,34 @@ class MuZeroNetwork(nn.Module):
 
     def predict_moves_left(self, hidden: torch.Tensor) -> torch.Tensor:
         """Moves-left logits (B, 2*K+1) from a hidden state. Queried separately
-        (training: CE loss; search: gated utility). POV-independent."""
+        (training: CE loss; search: gated utility). POV-independent.
+
+        When the shared prediction body exists (use_pred_attention), the head
+        reads the BODY output — same decision features policy/value see. The
+        moves-left output is search-consumed (the MCTS utility), so its accuracy
+        matters directly; the raw latent provably under-serves thin heads
+        (DTZ corr 0.80 in the latent, 0.035 through a 1-plane head). The body
+        forward is recomputed here (prediction() computes it for policy/value);
+        redundant but small (~12 MFLOPs/layer) and keeps the query API unchanged.
+        """
         assert self.moves_left_head is not None, \
             "predict_moves_left() called with use_moves_left=False"
+        body = getattr(self.prediction, "pred_body", None)
+        if body is not None:
+            hidden = body(hidden)
         return self.moves_left_head(hidden)
 
     def predict_material(self, hidden: torch.Tensor) -> torch.Tensor:
         """Material-margin logits (B, 2*K+1) from a hidden state. Queried
         separately for the aux CE loss (training-only; not used by MCTS).
-        Target is STM-relative material, so no negamax flip."""
+        Target is STM-relative material, so no negamax flip.
+
+        DELIBERATELY reads the RAW latent, not the shared prediction body: this
+        head's entire purpose is to be a world-model regularizer — it pressures
+        the LATENT itself to encode material. Routing it through the prediction
+        body would let the body compute material while the latent stays vague,
+        defeating the regularization (its output is consumed nowhere at
+        inference, so head accuracy per se is worthless)."""
         assert self.material_head is not None, \
             "predict_material() called with use_material_head=False"
         return self.material_head(hidden)

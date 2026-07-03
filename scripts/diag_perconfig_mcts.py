@@ -13,13 +13,18 @@ from src.games.chess_gpu import GpuChessGame
 from src.model.muzero_net import MuZeroNetwork
 from src.mcts.tensor_mcts import TensorMCTS
 
-DEV="cuda"; cfg=get_config("chess_small"); game=ChessGame(); AS=game.action_space_size; NF=cfg.history_frames
-gg=GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
 import os
+DEV="cuda"; cfg=get_config(os.environ.get("CFG","chess_small")); game=ChessGame(); AS=game.action_space_size; NF=cfg.history_frames
+gg=GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
 CKPT=os.environ.get("CKPT","checkpoints/tb5_seq_ml.pt"); ATTN=os.environ.get("USE_ATTENTION","0")=="1"
 SMOL=os.environ.get("USE_SMOLGEN","1")=="1"; PREDATTN=os.environ.get("USE_PRED_ATTENTION","0")=="1"
 DYNATTN=os.environ.get("USE_DYN_ATTENTION","0")=="1"
 ATTNL=int(os.environ.get("ATTN_LAYERS","4"))
+# CFG=chess_hybrid picks up hidden/fc/head widths from the preset; these envs then
+# only need to mirror the attention body switches.
+HYBRID_STEM=int(os.environ.get("HYBRID_STEM", str(getattr(cfg,"hybrid_stem_blocks",0))))
+PREDATTN_LAYERS=int(os.environ.get("PRED_ATTN_LAYERS", str(getattr(cfg,"pred_attn_layers",2))))
+VHP=int(os.environ.get("VALUE_HEAD_PLANES", str(getattr(cfg,"value_head_planes",1))))
 ML_SUPPORT=int(os.environ.get("ML_SUPPORT", str(cfg.moves_left_support_size)))
 ML_LINEAR=os.environ.get("ML_LINEAR","0")=="1"
 cfg.moves_left_support_size=ML_SUPPORT; cfg.moves_left_use_transform=not ML_LINEAR
@@ -35,7 +40,8 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     moves_left_head_planes=int(os.environ.get("MLH_PLANES", getattr(cfg,"moves_left_head_planes",16))),
     moves_left_head_blocks=int(os.environ.get("MLH_BLOCKS", getattr(cfg,"moves_left_head_blocks",1))),
     use_repr_attention=ATTN, attn_layers=ATTNL, attn_heads=4, use_smolgen=SMOL,
-    use_pred_attention=PREDATTN, pred_attn_layers=2, use_dyn_attention=DYNATTN).to(DEV)
+    use_pred_attention=PREDATTN, pred_attn_layers=PREDATTN_LAYERS, use_dyn_attention=DYNATTN,
+    hybrid_stem_blocks=HYBRID_STEM, value_head_planes=VHP).to(DEV)
 # strict=False: the checkpoint may carry training-only heads (projection/predictor/inverse)
 # that the inference backbone lacks; those are ignored. Missing keys => arch mismatch (fatal).
 _res=net.load_state_dict(torch.load(CKPT, map_location=DEV)["model_state_dict"], strict=False)
