@@ -242,6 +242,7 @@ def _apply_tb_rollout_fill(histories: list[GameHistory], prober_params: dict) ->
         h.draw_by_repetition = False
         h.draw_by_no_progress = False
         h.tb_filled = True
+        h.tb_authored = True   # fill-tail policies are TB demos — shield from reanalyze
         n_filled += 1
     return n_filled
 
@@ -704,9 +705,41 @@ def play_games_parallel_gpu_resident(
     action_space_size = chess_game.action_space_size
     n_frames = int(getattr(config, "history_frames", 1))
     seeded = start_fens is not None
-    # Seeded endgame games start mid-game; a random opening would wreck the
-    # position, so disable it for them.
-    n_random = 0 if seeded else int(getattr(config, "random_opening_plies", 0))
+    # Per-game opening plan. Seeded games (a start FEN) never open randomly — a
+    # random opening would wreck the position. start_fens may contain None
+    # entries (merged_seed_batch: normal + seeded games in ONE sweep). For
+    # NORMAL games, two opening modes:
+    #  - legacy (default): random_opening_plies uniform-random plies, ONE-HOT
+    #    policy targets (unchanged behavior);
+    #  - ε-mixture (opening_mix_mean_plies > 0): per-game r ~ U[1, 2·mean]
+    #    plies, uniform-random w.p. opening_uniform_frac (model-independent
+    #    diversity floor) else raw-policy softmax at opening_policy_temp
+    #    (KataGo initGamesWithPolicy). Opening plies store ZERO policy targets
+    #    (make_target's zero-CE no-op — no gradient toward opening moves).
+    fen_list = list(start_fens) if start_fens is not None else [None] * num_games
+    assert len(fen_list) == num_games, "start_fens must have length num_games"
+    is_seed_l = [f is not None for f in fen_list]
+    mix_mean = int(getattr(config, "opening_mix_mean_plies", 0))
+    mix_on = mix_mean > 0
+    n_random_scalar = int(getattr(config, "random_opening_plies", 0))
+    open_uniform_frac = float(getattr(config, "opening_uniform_frac", 0.15))
+    open_policy_temp = max(float(getattr(config, "opening_policy_temp", 1.5)), 1e-3)
+    open_len_l, open_uniform_l = [], []
+    for sd in is_seed_l:
+        if sd:
+            open_len_l.append(0); open_uniform_l.append(False)
+        elif mix_on:
+            open_len_l.append(random.randint(1, 2 * mix_mean))
+            open_uniform_l.append(random.random() < open_uniform_frac)
+        else:
+            open_len_l.append(n_random_scalar); open_uniform_l.append(True)
+    open_len_t = torch.tensor(open_len_l, dtype=torch.int32, device=device)
+    open_uniform_t = torch.tensor(open_uniform_l, dtype=torch.bool, device=device)
+    max_open = max(open_len_l) if open_len_l else 0
+    min_open = min(open_len_l) if open_len_l else 0
+    # Downstream batch-wide gates (subtree reuse, inline-prober skip) key on the
+    # LAST possible opening ply; keep the legacy name.
+    n_random = max_open
     temp_init = get_temperature(training_step, config)
     temp_final = float(config.temperature_final)
     temp_drop = int(config.temperature_drop_step)
@@ -757,11 +790,14 @@ def play_games_parallel_gpu_resident(
     # does the in-engine termination, alive_mask handles per-game stopping.
     max_plies_cap = int(getattr(config, "max_plies", getattr(ChessGame, "max_plies", 400)))
 
-    if seeded:
+    if any(is_seed_l):
+        # Any seeded game present: build the batch from explicit boards. None
+        # entries (merged_seed_batch normal games) get the standard start —
+        # identical state to reset_batch, just via the python-chess bridge.
         import chess as _chess
-        assert len(start_fens) == num_games, "start_fens must have length num_games"
         state = gpu_game.from_python_chess(
-            [_chess.Board(f) for f in start_fens], device=device)
+            [_chess.Board(f) if f is not None else _chess.Board() for f in fen_list],
+            device=device)
     else:
         state = gpu_game.reset_batch(num_games, device=device)
 
@@ -833,18 +869,35 @@ def play_games_parallel_gpu_resident(
         # deferred branch fills it). Appended once per ply below to keep T-alignment.
         tb_fen_row = None
 
-        # 3. MCTS — but skip for the random-opening plies (all alive games
-        # have move_count == ply during the opening because move_count
-        # increments by alive_mask each ply and starts at 0). For ply >=
-        # n_random, every alive game is out of opening.
-        if ply < n_random:
-            # Pure-random opening: uniform sample from legal_mask, no MCTS.
+        # Opening-move computation, shared by the two call sites below.
+        # Uniform mode: multinomial over legal moves. Policy mode (ε-mixture):
+        # one raw initial_inference (no search), softmax at opening_policy_temp.
+        # Targets: ZERO policy rows under the mixture (make_target zero-CE
+        # no-op); legacy mode keeps the historical one-hot.
+        def _opening_actions():
             uniform_logits = legal_mask.to(torch.float32)
-            action = torch.multinomial(uniform_logits, 1).squeeze(1).long()
-            policy = torch.zeros(
-                num_games, action_space_size, device=device, dtype=torch.float32
-            )
-            policy.scatter_(1, action.unsqueeze(1), 1.0)
+            u_act = torch.multinomial(uniform_logits, 1).squeeze(1).long()
+            if mix_on and bool((~open_uniform_t).any()):
+                with torch.no_grad():
+                    _, pol_logits, _ = network.initial_inference(stacked_obs)
+                masked = pol_logits.masked_fill(~legal_mask, float("-inf"))
+                probs = torch.softmax(masked / open_policy_temp, dim=-1)
+                p_act = torch.multinomial(probs, 1).squeeze(1).long()
+                o_act = torch.where(open_uniform_t, u_act, p_act)
+            else:
+                o_act = u_act
+            o_pol = torch.zeros(
+                num_games, action_space_size, device=device, dtype=torch.float32)
+            if not mix_on:
+                o_pol.scatter_(1, o_act.unsqueeze(1), 1.0)  # legacy one-hot
+            return o_act, o_pol
+
+        # 3. MCTS — but skip while EVERY game is still inside its opening
+        # (per-game open_len; ply < min_open ⇒ all games opening). In the mixed
+        # window (min_open <= ply < max_open) the MCTS branch runs and opening
+        # games' actions/targets are overridden after it.
+        if ply < min_open:
+            action, policy = _opening_actions()
             value = torch.zeros(num_games, device=device, dtype=torch.float32)
         else:
             forced_draw_mask = (
@@ -905,6 +958,17 @@ def play_games_parallel_gpu_resident(
             # value relabel (Syzygy WDL) and the moves-left relabel (Gaviota DTM),
             # not by biasing search. Mirrors lc0's rescorer (they rejected the
             # search-side DTZ policy boost). tb_steer_policy=True restores the bias.
+
+        # Mixed opening window (per-game open_len): games still inside their
+        # opening take opening actions + zero targets instead of the MCTS
+        # results computed above. Merged batches hit this every ply < max_open
+        # (seeded games have open_len 0 and need MCTS from ply 0).
+        if min_open <= ply < max_open:
+            in_open = (open_len_t > ply) & alive_mask                 # [N] bool
+            o_action, o_policy = _opening_actions()
+            action = torch.where(in_open, o_action, action)
+            policy = torch.where(in_open.unsqueeze(1), o_policy, policy)
+            value = torch.where(in_open, torch.zeros_like(value), value)
 
         # 6. Step env. ``step_batch_with_legal`` returns the new state's
         #    legal_mask alongside (already computed inside for terminal
@@ -1063,8 +1127,8 @@ def play_games_parallel_gpu_resident(
     for g in range(num_games):
         L = int(game_length_cpu[g])
         h_g = GameHistory(game_name=config.game)
-        if seeded:
-            h_g.start_fen = start_fens[g]   # buffer reconstruction replays from the seed
+        if fen_list[g] is not None:
+            h_g.start_fen = fen_list[g]   # buffer reconstruction replays from the seed
         h_g.reached_tb = bool(tb_reached_cpu[g])
         for t in range(L):
             # .copy() / torch.from_numpy(...).clone() materializes per-ply slices.
@@ -1179,6 +1243,23 @@ def run_self_play(
         n_normal = num_games - len(seed_fens)
 
         histories = []
+        if (use_resident and seed_fens
+                and bool(getattr(config, "merged_seed_batch", False))):
+            # MERGED sweep (next-run lever #11): normal + seeded games in the
+            # SAME resident batches — one straggler tail and one set of fixed
+            # per-ply overheads per chunk instead of two. Interleave so every
+            # chunk carries ~the configured seed fraction.
+            slots: list = [None] * n_normal + list(seed_fens)
+            random.shuffle(slots)
+            iterator = range(0, len(slots), n_parallel)
+            if show_progress:
+                iterator = tqdm(iterator, desc=desc + " (merged)", leave=False)
+            for s in iterator:
+                chunk = slots[s:s + n_parallel]
+                histories.extend(play_fn(
+                    network, config, len(chunk), device, training_step,
+                    start_fens=chunk))
+            return _apply_resignation(histories, config)
         # 1) normal games
         rem = n_normal
         iterator = range(0, n_normal, n_parallel) if n_normal > 0 else []

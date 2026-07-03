@@ -625,6 +625,22 @@ class MuZeroConfig:
     # demonstration. Seeded games are exempt (they'd be adjudicated at ply 0,
     # deleting the practice data they exist to generate).
     tb_rollout_fill: bool = False
+    # MERGED self-play batch (next-run lever #11): run normal + seeded games in ONE
+    # resident sweep (mixed start states, per-game opening masks) instead of
+    # sequential sub-batches — removes the doubled fixed overheads and the second
+    # straggler tail (~15-30% self-play wall-clock). Default off (sub-batch path).
+    merged_seed_batch: bool = False
+    # OPENING DIVERSITY ε-MIXTURE (next-run lever #14). When mean_plies > 0, each
+    # NORMAL game opens with r ~ U[1, 2·mean] plies chosen without search:
+    # with prob opening_uniform_frac a uniform-random legal move (model-INDEPENDENT
+    # diversity floor — cannot collapse as the policy sharpens), else sampled from
+    # the raw policy softmax at opening_policy_temp (KataGo initGamesWithPolicy —
+    # plausible on-distribution branching). Opening plies store ZERO policy targets
+    # (make_target's zero-CE no-op) — unlike legacy random_opening_plies, which
+    # trained the policy toward its own random moves. Seeded games never open.
+    opening_mix_mean_plies: int = 0
+    opening_policy_temp: float = 1.5
+    opening_uniform_frac: float = 0.15
     # Overlap the ~141ms single-threaded sample_batch with the GPU train step via
     # a background prefetch thread (double-buffered, lock-guarded against buffer
     # writes). ~halves per-step time during the training phase. Off by default.

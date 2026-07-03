@@ -262,6 +262,21 @@ def main():
                              "config.moves_left_head_blocks, preset 0).")
     parser.add_argument("--value-head-planes", type=int, default=None,
                         help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--merged-seed-batch", action="store_true", default=False,
+                        help="Run normal + seeded self-play games in ONE resident sweep "
+                             "(mixed start states, per-game opening masks) instead of "
+                             "sequential sub-batches — one straggler tail, ~15-30% self-play "
+                             "wall-clock saving.")
+    parser.add_argument("--opening-mix-mean-plies", type=int, default=None,
+                        help="Opening diversity ε-mixture: normal games open with r ~ U[1, 2·mean] "
+                             "searchless plies — uniform-random w.p. --opening-uniform-frac "
+                             "(model-independent diversity floor), else raw-policy softmax at "
+                             "--opening-policy-temp (KataGo initGamesWithPolicy). Opening plies "
+                             "store ZERO policy targets. 0/unset = off.")
+    parser.add_argument("--opening-policy-temp", type=float, default=None,
+                        help="Softmax temperature for policy-sampled opening plies (config 1.5).")
+    parser.add_argument("--opening-uniform-frac", type=float, default=None,
+                        help="Fraction of games opening with uniform-random plies (config 0.15).")
     parser.add_argument("--per-alpha", type=float, default=None,
                         help="PER priority exponent (override config.per_alpha). 0 = uniform "
                              "sampling — the MuZero-board-games/KataGo/Lc0-consistent choice; "
@@ -527,6 +542,14 @@ def main():
         config.moves_left_head_blocks = args.moves_left_head_blocks
     if args.value_head_planes is not None:
         config.value_head_planes = args.value_head_planes
+    if args.merged_seed_batch:
+        config.merged_seed_batch = True
+    if args.opening_mix_mean_plies is not None:
+        config.opening_mix_mean_plies = args.opening_mix_mean_plies
+    if args.opening_policy_temp is not None:
+        config.opening_policy_temp = args.opening_policy_temp
+    if args.opening_uniform_frac is not None:
+        config.opening_uniform_frac = args.opening_uniform_frac
     if args.per_alpha is not None:
         config.per_alpha = args.per_alpha
     if args.resign_exempt_seeded:

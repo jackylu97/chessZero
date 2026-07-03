@@ -103,6 +103,12 @@ class GameHistory:
     # from resignation (the demonstration must not be re-truncated). Transient
     # self-play stat (self_play/tb_fill_rate); not serialized.
     tb_filled: bool = False
+    # True iff this game's POLICY targets are (partly) tablebase-authored —
+    # anchor games (stamped at injection) and rollout-filled games. Reanalyze
+    # must NEVER touch these: it would overwrite perfect demonstration targets
+    # with the (weaker-in-endgame) net's own MCTS visits. SERIALIZED, so the
+    # protection survives buffer save/load.
+    tb_authored: bool = False
     # Per-ply STM-relative Syzygy value of the POSITION (DTZ-shaped), in [-1, 1],
     # NaN where the ply was not in TB range. Empty for games that never reached
     # the tablebase. When populated, make_target blends it into the VALUE target
@@ -225,6 +231,8 @@ class GameHistory:
             d["start_fen"] = self.start_fen
         if self.reanalyze_count:
             d["reanalyze_count"] = int(self.reanalyze_count)
+        if self.tb_authored:
+            d["tb_authored"] = True
         return d
 
     @classmethod
@@ -271,6 +279,7 @@ class GameHistory:
         gh.draw_by_no_progress = bool(d.get("draw_by_no_progress", False))
 
         gh.reanalyze_count = int(d.get("reanalyze_count", 0))
+        gh.tb_authored = bool(d.get("tb_authored", False))
         start_fen = d.get("start_fen")
         gh.start_fen = start_fen
         if start_fen is not None and hasattr(game, "reset_from_fen"):
@@ -1206,8 +1215,14 @@ class ReplayBuffer:
         Warmstart games (``external_values`` populated) are excluded: their policy
         targets are supervised one-hots from Stockfish, and their value targets come
         from external_values directly — reanalyze would strictly degrade both.
+        TB-authored games (anchor / rollout-filled — ``tb_authored``) are excluded
+        for the same reason: their policy targets are tablebase demonstrations;
+        reanalyze would overwrite perfect targets with the net's own weaker visits.
         """
-        eligible = [i for i, g in enumerate(self.buffer) if not g.external_values]
+        eligible = [
+            i for i, g in enumerate(self.buffer)
+            if not g.external_values and not getattr(g, "tb_authored", False)
+        ]
         if not eligible:
             return np.array([], dtype=np.int64), []
         n = min(n, len(eligible))

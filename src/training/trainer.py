@@ -832,6 +832,9 @@ class MuZeroTrainer:
             d = self._tb_anchor_dicts[self._tb_anchor_cursor]
             self._tb_anchor_cursor += 1
             g = GameHistory.from_compact_dict(d, self.game)
+            # Anchor policies are TB demonstrations — shield from reanalyze.
+            # Stamped here (not in the archive) so existing shards are covered.
+            g.tb_authored = True
             with self._buffer_lock:
                 self.replay_buffer.save_game(g)
             self._tb_anchor_injected += 1
