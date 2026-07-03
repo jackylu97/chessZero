@@ -615,13 +615,18 @@ def main():
 
     game = get_game(args.game)
 
+    # Run dirs are keyed by config.game (the ENGINE name, e.g. "chess"), not the
+    # preset name passed as --game (e.g. "chess_hybrid") — the trainer's writer
+    # and checkpointer use config.game, so the banner must too or it prints
+    # paths that don't exist (chess_hybrid/... vs the real chess/...).
+    game_dir = config.game
     run_id = args.run_id or generate_run_id(
-        Path(args.checkpoints_dir) / args.game,
-        Path(args.log_dir) / args.game,
+        Path(args.checkpoints_dir) / game_dir,
+        Path(args.log_dir) / game_dir,
     )
     print(f"Run ID: {run_id}")
-    print(f"  Checkpoints: {Path(args.checkpoints_dir) / args.game / run_id}")
-    print(f"  TensorBoard: {Path(args.log_dir) / args.game / run_id}")
+    print(f"  Checkpoints: {Path(args.checkpoints_dir) / game_dir / run_id}")
+    print(f"  TensorBoard: {Path(args.log_dir) / game_dir / run_id}")
 
     network = MuZeroNetwork(
         observation_channels=game.num_planes * getattr(config, "history_frames", 1),
