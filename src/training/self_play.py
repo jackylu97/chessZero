@@ -667,10 +667,11 @@ def play_games_parallel_gpu_resident(
         raise ValueError(
             "play_games_parallel_gpu_resident requires use_tensor_mcts=True."
         )
-    if getattr(config, "use_gumbel", False):
-        raise NotImplementedError(
-            "Gumbel root not supported in the GPU-resident path."
-        )
+    # Gumbel root IS supported in the GPU-resident path since 2026-07-04
+    # (TensorMCTS._initialize_root_gumbel + Sequential Halving root override;
+    # oracle-parity-tested vs the numpy BatchedMCTS in test_gumbel_tensor_mcts).
+    # run_batch_gpu returns gumbel_action/gumbel_policy, consumed below in
+    # place of select_action_gpu + the temperature schedule.
 
     network.eval()
     chess_game = ChessGame()
@@ -686,9 +687,16 @@ def play_games_parallel_gpu_resident(
     hidden_dtype = dtype_map[dtype_str]
     amp_str = getattr(config, "tensor_mcts_amp_dtype", None)
     amp_dtype = dtype_map[amp_str] if amp_str else None
+    select_backend = getattr(config, "tensor_mcts_select_backend", "compile")
+    if getattr(config, "use_gumbel", False) and select_backend == "triton":
+        # The Triton PUCT-walk kernel has no Sequential-Halving root-override
+        # path; fall back to the compiled selector (same math, ~10-20% slower
+        # select step — small vs the per-sim network forward).
+        tqdm.write("  gumbel: select_backend triton -> compile (root override unsupported in kernel)")
+        select_backend = "compile"
     mcts = TensorMCTS(
         network, chess_game, config, device=device, hidden_dtype=hidden_dtype,
-        select_backend=getattr(config, "tensor_mcts_select_backend", "compile"),
+        select_backend=select_backend,
         use_subtree_reuse=getattr(config, "tensor_mcts_subtree_reuse", False),
         amp_dtype=amp_dtype,
     )
@@ -872,16 +880,25 @@ def play_games_parallel_gpu_resident(
                 root_tb_value=steer,
             )
 
-            # 4. Per-game temperature for sampling (AlphaZero schedule).
-            #    Picks from pre-cached tensors to avoid per-ply construction.
-            is_post_drop = move_count >= temp_drop
-            temperature = torch.where(is_post_drop, temp_final_tensor, temp_init_tensor)
-            action, policy = select_action_gpu(
-                root_data["child_actions"],
-                root_data["child_visits"],
-                temperature,
-                action_space_size,
-            )
+            if "gumbel_action" in root_data:
+                # Plain Gumbel MuZero: A_{n+1} is the deterministic argmax of
+                # g + logits + σ(q̂) (exploration lives in the Gumbel draw, so
+                # the temperature schedule does not apply) and the policy
+                # target is π' = softmax(logits + σ(completedQ)) — the
+                # improvement-guaranteed dense target, not visit fractions.
+                action = root_data["gumbel_action"]
+                policy = root_data["gumbel_policy"]
+            else:
+                # 4. Per-game temperature for sampling (AlphaZero schedule).
+                #    Picks from pre-cached tensors to avoid per-ply construction.
+                is_post_drop = move_count >= temp_drop
+                temperature = torch.where(is_post_drop, temp_final_tensor, temp_init_tensor)
+                action, policy = select_action_gpu(
+                    root_data["child_actions"],
+                    root_data["child_visits"],
+                    temperature,
+                    action_space_size,
+                )
             value = root_data["root_value"]
             # Lc0-faithful: no policy steering by default (tb_steer_policy=False).
             # Self-play is on-policy; the TB signal enters training only via the

@@ -262,6 +262,11 @@ def main():
                              "config.moves_left_head_blocks, preset 0).")
     parser.add_argument("--value-head-planes", type=int, default=None,
                         help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--per-alpha", type=float, default=None,
+                        help="PER priority exponent (override config.per_alpha). 0 = uniform "
+                             "sampling — the MuZero-board-games/KataGo/Lc0-consistent choice; "
+                             "also prevents value-TD priorities from starving anchor games "
+                             "whose easy value targets hide unlearned policy content.")
     parser.add_argument("--resign-exempt-seeded", action="store_true", default=False,
                         help="Exempt seeded (start_fen) games from resignation: their value labels "
                              "are TB-true regardless, and resignation truncates exactly the "
@@ -522,6 +527,8 @@ def main():
         config.moves_left_head_blocks = args.moves_left_head_blocks
     if args.value_head_planes is not None:
         config.value_head_planes = args.value_head_planes
+    if args.per_alpha is not None:
+        config.per_alpha = args.per_alpha
     if args.resign_exempt_seeded:
         config.resign_exempt_seeded = True
     if args.no_attention:

@@ -231,6 +231,22 @@ class TensorMCTS:
         )
         self._use_terminal_draws = bool(getattr(config, "root_terminal_draws", False))
         self._use_tb_root = bool(getattr(config, "tb_root_probe", False))
+        # Plain Gumbel MuZero at the root (Danihelka 2022; mirrors the numpy
+        # BatchedMCTS implementation, mctx-style penalty formulation of
+        # Sequential Halving). Root Dirichlet noise + temperature selection are
+        # replaced by Gumbel-Top-m candidates + deterministic argmax of
+        # g + logits + sigma(q). Non-root selection stays PUCT.
+        self._use_gumbel = bool(getattr(config, "use_gumbel", False))
+        self._gumbel_m_cfg = int(getattr(config, "gumbel_num_considered", 16))
+        self._gumbel_c_visit = float(getattr(config, "gumbel_c_visit", 50.0))
+        self._gumbel_c_scale = float(getattr(config, "gumbel_c_scale", 1.0))
+        self._gumbel_use_noise = bool(getattr(config, "use_gumbel_noise", True))
+        self._gumbel_root_override = None   # [N] int64, set per-sim when gumbel is on
+        self._gumbel_state = None           # dict of per-run root tensors
+        if self._use_gumbel and select_backend == "triton":
+            raise ValueError(
+                "use_gumbel requires select_backend 'eager' or 'compile' "
+                "(the Triton select kernel has no root-override path)")
         self._ml_threshold = float(getattr(config, "ml_threshold", 0.3))
         self._ml_slope = float(getattr(config, "ml_slope", 0.005))
         self._ml_max_effect = float(getattr(config, "ml_max_effect", 0.1))
@@ -551,7 +567,9 @@ class TensorMCTS:
         # illegal at the new state. If ANY game has zero legal sampled
         # actions, fall back to a fresh search (otherwise multinomial in
         # select_action_gpu hits all-zero probs).
-        can_reuse = self.has_prior_search
+        # Gumbel: subtree reuse is disabled — each ply needs a FRESH Gumbel
+        # Top-m candidate draw (the perturbation is per-search state).
+        can_reuse = self.has_prior_search and not self._use_gumbel
         if can_reuse:
             root_actions = self.child_actions[:, 0, :]
             valid_slot = root_actions != -1
@@ -571,9 +589,15 @@ class TensorMCTS:
             c, h, w = hidden_batch.shape[1:]
             self._allocate(n, num_sims, (c, h, w))
             self._reset()
-            self._initialize_root_from_mask(
-                hidden_batch, policy_logits_root, legal_mask, add_noise
-            )
+            if self._use_gumbel:
+                self._initialize_root_gumbel(
+                    hidden_batch, policy_logits_root, legal_mask, add_noise,
+                    _value_root,
+                )
+            else:
+                self._initialize_root_from_mask(
+                    hidden_batch, policy_logits_root, legal_mask, add_noise
+                )
             self.has_prior_search = False
 
         # Map the per-action repetition mask [N, A] onto the root's K sampled
@@ -600,7 +624,11 @@ class TensorMCTS:
         else:
             self._root_tb_value = None
 
-        for _ in range(num_sims):
+        for _sim in range(num_sims):
+            if self._use_gumbel:
+                # Sequential Halving dictates the root child for this sim;
+                # consumed by _select at step 0 via _gumbel_root_override.
+                self._gumbel_root_override = self._gumbel_next_root_slot(_sim)
             (
                 path_node_idx,
                 path_slot,
@@ -628,12 +656,18 @@ class TensorMCTS:
         )                                                        # [N] float32
         # Clone so the caller can hold these past the next run_batch call,
         # which would otherwise overwrite the underlying tree storage.
-        return {
+        out = {
             "child_actions": self.child_actions[:, 0, :].clone(),  # [N, K] int32
             "child_visits": self.child_visits[:, 0, :].clone(),    # [N, K] int32
             "child_priors": self.child_priors[:, 0, :].clone(),    # [N, K] float32
             "root_value": root_value.clone(),                       # [N] float32
         }
+        if self._use_gumbel:
+            g_action, g_policy = self._gumbel_finalize()
+            out["gumbel_action"] = g_action                          # [N] int64
+            out["gumbel_policy"] = g_policy                          # [N, A] float32
+            self._gumbel_root_override = None
+        return out
 
     # ---------------------------------------------------------------- helpers
 
@@ -828,6 +862,220 @@ class TensorMCTS:
         self.child_priors[:, 0, :] = priors_root
         # child_visits / child_value_sum / child_rewards / child_node_idx
         # already at sentinel/zero from _reset.
+
+    # ---------------------------------------------------- Gumbel MuZero root
+    # Plain Gumbel MuZero (Danihelka 2022), batched port of the numpy
+    # BatchedMCTS implementation (mcts.py::_GumbelRootState + gumbel.py math).
+    # Sequential Halving uses the mctx-style "considered visit level" penalty
+    # formulation (the paper authors' reference implementation): a static
+    # per-sim table of visit levels; each sim the root child is
+    #   argmax_k  g(k) + logits(k) + sigma(q_norm(k)) − BIG·[N(k) != level_s]
+    # which reproduces round-robin-within-phase + top-half survival exactly
+    # when all m candidates exist, and degrades gracefully (pure score argmax)
+    # for games with fewer legal moves than m or on overhang sims (level −1).
+
+    def _initialize_root_gumbel(
+        self,
+        hidden_batch: torch.Tensor,
+        policy_logits_root: torch.Tensor,
+        legal_mask: torch.Tensor,
+        add_noise: bool,
+        value_root: torch.Tensor,
+    ):
+        """Gumbel root setup: Top-m candidates of g + masked logits.
+
+        Replaces sampled/enumerated expansion AND Dirichlet noise — root
+        exploration comes from the Gumbel perturbation itself
+        (``use_gumbel_noise``; off => deterministic top-m of the logits, the
+        eval/reanalyze mode). Stashes everything the per-sim selector and the
+        finalizer need in ``self._gumbel_state``.
+        """
+        n = self._allocated_n
+        K = self.K
+        dev = self.device
+
+        masked_logits = policy_logits_root.masked_fill(~legal_mask, _NEG_INF)
+        if add_noise and self._gumbel_use_noise:
+            u = torch.rand(n, self.action_space_size, device=dev)
+            # Standard Gumbel(0,1): g = -log(-log U). Clamp BOTH log arguments
+            # away from 0 explicitly — note (-torch.log(u).clamp(...)) would
+            # clamp log(u) BEFORE the unary minus (precedence) and NaN out.
+            neg_log_u = (-torch.log(u.clamp(min=1e-12))).clamp(min=1e-12)
+            g = -torch.log(neg_log_u)
+            perturbed_full = masked_logits + g
+        else:
+            perturbed_full = masked_logits
+
+        m = min(self._gumbel_m_cfg, K)
+        top_v, top_a = perturbed_full.topk(m, dim=1)                 # [N, m]
+        valid = top_v > (_NEG_INF / 2)                               # illegal ⇒ -inf
+        cand_actions = torch.where(
+            valid, top_a.to(torch.int32), torch.full_like(top_a, -1, dtype=torch.int32))
+
+        # Exact softmax priors on the candidate slots (root prior_score is
+        # bypassed by the override, but expand/backprop bookkeeping and any
+        # diagnostics read child_priors — keep them meaningful).
+        root_probs = torch.softmax(masked_logits, dim=-1)            # [N, A]
+        cand_priors = torch.gather(root_probs, 1, top_a.clamp(min=0))
+        cand_priors = torch.where(valid, cand_priors, torch.zeros_like(cand_priors))
+
+        self.node_count.fill_(1)
+        self.node_hidden[:, 0] = hidden_batch.to(self.hidden_dtype)
+        self.child_actions[:, 0, :].fill_(-1)
+        self.child_priors[:, 0, :].zero_()
+        self.child_actions[:, 0, :m] = cand_actions
+        self.child_priors[:, 0, :m] = cand_priors.to(torch.float32)
+
+        self._gumbel_state = {
+            "m": m,
+            # g + logits at candidate slots; -inf on invalid slots so argmax
+            # never picks them. [N, m] float32.
+            "perturbed": torch.where(
+                valid, top_v, torch.full_like(top_v, _NEG_INF)).to(torch.float32),
+            "logits_full": masked_logits.to(torch.float32).clone(),  # [N, A]
+            "value_prior": value_root.reshape(-1).to(torch.float32).clone(),  # [N]
+            "levels": self._gumbel_level_table(
+                int(self.config.num_simulations), m),                # list[int]
+        }
+
+    @staticmethod
+    def _gumbel_level_table(num_sims: int, m: int) -> list:
+        """Per-sim considered-visit level from the Sequential Halving schedule.
+
+        Phase p (m_p survivors, vpa visits each) contributes vpa blocks of m_p
+        sims at levels L, L+1, ... (round-robin within phase). Overhang sims
+        (schedule rounding) get level −1 = unconstrained score argmax,
+        matching the numpy oracle's provisional-best behavior.
+        """
+        from .gumbel import sequential_halving_schedule
+        levels: list = []
+        level = 0
+        for m_p, vpa in sequential_halving_schedule(num_sims, m):
+            for _ in range(int(vpa)):
+                levels.extend([level] * int(m_p))
+                level += 1
+        levels = levels[:num_sims]
+        levels.extend([-1] * (num_sims - len(levels)))
+        return levels
+
+    def _gumbel_root_q_norm(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """(q_norm [N, m], max_n [N]) for the root candidates — the paper's
+        q̂ with search-time semantics: min-max normalized mover-POV Q where
+        visited, 0.5 where unvisited (numpy `_gumbel_score` parity), and the
+        root-terminal-draw pin applied (mirrors the PUCT `_select` override)."""
+        st = self._gumbel_state
+        m = st["m"]
+        visits = self.child_visits[:, 0, :m].to(torch.float32)       # [N, m]
+        value_sums = self.child_value_sum[:, 0, :m]
+        rewards = self.child_rewards[:, 0, :m]
+        child_value = torch.where(
+            visits > 0, value_sums / visits.clamp(min=1.0), torch.zeros_like(value_sums))
+        raw_q = rewards - float(self.config.discount) * child_value  # [N, m]
+
+        has_range = (self.mm_max > self.mm_min).unsqueeze(1)         # [N, 1]
+        mm_span = (self.mm_max - self.mm_min).clamp(min=1e-12).unsqueeze(1)
+        q_norm = torch.where(
+            has_range, (raw_q - self.mm_min.unsqueeze(1)) / mm_span, raw_q)
+        q_norm = torch.where(visits > 0, q_norm, torch.full_like(q_norm, 0.5))
+
+        if self._use_terminal_draws and self._root_term_mask is not None:
+            ds_norm = (self._draw_score - self.mm_min.unsqueeze(1)) / mm_span  # [N,1]
+            ds = torch.where(
+                has_range, ds_norm.expand_as(q_norm),
+                torch.full_like(q_norm, self._draw_score))
+            q_norm = torch.where(self._root_term_mask[:, :m], ds, q_norm)
+
+        max_n = self.child_visits[:, 0, :m].to(torch.float32).max(dim=1).values  # [N]
+        return q_norm, max_n
+
+    def _gumbel_next_root_slot(self, sim_idx: int) -> torch.Tensor:
+        """[N] int64 root child slot for this simulation under Sequential
+        Halving (see class comment for the penalty formulation)."""
+        st = self._gumbel_state
+        q_norm, max_n = self._gumbel_root_q_norm()
+        sigma = ((self._gumbel_c_visit + max_n).unsqueeze(1)
+                 * self._gumbel_c_scale * q_norm)                     # [N, m]
+        scores = st["perturbed"] + sigma
+        level = st["levels"][sim_idx] if sim_idx < len(st["levels"]) else -1
+        if level >= 0:
+            visits = self.child_visits[:, 0, :st["m"]]
+            # Soft penalty (not -inf): games whose candidates are all past
+            # the level (fewer legal moves than m) fall back to best score.
+            scores = scores - (visits != level).to(torch.float32) * 1e6
+        return scores.argmax(dim=1)
+
+    def _gumbel_finalize(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """(action [N] int64, pi' [N, A] float32) — paper Eq. 11 target and
+        A_{n+1} selection. Batched port of mcts.py::select_action_gumbel:
+        completedQ over ALL legal actions with v_mix fill, min-max normalized,
+        π' = softmax(logits + σ(completedQ)); action = argmax over candidates
+        of perturbed + σ(q̂)."""
+        st = self._gumbel_state
+        m = st["m"]
+        A = self.action_space_size
+        n = self._allocated_n
+
+        visits_m = self.child_visits[:, 0, :m].to(torch.float32)     # [N, m]
+        value_sums = self.child_value_sum[:, 0, :m]
+        rewards = self.child_rewards[:, 0, :m]
+        child_value = torch.where(
+            visits_m > 0, value_sums / visits_m.clamp(min=1.0),
+            torch.zeros_like(value_sums))
+        raw_q_m = rewards - float(self.config.discount) * child_value
+
+        actions_m = self.child_actions[:, 0, :m]                      # [N, m] int32
+        valid = actions_m != -1
+        idx = actions_m.clamp(min=0).long()                           # [N, m]
+
+        # Scatter candidate visits/Q onto the full action axis.
+        visits_all = torch.zeros(n, A, dtype=torch.float32, device=self.device)
+        visits_all.scatter_(1, idx, torch.where(valid, visits_m, torch.zeros_like(visits_m)))
+        q_all = torch.zeros(n, A, dtype=torch.float32, device=self.device)
+        q_all.scatter_(1, idx, torch.where(valid, raw_q_m, torch.zeros_like(raw_q_m)))
+
+        # v_mix (paper Eq. 33) over the full legal axis.
+        logits_full = st["logits_full"]                               # [N, A]
+        legal = logits_full > (_NEG_INF / 2)
+        priors_full = torch.softmax(logits_full, dim=-1)
+        total_visits = visits_all.sum(dim=1)                          # [N]
+        visited = visits_all > 0
+        visited_prior_sum = torch.where(visited, priors_full,
+                                        torch.zeros_like(priors_full)).sum(dim=1)
+        weighted_q = torch.where(visited, priors_full * q_all,
+                                 torch.zeros_like(q_all)).sum(dim=1)
+        v_prior = st["value_prior"]
+        safe = (total_visits > 0) & (visited_prior_sum > 0)
+        v_mix = torch.where(
+            safe,
+            (v_prior + total_visits * weighted_q / visited_prior_sum.clamp(min=1e-12))
+            / (1.0 + total_visits),
+            v_prior)                                                   # [N]
+
+        completed_q = torch.where(visited, q_all, v_mix.unsqueeze(1))  # [N, A]
+        has_range = (self.mm_max > self.mm_min).unsqueeze(1)
+        mm_span = (self.mm_max - self.mm_min).clamp(min=1e-12).unsqueeze(1)
+        cq_norm = torch.where(
+            has_range,
+            (completed_q - self.mm_min.unsqueeze(1)) / mm_span,
+            completed_q.clamp(min=0.0, max=1.0))
+
+        max_n = visits_m.max(dim=1).values                             # [N]
+        sigma_all = ((self._gumbel_c_visit + max_n).unsqueeze(1)
+                     * self._gumbel_c_scale * cq_norm)                 # [N, A]
+        pi_logits = torch.where(
+            legal, logits_full + sigma_all, torch.full_like(logits_full, _NEG_INF))
+        pi_prime = torch.softmax(pi_logits, dim=-1)                    # [N, A]
+
+        # A_{n+1}: argmax over candidates of perturbed + σ(completedQ_norm at slot).
+        cq_norm_m = torch.gather(cq_norm, 1, idx)                      # [N, m]
+        sigma_m = ((self._gumbel_c_visit + max_n).unsqueeze(1)
+                   * self._gumbel_c_scale * cq_norm_m)
+        cand_scores = torch.where(
+            valid, st["perturbed"] + sigma_m,
+            torch.full_like(sigma_m, _NEG_INF))
+        winner = cand_scores.argmax(dim=1)                             # [N]
+        action = actions_m[self._arange_n, winner].long()              # [N]
+        return action, pi_prime
 
     # -------------------------------------------------------- subtree reuse
 
@@ -1106,6 +1354,7 @@ class TensorMCTS:
         path_node_idx = torch.full((n, m), -1, dtype=torch.int32, device=dev)
         path_slot = torch.full((n, m), -1, dtype=torch.int32, device=dev)
         path_node_idx[:, 0] = 0  # root
+        root_slot_override = self._gumbel_root_override  # [N] int64 or None
 
         current_node = torch.zeros(n, dtype=torch.int32, device=dev)
         still_walking = torch.ones(n, dtype=torch.bool, device=dev)
@@ -1218,6 +1467,12 @@ class TensorMCTS:
             )
 
             next_slot = scores.argmax(dim=1)  # [N] int64
+            # Gumbel root override (Plain Gumbel MuZero): at the ROOT step the
+            # child is dictated by Sequential Halving (computed in
+            # _gumbel_next_root_slot before this call), not by PUCT. Non-root
+            # steps keep PUCT selection (the "Plain" variant of the paper).
+            if step == 0 and root_slot_override is not None:
+                next_slot = root_slot_override
             next_slot_i32 = next_slot.to(torch.int32)
             chosen_action = actions[arange_n, next_slot]  # [N] int32
             chosen_child = self.child_node_idx[arange_n, cur, next_slot]  # [N] int32
