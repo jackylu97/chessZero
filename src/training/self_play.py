@@ -1182,18 +1182,47 @@ def play_games_parallel_gpu_resident(
     return histories
 
 
-_SEED_ARCHIVE_CACHE: dict[str, list[str]] = {}
+_SEED_ARCHIVE_CACHE: dict[str, tuple[list[str], list[int] | None]] = {}
 
 
-def _load_seed_archive(path: str) -> list[str]:
-    """Load + cache the endgame-seed FEN archive (one FEN per line)."""
+def _load_seed_archive(path: str) -> tuple[list[str], list[int] | None]:
+    """Load + cache the endgame-seed FEN archive (one FEN per line) and, when a
+    ``<path>.dtm`` sidecar exists (scripts/annotate_seed_dtm.py), the per-seed
+    |DTM| annotations (0 = drawn seed, -1 = probe failure)."""
     if path not in _SEED_ARCHIVE_CACHE:
         try:
             with open(path) as f:
-                _SEED_ARCHIVE_CACHE[path] = [ln.strip() for ln in f if ln.strip()]
+                fens = [ln.strip() for ln in f if ln.strip()]
         except Exception:
-            _SEED_ARCHIVE_CACHE[path] = []
+            fens = []
+        dtms = None
+        try:
+            with open(path + ".dtm") as f:
+                vals = [int(ln.strip()) for ln in f if ln.strip()]
+            if len(vals) == len(fens):
+                dtms = vals
+        except Exception:
+            dtms = None
+        _SEED_ARCHIVE_CACHE[path] = (fens, dtms)
     return _SEED_ARCHIVE_CACHE[path]
+
+
+def seed_curriculum_dtm_cap(training_step: int, config) -> int | None:
+    """Reverse-curriculum DTM cap for seed sampling (Florensa-style: start
+    near the goal, expand outward). Ramps linearly from
+    ``seed_curriculum_dtm_easy`` to unlimited over
+    ``seed_curriculum_anneal_frac`` of training. None = no cap (off, or ramp
+    complete)."""
+    if not getattr(config, "seed_curriculum", False):
+        return None
+    frac = float(getattr(config, "seed_curriculum_anneal_frac", 0.5))
+    total = max(1, int(getattr(config, "training_steps", 1)))
+    p = min(1.0, training_step / max(1.0, frac * total))
+    if p >= 1.0:
+        return None
+    easy = int(getattr(config, "seed_curriculum_dtm_easy", 8))
+    hard = int(getattr(config, "seed_curriculum_dtm_hard", 100))
+    return int(round(easy + p * (hard - easy)))
 
 
 def run_self_play(
@@ -1236,9 +1265,20 @@ def run_self_play(
         seed_arch = getattr(config, "endgame_seed_archive", None)
         seed_fens: list[str] = []
         if use_resident and seed_frac > 0.0 and seed_arch:
-            pool = _load_seed_archive(seed_arch)
+            pool, pool_dtms = _load_seed_archive(seed_arch)
             if pool:
                 n_seed = int(round(seed_frac * num_games))
+                cap = seed_curriculum_dtm_cap(training_step, config)
+                if cap is not None and pool_dtms is not None:
+                    # Reverse curriculum: draw from seeds solvable within the
+                    # current DTM cap (short chains first; the p^N conversion
+                    # math is benign there). Drawn seeds (dtm==0) stay eligible
+                    # throughout — they feed the draw-hold metric. Fall back to
+                    # the full pool if the cap leaves too few candidates.
+                    eligible = [f for f, d in zip(pool, pool_dtms)
+                                if d == 0 or 0 < d <= cap]
+                    if len(eligible) >= max(32, n_seed):
+                        pool = eligible
                 seed_fens = [random.choice(pool) for _ in range(n_seed)]
         n_normal = num_games - len(seed_fens)
 

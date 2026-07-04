@@ -262,6 +262,15 @@ def main():
                              "config.moves_left_head_blocks, preset 0).")
     parser.add_argument("--value-head-planes", type=int, default=None,
                         help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--symmetry-augment", action="store_true", default=False,
+                        help="D4 symmetry augmentation on pawnless castle-free training windows: "
+                             "random dihedral transform per sample (obs+actions+policies+masks), "
+                             "forcing relative-geometry features over absolute-square memorization.")
+    parser.add_argument("--seed-curriculum", action="store_true", default=False,
+                        help="DTM-stratified reverse curriculum for endgame seeds: sample seeds "
+                             "with |DTM| <= a cap ramping dtm_easy->dtm_hard over "
+                             "seed_curriculum_anneal_frac of training (short mating chains first). "
+                             "Needs <archive>.dtm from scripts/annotate_seed_dtm.py.")
     parser.add_argument("--merged-seed-batch", action="store_true", default=False,
                         help="Run normal + seeded self-play games in ONE resident sweep "
                              "(mixed start states, per-game opening masks) instead of "
@@ -542,6 +551,10 @@ def main():
         config.moves_left_head_blocks = args.moves_left_head_blocks
     if args.value_head_planes is not None:
         config.value_head_planes = args.value_head_planes
+    if args.symmetry_augment:
+        config.symmetry_augment = True
+    if args.seed_curriculum:
+        config.seed_curriculum = True
     if args.merged_seed_batch:
         config.merged_seed_batch = True
     if args.opening_mix_mean_plies is not None:

@@ -641,6 +641,24 @@ class MuZeroConfig:
     opening_mix_mean_plies: int = 0
     opening_policy_temp: float = 1.5
     opening_uniform_frac: float = 0.15
+    # DTM-stratified SEED CURRICULUM (reverse curriculum, Florensa 2017): sample
+    # seeds whose |DTM| <= a cap that ramps seed_curriculum_dtm_easy ->
+    # seed_curriculum_dtm_hard over seed_curriculum_anneal_frac of training.
+    # Short mating chains first (conversion ~ p^N — benign at small N), longer
+    # technique as per-move accuracy arrives. Needs the <archive>.dtm sidecar
+    # (scripts/annotate_seed_dtm.py). Drawn seeds stay eligible throughout.
+    seed_curriculum: bool = False
+    seed_curriculum_dtm_easy: int = 8
+    seed_curriculum_dtm_hard: int = 100
+    seed_curriculum_anneal_frac: float = 0.5
+    # D4 SYMMETRY AUGMENTATION (src/training/symmetry.py): apply a random
+    # dihedral-group element to each sampled pawnless castle-free training
+    # window (obs + actions + policy targets + legal masks under ONE element;
+    # value/DTM/material are invariants). Anti-memorization pressure toward
+    # relative-geometry features — the substrate of general endgame technique
+    # (KataGo trains with Go's 8-fold symmetry the same way). Equivariance
+    # verified against python-chess move generation (tests/test_symmetry.py).
+    symmetry_augment: bool = False
     # Overlap the ~141ms single-threaded sample_batch with the GPU train step via
     # a background prefetch thread (double-buffered, lock-guarded against buffer
     # writes). ~halves per-step time during the training phase. Off by default.

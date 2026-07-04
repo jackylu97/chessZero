@@ -990,6 +990,7 @@ class MuZeroTrainer:
                 tb_value_hard=bool(getattr(self.config, "tb_value_hard", False)),
                 build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
                 build_material_target=bool(getattr(self.config, "use_material_head", False)),
+                symmetry_augment=bool(getattr(self.config, "symmetry_augment", False)),
             )
 
     def _next_batch(self):

@@ -897,6 +897,7 @@ class ReplayBuffer:
         tb_value_hard: bool = False,
         build_legal_masks: bool = False,
         build_material_target: bool = False,
+        symmetry_augment: bool = False,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -1004,6 +1005,21 @@ class ReplayBuffer:
                 tb_policy_weight=tb_policy_weight,
                 tb_value_hard=tb_value_hard,
             )
+            # D4 symmetry augmentation (src/training/symmetry.py): for pawnless,
+            # castle-free windows, apply ONE random group element to the whole
+            # sample — obs frames, unroll actions, policy targets (and the legal
+            # masks below) — value/DTM/material targets are invariants. Forces
+            # relative-geometry features over absolute-square memorization.
+            sym_g = 0
+            if symmetry_augment and game.game_name == "chess":
+                from .symmetry import (transform_actions, transform_obs,
+                                       transform_policy_dense, window_eligible)
+                if window_eligible(obs_list):
+                    sym_g = int(np.random.randint(0, 8))
+                    if sym_g:
+                        obs_list = [transform_obs(o, sym_g) for o in obs_list]
+                        actions = transform_actions(actions, sym_g)
+                        policies = [transform_policy_dense(p, sym_g) for p in policies]
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)
             actions_batch.append(actions)
@@ -1058,6 +1074,10 @@ class ReplayBuffer:
                             row = np.zeros(action_space_size, dtype=np.float32)
                             row[np.asarray(legal, dtype=np.int64)] = 1.0
                             lm[i] = row
+                if sym_g:
+                    from .symmetry import transform_legal_mask
+                    for i in range(num_unroll_steps + 1):
+                        lm[i] = transform_legal_mask(lm[i], sym_g)
                 legal_masks_batch.append(lm)
 
         target_observations_t = torch.stack(target_observations)  # (B, K+1, C, H, W)
