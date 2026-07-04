@@ -1225,6 +1225,20 @@ class MuZeroTrainer:
                         * mask_k
                     )
 
+            # Reward-precision guard: under symmetry augmentation the reward
+            # head trains on CANONICAL views only (transformed samples masked;
+            # kept samples renormalized so the reward gradient magnitude is
+            # unchanged). Root cause 2026-07-05: reward = the search's in-tree
+            # mate detector (muted-reward diag: conversion 0.20 -> 0.048 on the
+            # same weights); augmented reward training traded precision for
+            # recall (false mate-fire 0.12 -> 0.41) and phantom per-edge
+            # rewards collapsed conversion 4x.
+            sym_keep = batch.get("sym_reward_keep")
+            if sym_keep is not None:
+                sym_keep = sym_keep.to(self.device)
+                scale = sym_keep.numel() / sym_keep.sum().clamp(min=1.0)
+                reward_loss = reward_loss * sym_keep * scale
+
             per_sample_loss = outer_scale * (
                 policy_loss
                 + value_weight * value_loss

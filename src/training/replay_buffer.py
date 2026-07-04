@@ -983,6 +983,7 @@ class ReplayBuffer:
         legal_masks_batch = []
         moves_left_batch = []
         material_batch = []
+        sym_reward_keep = []
 
         for g_idx in game_indices:
             game = self.buffer[g_idx]
@@ -1020,6 +1021,15 @@ class ReplayBuffer:
                         obs_list = [transform_obs(o, sym_g) for o in obs_list]
                         actions = transform_actions(actions, sym_g)
                         policies = [transform_policy_dense(p, sym_g) for p in policies]
+            # REWARD-PRECISION GUARD (2026-07-05 root cause): the reward head is
+            # the search's in-tree mate detector and THE conversion-critical
+            # component (muted-reward diag: 0.20 -> 0.048 conversion on the same
+            # weights). Training it on transformed views traded precision for
+            # recall (false mate-fire 0.12 -> 0.41), poisoning backups in winning
+            # subtrees. Reward learns from CANONICAL views only; the trainer
+            # renormalizes kept samples to preserve gradient magnitude. All
+            # other heads keep the full invariance pressure.
+            sym_reward_keep.append(0.0 if sym_g else 1.0)
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)
             actions_batch.append(actions)
@@ -1107,6 +1117,10 @@ class ReplayBuffer:
             "target_moves_left": torch.tensor(moves_left_batch, dtype=torch.float32),  # (B, K+1) plies-to-end
             "is_warmstart": torch.from_numpy(is_warmstart),
         }
+        if symmetry_augment:
+            # 1.0 = canonical view (reward loss active), 0.0 = transformed
+            # (reward loss masked; see reward-precision guard above).
+            batch["sym_reward_keep"] = torch.tensor(sym_reward_keep, dtype=torch.float32)
         if build_material_target:
             batch["target_material"] = torch.tensor(material_batch, dtype=torch.float32)  # (B, K+1) STM material margin
         if build_legal_masks:
