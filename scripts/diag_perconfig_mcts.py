@@ -28,7 +28,7 @@ VHP=int(os.environ.get("VALUE_HEAD_PLANES", str(getattr(cfg,"value_head_planes",
 ML_SUPPORT=int(os.environ.get("ML_SUPPORT", str(cfg.moves_left_support_size)))
 ML_LINEAR=os.environ.get("ML_LINEAR","0")=="1"
 cfg.moves_left_support_size=ML_SUPPORT; cfg.moves_left_use_transform=not ML_LINEAR
-N_WON=400; MAX_PLIES=80; SIMS=200
+N_WON=int(os.environ.get("N_WON","400")); MAX_PLIES=int(os.environ.get("MAX_PLIES","80")); SIMS=int(os.environ.get("SIMS","200"))
 net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS, hidden_planes=cfg.hidden_planes,
     num_blocks=cfg.num_residual_blocks, latent_h=cfg.latent_h, latent_w=cfg.latent_w, input_h=game.board_size[0],
     input_w=game.board_size[1], fc_hidden=cfg.fc_hidden, value_support_size=cfg.value_support_size,
@@ -138,7 +138,7 @@ def report(tag, outcome, pmate, sigs, cap_won, cap_lost):
 
 tb=chess.syzygy.open_tablebase("data/syzygy")
 for use_term in (False, True):
-    cfg.num_simulations=SIMS; cfg.moves_left_mcts=True; cfg.tb_root_probe=False; cfg.root_terminal_draws=use_term
+    cfg.num_simulations=SIMS; cfg.moves_left_mcts=True; cfg.tb_root_probe=False; cfg.root_terminal_draws=use_term; cfg.use_gumbel=os.environ.get("USE_GUMBEL","0")=="1"; cfg.use_gumbel_noise=False
     mcts=TensorMCTS(net, game, cfg, device=DEV, hidden_dtype=torch.float32, select_backend="eager")
     t0=time.time()
     o,p,s,cw,cl=play_classify(lambda bs: mcts_moves(mcts, bs, use_term), tb)
