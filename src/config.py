@@ -659,6 +659,12 @@ class MuZeroConfig:
     # (KataGo trains with Go's 8-fold symmetry the same way). Equivariance
     # verified against python-chess move generation (tests/test_symmetry.py).
     symmetry_augment: bool = False
+    # Reward head width (1x1 conv planes). Historically 1 — an afterthought.
+    # 2026-07-05: the dynamics-reward head is the search's in-tree mate
+    # detector and THE conversion-critical component (muted-reward diag:
+    # 0.20 -> 0.048 on identical weights). 8 matches value/moves-left heads.
+    # Kept at 1 in presets so old checkpoints load; set per-run via CLI.
+    reward_head_planes: int = 1
     # Overlap the ~141ms single-threaded sample_batch with the GPU train step via
     # a background prefetch thread (double-buffered, lock-guarded against buffer
     # writes). ~halves per-step time during the training phase. Off by default.

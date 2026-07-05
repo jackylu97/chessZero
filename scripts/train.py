@@ -262,6 +262,11 @@ def main():
                              "config.moves_left_head_blocks, preset 0).")
     parser.add_argument("--value-head-planes", type=int, default=None,
                         help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--reward-head-planes", type=int, default=None,
+                        help="Width of the dynamics-reward head's 1x1 projection (config default 1). "
+                             "The reward head is the search's in-tree mate detector; 8 matches the "
+                             "value/moves-left heads. Changes parameter shapes (fresh run or "
+                             "--warmstart-body only).")
     parser.add_argument("--symmetry-augment", action="store_true", default=False,
                         help="D4 symmetry augmentation on pawnless castle-free training windows: "
                              "random dihedral transform per sample (obs+actions+policies+masks), "
@@ -545,6 +550,8 @@ def main():
         config.ml_max_effect = args.ml_max_effect
     if args.ml_threshold is not None:
         config.ml_threshold = args.ml_threshold
+    if args.reward_head_planes is not None:
+        config.reward_head_planes = args.reward_head_planes
     if args.moves_left_head_planes is not None:
         config.moves_left_head_planes = args.moves_left_head_planes
     if args.moves_left_head_blocks is not None:
@@ -676,6 +683,7 @@ def main():
         fc_hidden=config.fc_hidden,
         value_support_size=config.value_support_size,
         reward_support_size=config.reward_support_size,
+        reward_head_planes=getattr(config, "reward_head_planes", 1),
         action_embed_dim=getattr(config, "action_embed_dim", 16),
         use_consistency_loss=config.use_consistency_loss,
         proj_hid=config.proj_hid,

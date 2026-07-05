@@ -41,7 +41,8 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     moves_left_head_blocks=int(os.environ.get("MLH_BLOCKS", getattr(cfg,"moves_left_head_blocks",1))),
     use_repr_attention=ATTN, attn_layers=ATTNL, attn_heads=4, use_smolgen=SMOL,
     use_pred_attention=PREDATTN, pred_attn_layers=PREDATTN_LAYERS, use_dyn_attention=DYNATTN,
-    hybrid_stem_blocks=HYBRID_STEM, value_head_planes=VHP).to(DEV)
+    hybrid_stem_blocks=HYBRID_STEM, value_head_planes=VHP,
+    reward_head_planes=int(os.environ.get("REWARD_PLANES", str(getattr(cfg,"reward_head_planes",1))))).to(DEV)
 # strict=False: the checkpoint may carry training-only heads (projection/predictor/inverse)
 # that the inference backbone lacks; those are ignored. Missing keys => arch mismatch (fatal).
 _res=net.load_state_dict(torch.load(CKPT, map_location=DEV)["model_state_dict"], strict=False)
@@ -49,7 +50,7 @@ assert not _res.missing_keys, f"ARCH MISMATCH, missing keys: {_res.missing_keys[
 net.eval()
 print(f"loaded {CKPT}  (rep={'attn' if ATTN else 'conv'} smol={SMOL} predattn={PREDATTN}); "
       f"ignored {len(_res.unexpected_keys)} training-only keys", flush=True)
-te=pickle.load(open("data/tb5_test.pkl","rb")); te_fen=[x[0] for x in te]; te_v=np.array([x[1] for x in te])
+te=pickle.load(open(os.environ.get("TEST_PKL","data/tb5_test.pkl"),"rb")); te_fen=[x[0] for x in te]; te_v=np.array([x[1] for x in te])
 
 def encode(fens):
     st=gg.from_python_chess([chess.Board(f) for f in fens], device=DEV); obs=gg.to_tensor_batch(st)

@@ -123,6 +123,7 @@ class DynamicsNetwork(nn.Module):
         fc_hidden: int,
         action_embed_dim: int = 16,
         reward_support_size: int = 1,
+        reward_head_planes: int = 1,
         use_attention: bool = False,
         attn_layers: int = 4,
         attn_heads: int = 4,
@@ -170,12 +171,18 @@ class DynamicsNetwork(nn.Module):
                 *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
             )
 
-        # Reward head outputs categorical distribution
+        # Reward head outputs categorical distribution.
+        # reward_head_planes widens the 1x1 projection (historically 1 — an
+        # afterthought). 2026-07-05: the reward head is the search's in-tree
+        # mate detector and THE conversion-critical component (muted-reward
+        # diag: 0.20 -> 0.048 conversion on identical weights); provision it
+        # like one. 8 planes matches the value/moves-left heads.
         reward_out = 2 * reward_support_size + 1
+        rhp = int(reward_head_planes)
         self.reward_head = nn.Sequential(
-            nn.Conv2d(hidden_planes, 1, 1),
+            nn.Conv2d(hidden_planes, rhp, 1),
             nn.Flatten(),
-            mlp_head(latent_h * latent_w, fc_hidden, reward_out),
+            mlp_head(rhp * latent_h * latent_w, fc_hidden, reward_out),
         )
         _zero_init_last_linear(self.reward_head)
 
@@ -569,6 +576,7 @@ class MuZeroNetwork(nn.Module):
         moves_left_support_size: int = 10,
         use_material_head: bool = False,
         material_head_support_size: int = 8,
+        reward_head_planes: int = 1,
         value_head_planes: int = 1,
         value_head_blocks: int = 0,
         moves_left_head_planes: int = 1,
@@ -609,6 +617,7 @@ class MuZeroNetwork(nn.Module):
             latent_h, latent_w, fc_hidden,
             action_embed_dim=action_embed_dim,
             reward_support_size=reward_support_size,
+            reward_head_planes=reward_head_planes,
             use_attention=use_dyn_attention, attn_layers=attn_layers,
             attn_heads=attn_heads, use_smolgen=use_smolgen,
             hybrid_stem_blocks=hybrid_stem_blocks,
