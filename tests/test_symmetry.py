@@ -122,6 +122,61 @@ def test_policy_transform_preserves_mass_and_argmax():
         assert tp[ACT_MAPS[g, int(p.argmax())]] == p.max()
 
 
+def test_cross_ply_frame_consistency():
+    """The 2026-07-05 root-cause regression test (audit Finding 1).
+
+    Observations are STM-encoded: black plies are rank-mirrored. A group
+    element applied to a K-step WINDOW is trajectory-consistent iff
+    transform_obs(enc(step(b, a)), g) == enc(step(g·b, g·a)) — the transformed
+    successor's ENCODING (black to move => rank-mirrored frame) must match.
+    Only the centralizer of the rank mirror {0, 2, 4, 6} satisfies this;
+    R90/R270/diagonals are off by exactly R180 on every odd ply. The original
+    suite missed it by testing white-to-move boards only.
+    """
+    from src.games.chess import GameState
+    from src.training.symmetry import SAFE_ELEMENTS
+    game = ChessGame()
+    rng = random.Random(7)
+    n_checked = 0
+    for _ in range(40):
+        board = _random_pawnless_board(rng)
+        mv = rng.choice(list(board.legal_moves))
+        a = _move_to_action(mv, board.turn)
+        succ = board.copy(); succ.push(mv)
+        if succ.is_game_over():
+            continue
+        enc_succ = game.to_tensor(GameState(board=succ.copy(), done=False,
+                                            winner=None, current_player=1))
+        for g in range(N_SYM):
+            tboard = _transform_board(board, g)
+            ta = int(ACT_MAPS[g, a])
+            tmv = None
+            for cand in tboard.legal_moves:
+                if _move_to_action(cand, tboard.turn) == ta:
+                    tmv = cand; break
+            assert tmv is not None
+            tsucc = tboard.copy(); tsucc.push(tmv)
+            enc_tsucc = game.to_tensor(GameState(board=tsucc.copy(), done=False,
+                                                 winner=None, current_player=1))
+            match = torch.equal(transform_obs(enc_succ, g)[:12], enc_tsucc[:12])
+            if g in SAFE_ELEMENTS:
+                assert match, f"safe element g={g} broke cross-ply consistency"
+            else:
+                assert not match, (f"unsafe element g={g} unexpectedly consistent — "
+                                   f"if the encoding changed, revisit SAFE_ELEMENTS")
+        n_checked += 1
+    assert n_checked >= 20
+
+
+def test_sample_path_draws_safe_elements_only():
+    """sample_batch must never draw an unsafe element again."""
+    import inspect
+    import src.training.replay_buffer as rb
+    src = inspect.getsource(rb.ReplayBuffer.sample_batch)
+    assert "SAFE_ELEMENTS" in src, "sample_batch no longer draws from SAFE_ELEMENTS"
+    assert "randint(0, 8)" not in src, "raw 8-element draw reintroduced"
+
+
 def test_window_eligibility():
     game = ChessGame()
     from src.games.chess import GameState

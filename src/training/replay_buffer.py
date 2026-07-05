@@ -1013,10 +1013,14 @@ class ReplayBuffer:
             # relative-geometry features over absolute-square memorization.
             sym_g = 0
             if symmetry_augment and game.game_name == "chess":
-                from .symmetry import (transform_actions, transform_obs,
-                                       transform_policy_dense, window_eligible)
+                from .symmetry import (SAFE_ELEMENTS, transform_actions,
+                                       transform_obs, transform_policy_dense,
+                                       window_eligible)
                 if window_eligible(obs_list):
-                    sym_g = int(np.random.randint(0, 8))
+                    # Draw from the parity-safe subgroup ONLY — see
+                    # symmetry.SAFE_ELEMENTS. R90/R270/diagonals corrupt
+                    # cross-ply frame consistency under STM encoding.
+                    sym_g = int(SAFE_ELEMENTS[np.random.randint(0, len(SAFE_ELEMENTS))])
                     if sym_g:
                         obs_list = [transform_obs(o, sym_g) for o in obs_list]
                         actions = transform_actions(actions, sym_g)

@@ -35,6 +35,19 @@ from src.games.chess import NUM_MOVE_TYPES  # 73
 N_SYM = 8
 _A = 64 * NUM_MOVE_TYPES
 
+# PARITY-SAFE SUBGROUP (2026-07-05 root cause, audit Finding 1): observations
+# alternate STM encodings ply-to-ply (black plies are rank-mirrored, chess.py
+# `sq ^= 56`). Applying one group element to a K-step WINDOW is only frame-
+# consistent for elements that COMMUTE with the rank mirror: identity, R180,
+# file-mirror, rank-mirror = {0, 2, 4, 6}. The other four (R90, R270, both
+# diagonals) leave every ply-to-ply link off by exactly R180 — the transformed
+# window is not a real game trajectory, corrupting every transition-supervised
+# loss (dynamics/consistency/inverse/unrolled policy/reward-through-dynamics)
+# while all SINGLE-position pairs stay valid (which is why static probes and
+# the white-to-move-only equivariance tests passed). Proof:
+# tests/test_symmetry.py::test_cross_ply_frame_consistency.
+SAFE_ELEMENTS = (0, 2, 4, 6)
+
 # Codec displacement tables (mirrors _action_to_move exactly).
 _DIR_MAP = {0: (0, 1), 1: (1, 1), 2: (1, 0), 3: (1, -1),
             4: (0, -1), 5: (-1, -1), 6: (-1, 0), 7: (-1, 1)}
