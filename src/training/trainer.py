@@ -835,6 +835,7 @@ class MuZeroTrainer:
             # Anchor policies are TB demonstrations — shield from reanalyze.
             # Stamped here (not in the archive) so existing shards are covered.
             g.tb_authored = True
+            g.channel_tag = "anchor"  # unified-buffer channel identity (task #19)
             with self._buffer_lock:
                 self.replay_buffer.save_game(g)
             self._tb_anchor_injected += 1

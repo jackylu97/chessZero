@@ -109,6 +109,11 @@ class GameHistory:
     # with the (weaker-in-endgame) net's own MCTS visits. SERIALIZED, so the
     # protection survives buffer save/load.
     tb_authored: bool = False
+    # SAMPLING CHANNEL TAG (task #19, unified buffer): "" for organic games;
+    # "anchor" stamped at TB-anchor injection. NOT derivable from tb_authored
+    # alone (rollout-FILLED self-play games also set tb_authored for the
+    # reanalyze guard, but belong to the selfplay channel). Serialized.
+    channel_tag: str = ""
     # Per-ply STM-relative Syzygy value of the POSITION (DTZ-shaped), in [-1, 1],
     # NaN where the ply was not in TB range. Empty for games that never reached
     # the tablebase. When populated, make_target blends it into the VALUE target
@@ -148,6 +153,20 @@ class GameHistory:
 
     def __len__(self) -> int:
         return len(self.observations)
+
+    @property
+    def channel(self) -> str:
+        """Sampling channel (task #19): 'warmstart' (Stockfish-eval games),
+        'anchor' (injected TB demonstrations), or 'selfplay' (everything
+        organic, including rollout-filled games). Derived from existing
+        markers + channel_tag so legacy buffers need no migration (legacy
+        anchor games without the tag classify as selfplay — acceptable, they
+        only exist in pre-task-19 snapshots)."""
+        if self.external_values:
+            return "warmstart"
+        if self.channel_tag == "anchor":
+            return "anchor"
+        return "selfplay"
 
     def to_compact_dict(self) -> dict:
         """Pack into a minimal dict for storage: drops observations and
@@ -233,6 +252,8 @@ class GameHistory:
             d["reanalyze_count"] = int(self.reanalyze_count)
         if self.tb_authored:
             d["tb_authored"] = True
+        if self.channel_tag:
+            d["channel_tag"] = self.channel_tag
         return d
 
     @classmethod
@@ -280,6 +301,7 @@ class GameHistory:
 
         gh.reanalyze_count = int(d.get("reanalyze_count", 0))
         gh.tb_authored = bool(d.get("tb_authored", False))
+        gh.channel_tag = str(d.get("channel_tag", ""))
         start_fen = d.get("start_fen")
         gh.start_fen = start_fen
         if start_fen is not None and hasattr(game, "reset_from_fen"):
@@ -883,6 +905,8 @@ class ReplayBuffer:
         eval_to_wdl_beta: float = 2.0,
         warmstart_sample_frac: float = 0.0,
         decisive_sample_frac: float = 0.0,
+        batch_mixture: dict | None = None,
+        position_sampling: str = "per_game",
         q_ratio: float = 0.0,
         warmstart_q_ratio: float | None = None,
         selfplay_q_ratio: float | None = None,
@@ -926,6 +950,54 @@ class ReplayBuffer:
         #     gradient and the value head collapses to predicting "draw".
         # Modes are mutually exclusive (warmstart takes precedence). Both fall
         # back to flat PER when frac=0 or a stratum is empty.
+        _mix_indices = None
+        _mix_weights = None
+        if batch_mixture:
+            # CHANNEL MIXTURE (task #19, unified buffer): declarative batch
+            # composition over GameHistory.channel strata. Supersedes the
+            # two-stratum modes below (they still run for RNG-stream/back-compat
+            # but their picks are overridden). Mixture weights renormalize over
+            # channels that actually hold games (during warmup the selfplay
+            # channel is empty -> its share redistributes proportionally, so
+            # composition stays a CHOSEN ratio instead of an emergent one).
+            # Per-stratum PER probs + IS weights mirror the legacy math.
+            ch_indices: dict[str, list[int]] = {}
+            for i in range(n):
+                ch_indices.setdefault(self.buffer[i].channel, []).append(i)
+            active = {c: np.asarray(v, dtype=np.int64)
+                      for c, v in ch_indices.items()
+                      if v and float(batch_mixture.get(c, 0.0)) > 0.0}
+            if active:
+                tot_w = sum(float(batch_mixture[c]) for c in active)
+                # Largest-remainder rounding so counts hit batch_size exactly.
+                raw = {c: batch_size * float(batch_mixture[c]) / tot_w for c in active}
+                counts = {c: int(raw[c]) for c in active}
+                rem = batch_size - sum(counts.values())
+                for c in sorted(active, key=lambda c: raw[c] - int(raw[c]), reverse=True):
+                    if rem <= 0:
+                        break
+                    counts[c] += 1
+                    rem -= 1
+                idx_parts, w_parts = [], []
+                for c, idx_arr in active.items():
+                    k = counts[c]
+                    if k <= 0:
+                        continue
+                    p = probs[idx_arr]
+                    if position_sampling == "per_ply":
+                        # Weight games by length so every stored PLY is equally
+                        # likely — removes the hidden overweighting of short
+                        # (anchor) games under per-game-uniform sampling.
+                        p = p * np.array([max(len(self.buffer[i]), 1) for i in idx_arr],
+                                         dtype=np.float64)
+                    p = p / p.sum()
+                    picked = np.random.choice(len(idx_arr), size=k, p=p)
+                    idx_parts.append(idx_arr[picked])
+                    w_parts.append((len(idx_arr) * p[picked]) ** (-beta))
+                _mix_indices = np.concatenate(idx_parts)
+                _mix_weights = np.concatenate(w_parts)
+                _mix_weights = (_mix_weights / _mix_weights.max()).astype(np.float32)
+
         subset_idx_arr = None
         comp_idx_arr = None
         strat_frac = 0.0
@@ -973,6 +1045,11 @@ class ReplayBuffer:
             # Importance sampling weights: w_i = (1 / (N * P(i)))^beta, normalised
             weights = (n * probs[game_indices]) ** (-beta)
             weights = (weights / weights.max()).astype(np.float32)
+
+        if _mix_indices is not None:
+            # Channel mixture supersedes the legacy pick (see block above).
+            game_indices = _mix_indices
+            weights = _mix_weights
 
         target_observations = []
         target_obs_masks = []
@@ -1104,6 +1181,11 @@ class ReplayBuffer:
             [bool(self.buffer[i].external_values) for i in game_indices],
             dtype=bool,
         )
+        # Per-sample channel ids for composition logging + per-channel loss
+        # splits (task #19): 0=warmstart, 1=anchor, 2=selfplay.
+        _CH_ID = {"warmstart": 0, "anchor": 1, "selfplay": 2}
+        channel_ids = np.array(
+            [_CH_ID[self.buffer[i].channel] for i in game_indices], dtype=np.int64)
 
         batch = {
             # Root obs (k=0) kept at "observations" for back-compat with callers that
@@ -1120,6 +1202,7 @@ class ReplayBuffer:
             "target_policies": torch.from_numpy(np.stack(policies_batch)),
             "target_moves_left": torch.tensor(moves_left_batch, dtype=torch.float32),  # (B, K+1) plies-to-end
             "is_warmstart": torch.from_numpy(is_warmstart),
+            "channel_ids": torch.from_numpy(channel_ids),
         }
         if symmetry_augment:
             # 1.0 = canonical view (reward loss active), 0.0 = transformed
