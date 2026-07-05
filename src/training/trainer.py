@@ -28,7 +28,8 @@ from .replay_buffer import (
 )
 from .representation_probe import compute_repr_metrics
 from .self_play import (run_self_play, get_material_value_weight, get_material_head_weight,
-                        get_warmstart_sample_frac, get_tb_policy_weight)
+                        get_warmstart_sample_frac, get_tb_policy_weight,
+                        get_batch_mixture)
 
 
 def _negative_cosine_similarity(p: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -136,6 +137,7 @@ class MuZeroTrainer:
             config.replay_buffer_size,
             warmstart_max_size=getattr(config, "warmstart_buffer_size", None),
             decisive_retention_multiplier=getattr(config, "decisive_retention_multiplier", 1.0),
+            anchor_max_size=getattr(config, "anchor_max_size", None),
         )
         # Two-phase buffer sizing: during the supervised warmstart phase there is
         # no self-play to protect the anchor from, so let warmstart games fill the
@@ -977,6 +979,8 @@ class MuZeroTrainer:
                 eval_to_wdl_beta=getattr(self.config, "eval_to_wdl_beta", 2.0),
                 warmstart_sample_frac=get_warmstart_sample_frac(self.global_step, self.config),
                 decisive_sample_frac=getattr(self.config, "decisive_sample_frac", 0.0),
+                batch_mixture=get_batch_mixture(self.global_step, self.config),
+                position_sampling=getattr(self.config, "position_sampling", "per_game"),
                 q_ratio=getattr(self.config, "q_ratio", 0.0),
                 warmstart_q_ratio=getattr(self.config, "warmstart_q_ratio", None),
                 selfplay_q_ratio=getattr(self.config, "selfplay_q_ratio", None),
@@ -1376,6 +1380,28 @@ class MuZeroTrainer:
                                     if n_warm > 0 else float("nan"))
                 policy_loss_self = (policy_per_sample[~is_warm].mean().item()
                                     if n_sp > 0 else float("nan"))
+                # Per-channel composition + anchor loss split (task #19).
+                # Realized fracs make batch composition VISIBLE — the 2026-07-05
+                # histogram audit found warmup batches were an emergent 60%
+                # anchor nobody chose; these scalars make that impossible to miss.
+                ch = batch.get("channel_ids")
+                if ch is not None:
+                    ch = ch.to(self.device)
+                    n_b = ch.numel()
+                    is_anchor = ch == 1
+                    self.writer.add_scalar("batch/frac_warmstart",
+                                           float((ch == 0).sum().item()) / n_b, self.global_step)
+                    self.writer.add_scalar("batch/frac_anchor",
+                                           float(is_anchor.sum().item()) / n_b, self.global_step)
+                    self.writer.add_scalar("batch/frac_selfplay",
+                                           float((ch == 2).sum().item()) / n_b, self.global_step)
+                    if bool(is_anchor.any()):
+                        self.writer.add_scalar(
+                            "loss/policy_loss_anchor",
+                            policy_per_sample[is_anchor].mean().item(), self.global_step)
+                        self.writer.add_scalar(
+                            "loss/value_loss_anchor",
+                            value_per_sample[is_anchor].mean().item(), self.global_step)
                 value_loss_warm = (value_per_sample[is_warm].mean().item()
                                    if n_warm > 0 else float("nan"))
                 value_loss_self = (value_per_sample[~is_warm].mean().item()

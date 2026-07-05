@@ -793,8 +793,15 @@ class ReplayBuffer:
     """
 
     def __init__(self, max_size: int, warmstart_max_size: int | None = None,
-                 decisive_retention_multiplier: float = 1.0):
+                 decisive_retention_multiplier: float = 1.0,
+                 anchor_max_size: int | None = None):
         self.max_size = max_size
+        # Per-channel cap for injected TB-anchor demonstrations (task #19).
+        # None = legacy behavior (anchor games compete in the selfplay pool,
+        # so anchor share is EMERGENT from injection cadence vs eviction).
+        # Set => anchor becomes a third pool with its own within-pool eviction,
+        # making demonstration volume a chosen number.
+        self.anchor_max_size = anchor_max_size
         # Retention "lives": when > 1, a DECISIVE game's age counts this many times
         # slower for eviction, so it survives ~M× longer than a drawn game (lifting
         # the buffer's decisive-game density). 1.0 = plain oldest-first FIFO.
@@ -816,7 +823,7 @@ class ReplayBuffer:
         self._priorities: list[float] = []
         self.total_games = 0
 
-    def _eviction_victim(self, is_warm: bool | None) -> int | None:
+    def _eviction_victim(self, is_warm: bool | None, channel: str | None = None) -> int | None:
         """Index of the game to evict among the candidate pool.
 
         Evicts the game with the largest ``age / retention_weight`` — i.e. the one
@@ -825,12 +832,16 @@ class ReplayBuffer:
         So decisive games are evicted only once they're ~M× older than a draw would
         be → they persist ~M× longer. With multiplier 1.0 this is plain oldest-first.
 
-        ``is_warm`` selects the pool (True/False); None = legacy single pool.
+        ``channel`` (task #19) selects the candidate pool by GameHistory.channel;
+        else ``is_warm`` selects the legacy two-pool split; both None = single pool.
         """
         M = self.decisive_retention_multiplier
         best_i, best_score = None, -1.0
         for i, g in enumerate(self.buffer):
-            if is_warm is not None and bool(g.external_values) != is_warm:
+            if channel is not None:
+                if g.channel != channel:
+                    continue
+            elif is_warm is not None and bool(g.external_values) != is_warm:
                 continue
             age = self._save_counter - g.birth
             weight = M if (M > 1.0 and g.game_outcome != 0.0) else 1.0
@@ -845,7 +856,25 @@ class ReplayBuffer:
         game_history.birth = self._save_counter
         self._save_counter += 1
         is_warm = bool(game_history.external_values)
-        if self.warmstart_max_size is not None:
+        if self.anchor_max_size is not None:
+            # Three-pool eviction (task #19): each channel evicts only among
+            # itself once its cap is reached — every pool's volume is a CHOSEN
+            # number (warm = warmstart_max_size, anchor = anchor_max_size,
+            # selfplay = the remainder). Victims retention-weighted as before.
+            ch = game_history.channel
+            warm_cap = self.warmstart_max_size or 0
+            caps = {
+                "warmstart": warm_cap,
+                "anchor": self.anchor_max_size,
+                "selfplay": max(1, self.max_size - warm_cap - self.anchor_max_size),
+            }
+            cur = sum(1 for g in self.buffer if g.channel == ch)
+            if cur >= caps[ch]:
+                victim = self._eviction_victim(None, channel=ch)
+                if victim is not None:
+                    self.buffer.pop(victim)
+                    self._priorities.pop(victim)
+        elif self.warmstart_max_size is not None:
             # Two-pool eviction: if the relevant pool is at cap, evict within THAT
             # pool only (warmstart games can never be displaced by self-play). The
             # victim is retention-weighted (decisive games persist M× longer).

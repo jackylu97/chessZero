@@ -665,6 +665,18 @@ class MuZeroConfig:
     # 0.20 -> 0.048 on identical weights). 8 matches value/moves-left heads.
     # Kept at 1 in presets so old checkpoints load; set per-run via CLI.
     reward_head_planes: int = 1
+    # UNIFIED BUFFER (task #19): declarative batch composition. When set,
+    # supersedes warmstart_sample_frac stratification. Piecewise schedule of
+    # (step_fraction, {channel: weight}) with channels warmstart|anchor|selfplay;
+    # weights renormalize over non-empty channels (warmup composition becomes a
+    # CHOSEN ratio, not the emergent one the 2026-07-05 histogram audit found).
+    batch_mixture_schedule: list | None = None
+    # Per-channel cap for injected TB-anchor demonstrations in the main buffer.
+    # None = legacy (anchor competes in the selfplay pool; volume emergent).
+    anchor_max_size: int | None = None
+    # Position sampling within a game: "per_game" (legacy; short games' plies
+    # oversampled) or "per_ply" (every stored ply equally likely).
+    position_sampling: str = "per_game"
     # Overlap the ~141ms single-threaded sample_batch with the GPU train step via
     # a background prefetch thread (double-buffered, lock-guarded against buffer
     # writes). ~halves per-step time during the training phase. Off by default.

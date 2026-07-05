@@ -262,6 +262,17 @@ def main():
                              "config.moves_left_head_blocks, preset 0).")
     parser.add_argument("--value-head-planes", type=int, default=None,
                         help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--batch-mixture-schedule", type=str, default=None,
+                        help='JSON schedule of declarative batch composition (task #19), e.g. '
+                             '\'[[0.0,{"warmstart":0.4,"anchor":0.2,"selfplay":0.4}],'
+                             '[0.6,{"warmstart":0.1,"anchor":0.1,"selfplay":0.8}]]\'. '
+                             "Supersedes warmstart-sample-frac stratification.")
+    parser.add_argument("--anchor-max-size", type=int, default=None,
+                        help="Cap the TB-anchor pool in the main buffer (three-pool eviction). "
+                             "Unset = legacy emergent anchor volume.")
+    parser.add_argument("--position-sampling", choices=["per_game", "per_ply"], default=None,
+                        help="Position sampling within games: per_game (legacy) or per_ply "
+                             "(every stored ply equally likely; removes short-game overweighting).")
     parser.add_argument("--reward-head-planes", type=int, default=None,
                         help="Width of the dynamics-reward head's 1x1 projection (config default 1). "
                              "The reward head is the search's in-tree mate detector; 8 matches the "
@@ -550,6 +561,14 @@ def main():
         config.ml_max_effect = args.ml_max_effect
     if args.ml_threshold is not None:
         config.ml_threshold = args.ml_threshold
+    if args.batch_mixture_schedule is not None:
+        import json
+        sched = json.loads(args.batch_mixture_schedule)
+        config.batch_mixture_schedule = [(float(f), dict(m)) for f, m in sched]
+    if args.anchor_max_size is not None:
+        config.anchor_max_size = args.anchor_max_size
+    if args.position_sampling is not None:
+        config.position_sampling = args.position_sampling
     if args.reward_head_planes is not None:
         config.reward_head_planes = args.reward_head_planes
     if args.moves_left_head_planes is not None:

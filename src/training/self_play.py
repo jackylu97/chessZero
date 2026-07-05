@@ -287,6 +287,28 @@ def get_warmstart_sample_frac(training_step: int, config) -> float:
     return f_init + (f_final - f_init) * t
 
 
+def get_batch_mixture(training_step: int, config) -> dict | None:
+    """Declarative batch composition for the current step (task #19).
+
+    ``batch_mixture_schedule`` is a list of ``(step_fraction, {channel: weight})``
+    pairs, piecewise-constant like temperature_schedule: the entry with the
+    largest step_fraction <= progress applies. None (default) = legacy
+    warmstart_sample_frac stratification. Channels: warmstart | anchor |
+    selfplay; weights renormalize over non-empty channels at sample time, so
+    during warmup (selfplay empty) the composition stays a chosen ratio.
+    """
+    sched = getattr(config, "batch_mixture_schedule", None)
+    if not sched:
+        return None
+    total = max(1, int(getattr(config, "training_steps", 1)))
+    progress = training_step / total
+    mixture = None
+    for frac, mix in sorted(sched, key=lambda e: e[0]):
+        if progress >= frac:
+            mixture = mix
+    return dict(mixture) if mixture else None
+
+
 def get_tb_policy_weight(training_step: int, config) -> float:
     """Annealed soft-TB-policy-relabel weight. Linearly decays ``tb_policy_weight`` →
     ``tb_policy_weight_final`` over [0, ``tb_policy_anneal_frac`` · training_steps]; with
