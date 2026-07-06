@@ -28,7 +28,7 @@ def get_game(name: str):
     if name == "connect4":
         from src.games.connect4 import Connect4
         return Connect4()
-    if name in ("chess", "chess_small", "chess_hybrid"):
+    if name in ("chess", "chess_small", "chess_hybrid", "chess_hybrid_xl"):
         from src.games.chess import ChessGame
         return ChessGame()
     if name == "checkers":
@@ -41,7 +41,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train MuZero")
     parser.add_argument("--game", type=str, default="tictactoe",
                         choices=["tictactoe", "connect4", "chess", "chess_small",
-                                 "chess_hybrid", "checkers"])
+                                 "chess_hybrid", "chess_hybrid_xl", "checkers"])
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--log-dir", type=str, default="runs")
@@ -262,6 +262,10 @@ def main():
                              "config.moves_left_head_blocks, preset 0).")
     parser.add_argument("--value-head-planes", type=int, default=None,
                         help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--grad-checkpoint-attention", action="store_true", default=False,
+                        help="Recompute attention layers in backward (exact math, ~25-30% slower "
+                             "train steps, large activation-memory savings). Needed for "
+                             "chess_hybrid_xl batch-512 on 32GB cards.")
     parser.add_argument("--batch-mixture-schedule", type=str, default=None,
                         help='JSON schedule of declarative batch composition (task #19), e.g. '
                              '\'[[0.0,{"warmstart":0.4,"anchor":0.2,"selfplay":0.4}],'
@@ -561,6 +565,8 @@ def main():
         config.ml_max_effect = args.ml_max_effect
     if args.ml_threshold is not None:
         config.ml_threshold = args.ml_threshold
+    if args.grad_checkpoint_attention:
+        config.grad_checkpoint_attention = True
     if args.batch_mixture_schedule is not None:
         import json
         sched = json.loads(args.batch_mixture_schedule)
@@ -734,6 +740,14 @@ def main():
         pred_attn_layers=getattr(config, "pred_attn_layers", 2),
         hybrid_stem_blocks=getattr(config, "hybrid_stem_blocks", 0),
     )
+    if getattr(config, "grad_checkpoint_attention", False):
+        from src.model.attention import BoardAttentionEncoder
+        n_ck = 0
+        for m in network.modules():
+            if isinstance(m, BoardAttentionEncoder):
+                m.grad_checkpoint = True
+                n_ck += 1
+        print(f"Activation checkpointing ON for {n_ck} attention encoder(s)")
 
     trainer = MuZeroTrainer(
         config, game, network, run_id,

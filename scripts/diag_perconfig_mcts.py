@@ -19,7 +19,7 @@ gg=GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
 CKPT=os.environ.get("CKPT","checkpoints/tb5_seq_ml.pt"); ATTN=os.environ.get("USE_ATTENTION","0")=="1"
 SMOL=os.environ.get("USE_SMOLGEN","1")=="1"; PREDATTN=os.environ.get("USE_PRED_ATTENTION","0")=="1"
 DYNATTN=os.environ.get("USE_DYN_ATTENTION","0")=="1"
-ATTNL=int(os.environ.get("ATTN_LAYERS","4"))
+ATTNL=int(os.environ.get("ATTN_LAYERS", str(getattr(cfg,"attn_layers",4))))
 # CFG=chess_hybrid picks up hidden/fc/head widths from the preset; these envs then
 # only need to mirror the attention body switches.
 HYBRID_STEM=int(os.environ.get("HYBRID_STEM", str(getattr(cfg,"hybrid_stem_blocks",0))))
@@ -39,7 +39,8 @@ net=MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS,
     use_moves_left=True, moves_left_support_size=cfg.moves_left_support_size,
     moves_left_head_planes=int(os.environ.get("MLH_PLANES", getattr(cfg,"moves_left_head_planes",16))),
     moves_left_head_blocks=int(os.environ.get("MLH_BLOCKS", getattr(cfg,"moves_left_head_blocks",1))),
-    use_repr_attention=ATTN, attn_layers=ATTNL, attn_heads=4, use_smolgen=SMOL,
+    use_repr_attention=ATTN, attn_layers=ATTNL,
+    attn_heads=int(os.environ.get("ATTN_HEADS", str(getattr(cfg,"attn_heads",4)))), use_smolgen=SMOL,
     use_pred_attention=PREDATTN, pred_attn_layers=PREDATTN_LAYERS, use_dyn_attention=DYNATTN,
     hybrid_stem_blocks=HYBRID_STEM, value_head_planes=VHP,
     reward_head_planes=int(os.environ.get("REWARD_PLANES", str(getattr(cfg,"reward_head_planes",1))))).to(DEV)
@@ -138,7 +139,12 @@ def report(tag, outcome, pmate, sigs, cap_won, cap_lost):
         print(f"    {s:12s} n={n:4d} CONV={conv:.2f} cap={c/n:.2f} draw={d/n:.2f} lost={l/n:.2f}")
 
 tb=chess.syzygy.open_tablebase("data/syzygy")
-for use_term in (False, True):
+_terms=[False, True]
+if os.environ.get("SKIP_TERM","0")=="1": _terms=[False]
+mcts=None
+for use_term in _terms:
+    if mcts is not None:
+        del mcts; torch.cuda.empty_cache()   # free the prior tree before re-allocating (OOM fix)
     cfg.num_simulations=SIMS; cfg.moves_left_mcts=True; cfg.tb_root_probe=False; cfg.root_terminal_draws=use_term; cfg.use_gumbel=os.environ.get("USE_GUMBEL","0")=="1"; cfg.use_gumbel_noise=False
     mcts=TensorMCTS(net, game, cfg, device=DEV, hidden_dtype=torch.float32, select_backend="eager")
     t0=time.time()

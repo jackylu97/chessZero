@@ -15,6 +15,7 @@ place of the residual blocks while preserving the spatial latent the conv policy
 from __future__ import annotations
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 
 class Smolgen(nn.Module):
@@ -123,7 +124,18 @@ class BoardAttentionEncoder(nn.Module):
         B, C, H, W = x.shape
         t = x.flatten(2).transpose(1, 2)                        # (B, N, C)
         t = t + self.pos
+        # Activation checkpointing (2026-07-06, XL scale test): with grad
+        # enabled, recompute each layer in backward instead of storing its
+        # activations — memory drops ~n_layers-fold on the attention stack for
+        # ~25-30% extra training compute. EXACT same math (not an
+        # approximation). Enabled per-encoder via .grad_checkpoint; inference
+        # (no_grad) paths are unaffected. This is what fits the 24M-param XL's
+        # batch-512 training on a 32GB card.
+        use_ckpt = getattr(self, "grad_checkpoint", False) and torch.is_grad_enabled()
         for layer in self.layers:
-            t = layer(t)
+            if use_ckpt:
+                t = torch.utils.checkpoint.checkpoint(layer, t, use_reentrant=False)
+            else:
+                t = layer(t)
         t = self.ln_out(t)
         return t.transpose(1, 2).reshape(B, C, H, W)

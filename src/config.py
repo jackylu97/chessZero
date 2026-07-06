@@ -677,6 +677,11 @@ class MuZeroConfig:
     # Position sampling within a game: "per_game" (legacy; short games' plies
     # oversampled) or "per_ply" (every stored ply equally likely).
     position_sampling: str = "per_game"
+    # Activation checkpointing on the attention bodies during training:
+    # recompute layers in backward instead of storing activations. Exact same
+    # math, ~25-30% slower train steps, memory ~n_layers-fold smaller on the
+    # attention stack. Required for chess_hybrid_xl batch-512 on 32GB.
+    grad_checkpoint_attention: bool = False
     # Overlap the ~141ms single-threaded sample_batch with the GPU train step via
     # a background prefetch thread (double-buffered, lock-guarded against buffer
     # writes). ~halves per-step time during the training phase. Off by default.
@@ -1169,5 +1174,22 @@ def get_config(game: str) -> MuZeroConfig:
         value_head_planes=8,         # 1 -> 8: un-bottleneck the value projection
         moves_left_head_planes=8,    # 1 -> 8: latent holds DTZ at corr 0.80, the
                                      #   1-plane head reads it at 0.035
+    )
+    # chess_hybrid_xl (2026-07-06, strategy §16): the 5x SCALE TEST — same shape
+    # as chess_hybrid, 4.9x the inference params (23.97M vs 4.85M). d288 with 8
+    # heads (head-dim 36), 6-layer bodies, 3-layer prediction body, 3-block
+    # conv-SE stems, fc 256. Paired with 2x schedule (30k warmstart / 300k
+    # total). Reward head planes stay 8 (set per-run via CLI). Board-game
+    # scaling prior (Jones 2021): expect left-shifted milestones (sample
+    # efficiency), overfit risk on the unchanged 5120 buffer — watch
+    # SF-agreement as the tripwire.
+    configs["chess_hybrid_xl"] = replace(
+        configs["chess_hybrid"],
+        hidden_planes=288,
+        fc_hidden=256,
+        attn_layers=6,
+        attn_heads=8,
+        hybrid_stem_blocks=3,
+        pred_attn_layers=3,
     )
     return configs.get(game, configs["tictactoe"])
