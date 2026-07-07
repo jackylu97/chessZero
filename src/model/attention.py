@@ -139,3 +139,111 @@ class BoardAttentionEncoder(nn.Module):
                 t = layer(t)
         t = self.ln_out(t)
         return t.transpose(1, 2).reshape(B, C, H, W)
+
+
+class AttnPoolHead(nn.Module):
+    """Attention-pooled scalar head (2026-07-07 arch sweep, arm D).
+
+    Replaces the Conv1x1->flatten->MLP squeeze: a single LEARNED QUERY
+    cross-attends over the 64 square-tokens, then an MLP maps the pooled
+    vector to the output logits. Rationale: scalar judgments like "is this
+    mate" are RELATIONAL (king, attackers, escape squares) — one global
+    attention read is the natural aggregation, where a 1x1-conv squeeze must
+    compress relations into per-square channels first.
+    In: (B, C, H, W) latent. Out: (B, out_dim) logits.
+    """
+
+    def __init__(self, dim: int, out_dim: int, n_heads: int = 8, mlp_hidden: int | None = None):
+        super().__init__()
+        self.query = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.trunc_normal_(self.query, std=0.02)
+        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.ln = nn.LayerNorm(dim)
+        h = mlp_hidden if mlp_hidden is not None else dim
+        self.mlp = nn.Sequential(nn.Linear(dim, h), nn.ReLU(), nn.Linear(h, out_dim))
+        nn.init.zeros_(self.mlp[-1].weight); nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        tokens = x.flatten(2).transpose(1, 2)                    # (B, 64, C)
+        q = self.query.expand(B, -1, -1)
+        pooled, _ = self.attn(q, tokens, tokens)                  # (B, 1, C)
+        return self.mlp(self.ln(pooled.squeeze(1)))               # (B, out_dim)
+
+
+def _build_from_to_luts(num_move_types: int = 73):
+    """LUTs mapping the flat action space (from*73+mt) onto (from,to) bilinear
+    scores + an underpromotion branch. Single source of truth: the codec
+    displacement tables (mirrors _action_to_move exactly; same tables the
+    symmetry module validates against python-chess).
+
+    Returns (gather_idx [A], is_promo [A], valid [A]):
+      - ray/knight action a with on-board destination: gather_idx[a] = from*64+to
+      - underpromotion action: gather_idx[a] = from*9 + (mt-64), is_promo[a]=1
+      - off-board geometry: valid[a]=0 (logit pinned to -1e4)
+    """
+    # Single source of truth for move geometry (same tables the symmetry
+    # module validates against python-chess). Lazy import: model -> training
+    # dependency only at LUT-build time, no cycle.
+    from src.training.symmetry import _DIR_MAP, _KNIGHT
+    A = 64 * num_move_types
+    gather_idx = torch.zeros(A, dtype=torch.long)
+    is_promo = torch.zeros(A, dtype=torch.bool)
+    valid = torch.zeros(A, dtype=torch.bool)
+    for frm in range(A // num_move_types * 0 + 64):
+        fr, fc = divmod(frm, 8)
+        for mt in range(num_move_types):
+            a = frm * num_move_types + mt
+            if mt >= 64:
+                gather_idx[a] = frm * 9 + (mt - 64)
+                is_promo[a] = True
+                valid[a] = True
+                continue
+            if mt < 56:
+                dr, dc = _DIR_MAP[mt // 7]
+                dist = mt % 7 + 1
+                dr, dc = dr * dist, dc * dist
+            else:
+                dr, dc = _KNIGHT[mt - 56]
+            tr, tc = fr + dr, fc + dc
+            if 0 <= tr < 8 and 0 <= tc < 8:
+                gather_idx[a] = frm * 64 + (tr * 8 + tc)
+                valid[a] = True
+    return gather_idx, is_promo, valid
+
+
+class FromToPolicyHead(nn.Module):
+    """Relational (from->to) policy head, Lc0-transformer style (arch sweep, arm C).
+
+    Move logits as bilinear scores between from-square and to-square token
+    embeddings — a move IS a relation between two squares; the conv head must
+    encode 'long-diagonal queen move' as stacked plane patterns instead.
+    Underpromotions (mt 64-72) get a per-from-square linear branch.
+    In: (B, C, H, W) latent. Out: (B, 4672) logits over the standard action space.
+    """
+
+    def __init__(self, dim: int, d_head: int = 64, num_move_types: int = 73):
+        super().__init__()
+        self.d_head = d_head
+        self.q_proj = nn.Linear(dim, d_head)
+        self.k_proj = nn.Linear(dim, d_head)
+        self.promo = nn.Linear(dim, 9)
+        nn.init.zeros_(self.promo.weight); nn.init.zeros_(self.promo.bias)
+        gather_idx, is_promo, valid = _build_from_to_luts(num_move_types)
+        self.register_buffer("ft_gather", gather_idx, persistent=False)
+        self.register_buffer("ft_is_promo", is_promo, persistent=False)
+        self.register_buffer("ft_valid", valid, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        tokens = x.flatten(2).transpose(1, 2)                    # (B, 64, C)
+        q = self.q_proj(tokens)                                   # (B, 64, dh) from-embeddings
+        k = self.k_proj(tokens)                                   # (B, 64, dh) to-embeddings
+        S = torch.bmm(q, k.transpose(1, 2)) / (self.d_head ** 0.5)  # (B, 64, 64)
+        U = self.promo(tokens)                                    # (B, 64, 9)
+        s_flat = S.flatten(1)                                     # (B, 4096)
+        u_flat = U.flatten(1)                                     # (B, 576)
+        ray = s_flat.gather(1, self.ft_gather.clamp(max=4095).unsqueeze(0).expand(B, -1))
+        pro = u_flat.gather(1, self.ft_gather.clamp(max=575).unsqueeze(0).expand(B, -1))
+        logits = torch.where(self.ft_is_promo.unsqueeze(0), pro, ray)
+        return logits.masked_fill(~self.ft_valid.unsqueeze(0), -1e4)

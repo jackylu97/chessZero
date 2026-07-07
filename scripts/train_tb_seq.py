@@ -4,15 +4,30 @@ dynamics is real, so MCTS should finally help. Tests value/policy acc + greedy +
 
 Run: PYTHONPATH=. .venv/bin/python scripts/train_tb_seq.py
 """
-import pickle, time, numpy as np, torch, torch.nn.functional as F, chess
+import os, pickle, time, numpy as np, torch, torch.nn.functional as F, chess
 from src.config import get_config
 from src.games.chess import ChessGame, _action_to_move, _move_to_action
 from src.games.chess_gpu import GpuChessGame
 from src.model.muzero_net import MuZeroNetwork
 from src.model.utils import scalar_transform, scalar_to_support, inverse_scalar_transform, support_to_scalar
 
-DEV = "cuda"; cfg = get_config("chess_small"); game = ChessGame(); AS = game.action_space_size; NF = cfg.history_frames
+DEV = "cuda"; cfg = get_config(os.environ.get("CFG", "chess_small")); game = ChessGame(); AS = game.action_space_size; NF = cfg.history_frames
 K = 5; gg = GpuChessGame(); torch.manual_seed(0); np.random.seed(0)
+# 2026-07-07 arch sweep params (defaults preserve historical behavior)
+D_MODEL = int(os.environ.get("D_MODEL", str(cfg.hidden_planes)))
+ATTN = os.environ.get("USE_ATTENTION", "0") == "1"
+LAYERS = int(os.environ.get("ATTN_LAYERS", str(getattr(cfg, "attn_layers", 4))))
+HEADS = int(os.environ.get("ATTN_HEADS", str(getattr(cfg, "attn_heads", 4))))
+STEM = int(os.environ.get("HYBRID_STEM", str(getattr(cfg, "hybrid_stem_blocks", 0))))
+PRED_L = int(os.environ.get("PRED_ATTN_LAYERS", str(getattr(cfg, "pred_attn_layers", 2))))
+POLICY_HEAD = os.environ.get("POLICY_HEAD", cfg.policy_head_type)
+SCALAR_POOL = os.environ.get("SCALAR_POOL", "conv")
+STEPS = int(os.environ.get("STEPS", "12000"))
+BATCH = int(os.environ.get("BATCH", "384"))
+REWARD_W = float(os.environ.get("REWARD_W", "0.0"))
+FC = int(os.environ.get("FC_HIDDEN", str(cfg.fc_hidden)))
+OUT = os.environ.get("OUT", "checkpoints/tb5_seq_ml.pt")
+GRAD_CKPT = os.environ.get("GRAD_CKPT", "0") == "1"
 print("loading sequences...", flush=True)
 SEQ = pickle.load(open("data/tb5_seq.pkl", "rb"))
 te = pickle.load(open("data/tb5_test.pkl", "rb"))           # isolated positions for value/policy/conv eval
@@ -25,15 +40,26 @@ def encode(fens):
     if NF > 1: obs = torch.cat([obs, torch.zeros(N, (NF-1)*C, H, W, device=DEV)], 1)
     return obs
 
-net = MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS, hidden_planes=cfg.hidden_planes,
+net = MuZeroNetwork(observation_channels=game.num_planes*NF, action_space_size=AS, hidden_planes=D_MODEL,
     num_blocks=cfg.num_residual_blocks, latent_h=cfg.latent_h, latent_w=cfg.latent_w, input_h=game.board_size[0],
-    input_w=game.board_size[1], fc_hidden=cfg.fc_hidden, value_support_size=cfg.value_support_size,
-    reward_support_size=cfg.reward_support_size, action_embed_dim=cfg.action_embed_dim, use_consistency_loss=False,
+    input_w=game.board_size[1], fc_hidden=FC, value_support_size=cfg.value_support_size,
+    reward_support_size=cfg.reward_support_size, reward_head_planes=8,
+    action_embed_dim=cfg.action_embed_dim, use_consistency_loss=False,
     proj_hid=cfg.proj_hid, proj_out=cfg.proj_out, pred_hid=cfg.pred_hid, pred_out=cfg.pred_out,
     use_scalar_transform=cfg.use_scalar_transform, value_target_scale=cfg.value_target_scale, value_head_type="wdl",
-    draw_score=0.0, policy_head_type=cfg.policy_head_type, use_material_head=False,
+    draw_score=0.0, policy_head_type=POLICY_HEAD, use_material_head=False,
     use_moves_left=True, moves_left_support_size=cfg.moves_left_support_size,
-    moves_left_head_planes=16, moves_left_head_blocks=1).to(DEV)
+    moves_left_head_planes=8, moves_left_head_blocks=0,
+    scalar_head_pool=SCALAR_POOL,
+    use_repr_attention=ATTN, use_dyn_attention=ATTN, use_pred_attention=ATTN,
+    attn_layers=LAYERS, attn_heads=HEADS, use_smolgen=True,
+    pred_attn_layers=PRED_L, hybrid_stem_blocks=STEM,
+    value_head_planes=8).to(DEV)
+if GRAD_CKPT:
+    from src.model.attention import BoardAttentionEncoder
+    for m in net.modules():
+        if isinstance(m, BoardAttentionEncoder):
+            m.grad_checkpoint = True
 ML_W = float(cfg.moves_left_loss_weight)   # 0.25 — aux moves-left CE weight
 opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
 
@@ -104,8 +130,8 @@ def evaluate(mcts_sims=None):
     net.train(); return vacc, pacc, gconv, mconv, mlw, mld
 
 print(f"params: {sum(p.numel() for p in net.parameters())/1e6:.2f}M", flush=True)
-B = 384; t0 = time.time()
-for step in range(1, 12001):
+B = BATCH; t0 = time.time()
+for step in range(1, STEPS + 1):
     bi = np.random.randint(0, len(SEQ), B); batch = [SEQ[i] for i in bi]
     # pad to K+1 plies
     obs_k = []; act_k = []; vc_k = []; pol_k = []; mask_k = []; ml_k = []
@@ -125,6 +151,15 @@ for step in range(1, 12001):
         else:
             h, rl, pl, vl = net.recurrent_inference_logits(h, act_k[k-1])
             h.register_hook(lambda g: g * 0.5)
+            if REWARD_W > 0.0:
+                # Reward supervision (2026-07-07): mate transition <=> the landed
+                # position has plies-to-end 0. Target one-hot at +1 (mover POV);
+                # everything else 0. Gives the proxy a trained mate detector.
+                rew_cls = torch.where(ml_k[k] <= 0.5,
+                                      torch.full_like(vc_k[k], 2),
+                                      torch.full_like(vc_k[k], 1))  # support {-1,0,+1} idx
+                rce = F.cross_entropy(rl, rew_cls, reduction='none') * mask_k[k]
+                loss = loss + mloss * REWARD_W * rce.mean()
             # latent consistency: dynamics latent should match the real position's latent
             with torch.no_grad():
                 ht = net.representation(obs_k[k])
@@ -144,6 +179,6 @@ for step in range(1, 12001):
               f"policy_acc {pacc:.3f} GREEDY_conv {gconv:.3f}{ms} | ml_won {mlw:.0f} ml_draw {mld:.0f}", flush=True)
 import os
 os.makedirs("checkpoints", exist_ok=True)
-torch.save({"model_state_dict": net.state_dict()}, "checkpoints/tb5_seq_ml.pt")
-print("saved checkpoints/tb5_seq_ml.pt", flush=True)
+torch.save({"model_state_dict": net.state_dict()}, OUT)
+print(f"saved {OUT}", flush=True)
 print("DONE", flush=True)

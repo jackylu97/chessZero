@@ -297,11 +297,13 @@ class PredictionNetwork(nn.Module):
         pred_attn_layers: int = 2,
         pred_attn_heads: int = 4,
         pred_use_smolgen: bool = True,
+        scalar_head_pool: str = "conv",
     ):
         super().__init__()
         self.value_support_size = value_support_size
         self.value_head_type = value_head_type
         self.policy_head_type = policy_head_type
+        self.scalar_head_pool = scalar_head_pool
 
         # Shared attention body over the latent tokens, applied BEFORE the policy/value
         # heads split — gives both heads attention-refined features and (unlike the
@@ -324,6 +326,12 @@ class PredictionNetwork(nn.Module):
             self.policy_head = ConvPolicyHead(
                 hidden_planes, action_space_size, latent_h, latent_w
             )  # zero-inits its own output conv
+        elif policy_head_type == "from_to":
+            # Relational bilinear from->to head (Lc0 transformer style; arch
+            # sweep arm C). Codec-parity tested in tests/test_arch_heads.py.
+            from .attention import FromToPolicyHead
+            assert action_space_size == 64 * 73, "from_to head is chess-specific"
+            self.policy_head = FromToPolicyHead(hidden_planes)
         elif policy_head_type == "flat":
             self.policy_head = nn.Sequential(
                 nn.Conv2d(hidden_planes, 2, 1, bias=False),
@@ -351,18 +359,26 @@ class PredictionNetwork(nn.Module):
         # value_head_planes>1 widens the projection; value_head_blocks>0 adds
         # pre-projection residual blocks at hidden width for dedicated capacity.
         vhp = int(value_head_planes)
-        value_layers: list[nn.Module] = [
-            ResidualBlock(hidden_planes, (latent_h, latent_w))
-            for _ in range(int(value_head_blocks))
-        ]
-        value_layers += [
-            nn.Conv2d(hidden_planes, vhp, 1, bias=False),
-            norm_layer(vhp, (latent_h, latent_w)),
-            nn.ReLU(),
-            nn.Flatten(),
-            mlp_head(vhp * latent_h * latent_w, fc_hidden, value_out),
-        ]
-        self.value_head = nn.Sequential(*value_layers)
+        if scalar_head_pool == "attn":
+            # Attention-pooled value head (arch sweep arm D): learned query
+            # cross-attends the 64 tokens — relational aggregation instead of
+            # a channel squeeze. See attention.AttnPoolHead.
+            from .attention import AttnPoolHead
+            self.value_head = AttnPoolHead(hidden_planes, value_out,
+                                           mlp_hidden=fc_hidden)
+        else:
+            value_layers: list[nn.Module] = [
+                ResidualBlock(hidden_planes, (latent_h, latent_w))
+                for _ in range(int(value_head_blocks))
+            ]
+            value_layers += [
+                nn.Conv2d(hidden_planes, vhp, 1, bias=False),
+                norm_layer(vhp, (latent_h, latent_w)),
+                nn.ReLU(),
+                nn.Flatten(),
+                mlp_head(vhp * latent_h * latent_w, fc_hidden, value_out),
+            ]
+            self.value_head = nn.Sequential(*value_layers)
         # Value-head output init. Default (std=0.0) zero-inits the last linear —
         # the standard MuZero/LightZero stability trick. BUT zero weights make the
         # head's Jacobian w.r.t. its input zero (grad_to_input = Wᵀ·grad_out = 0),
@@ -581,6 +597,7 @@ class MuZeroNetwork(nn.Module):
         value_head_blocks: int = 0,
         moves_left_head_planes: int = 1,
         moves_left_head_blocks: int = 0,
+        scalar_head_pool: str = "conv",
         use_repr_attention: bool = False,
         attn_layers: int = 4,
         attn_heads: int = 4,
@@ -634,6 +651,7 @@ class MuZeroNetwork(nn.Module):
             pred_attn_layers=pred_attn_layers,
             pred_attn_heads=attn_heads,
             pred_use_smolgen=use_smolgen,
+            scalar_head_pool=scalar_head_pool,
         )
 
         # Inverse-dynamics head (ICM): predicts a_k from (h_k, h_{k+1}). Forces the
@@ -648,7 +666,11 @@ class MuZeroNetwork(nn.Module):
 
         # Moves-left head (Lc0): predicts plies-to-end; used to break value
         # saturation so the search prefers faster wins instead of shuffling.
-        if use_moves_left:
+        if use_moves_left and scalar_head_pool == "attn":
+            from .attention import AttnPoolHead
+            self.moves_left_head = AttnPoolHead(
+                hidden_planes, 2 * moves_left_support_size + 1, mlp_hidden=fc_hidden)
+        elif use_moves_left:
             self.moves_left_head = MovesLeftHead(
                 hidden_planes, latent_h, latent_w, fc_hidden, moves_left_support_size,
                 head_planes=moves_left_head_planes, head_blocks=moves_left_head_blocks,
