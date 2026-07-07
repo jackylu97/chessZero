@@ -10,13 +10,25 @@
 # Registered predictions (board-game scaling laws, Jones 2021):
 #   1. milestones left-shifted in steps (sample efficiency of the larger net)
 #   2. 60k verdict should exceed v3 (evals ~59, conversion 0.113/0.160-long)
-#   3. still-climbing at 60k => scale is data/compute-hungry (extend, don't conclude)
+#   3. still-climbing at 60k => extend, do not conclude
+# 2026-07-06 MID-RUN CHANGE at 32k (user decision): sims 400 -> 200 (Jones
+# train/test-compute trade; 800-vs-400 diag showed depth is not the binder;
+# Gumbel guarantee holds at low sims). Verdict diags stay SIMS=400 for
+# cross-arm comparability. XL@200 is the production-rehearsal config.
+# 2026-07-07 SECOND CHANGE at ~62k: sims BACK to 400 (A/B/A). Evidence: under
+# 200-sim training, general strength soared (eval record, SF-agreement 0.814)
+# but 400-sim-measured conversion REGRESSED 0.107 -> 0.047 and the sims sweep
+# equalized at the LOW level (net stopped converting regardless of depth).
+# Reading: self-play search depth is load-bearing for the TECHNIQUE-learning
+# loop while the net is young — search finds conversions, the net banks them;
+# at 200 sims the loop starves. Watch conversion recover by ~75k to confirm.
 set -uo pipefail
 cd /workspace/chessZero
 RUN=2026_07_06_hybrid_xl
 tmux kill-session -t selfplay 2>/dev/null
 tmux new-session -d -s selfplay "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. .venv/bin/python -u scripts/_faulthandler_bootstrap.py scripts/train.py \
   --game chess_hybrid_xl --run-id $RUN --device cuda \
+  --resume checkpoints/chess/2026_07_06_hybrid_xl/checkpoint_62000.pt \
   --grad-checkpoint-attention \
   --reward-head-planes 8 \
   --use-gumbel --gumbel-m 16 --per-alpha 0 \
