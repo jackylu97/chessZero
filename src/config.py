@@ -294,10 +294,14 @@ class MuZeroConfig:
     # Stockfish per-position eval (in [-1,+1] STM POV) into a soft (P_W, P_D,
     # P_L) target via parameterized 3-way logistic. ``alpha`` controls
     # sharpness (4.0 ≈ Stockfish-cp-like steepness); ``beta`` controls draw-
-    # zone width (2.0 ≈ P_D=0.76 at eval=0). Restores per-position teacher
-    # signal density during warmstart that pure-z one-hot targets discarded.
-    eval_to_wdl_alpha: float = 4.0
-    eval_to_wdl_beta: float = 2.0
+    # zone width. Calibrated against the Lichess real-game win-rate logistic given
+    # our normalization eval=tanh(cp/800) (so eval=1 == mate, eval=0.3 == +2.5 pawns):
+    # α=5.6/β=1.7 gives P_D≈0.69 at eval=0, W-L≈0.43 at eval=0.3, and P_W≈0.98 at
+    # eval=1 (mate → near-certain win) — ~4× better calibration than the old 4.0/2.0
+    # which under-confidenced the whole range (capped W-L at 0.88 even for mate).
+    # Restores per-position teacher signal density that pure-z one-hot targets discard.
+    eval_to_wdl_alpha: float = 5.6
+    eval_to_wdl_beta: float = 1.7
 
     # --- Material / score-margin value utility (KataGo c_score analogue) ------
     # Tier-0 root-cause fix for the draw basin (see decisive_signal_plan_2026_06_23.md).
@@ -342,6 +346,15 @@ class MuZeroConfig:
     # false-positive rate (self_play/resign_false_positive_rate) is measurable.
     # AlphaZero played ~20% to completion; tune resign_threshold to keep FP < 5%.
     resign_holdout_frac: float = 0.15
+    # Exempt SEEDED games (start_fen set) from resignation. On seeds resignation
+    # is all cost, no benefit: value labels are already TB-true (all plies in-TB
+    # at tb_value_weight=1.0), truncation is post-hoc (no compute saved), and it
+    # fires precisely in the games where the model is about to practice the
+    # conversion — deleting the finishing sequence seeding exists to generate,
+    # while reducing seed/conversion to a value-calibration proxy (~95% of
+    # "conversions" were resignations). With the exemption, seed/conversion and
+    # seed/mate_rate become honest on-policy skill metrics.
+    resign_exempt_seeded: bool = False
 
     # Stratified sampling: at every training batch, sample
     # floor(batch_size * warmstart_sample_frac) games from warmstart-only
@@ -450,6 +463,30 @@ class MuZeroConfig:
     inverse_dynamics_loss_weight: float = 1.0
     inverse_dynamics_hidden: int = 256
 
+    # Self-attention (smolgen) backbone. Validated on the ≤5-man endgame proxy
+    # (endgame_attention_findings_2026_06_28.md): attention in BOTH the representation
+    # and the dynamics broke the conv tower's flat ~4% MCTS conversion plateau →
+    # rising 4%→41% (KQvK 0.44→0.91) at ~equal param count — a representation win, not
+    # capacity. The encoder REPLACES the conv residual tower in rep/dyn (a conv stem
+    # remains). use_dyn_attention matters because the SimSiam consistency target is a
+    # smolgen-rich repr latent the conv dynamics can't reproduce; matching the bodies
+    # keeps geometry flowing through the MCTS rollout. pred-attention was tested and
+    # did NOT help (off). NOTE: dyn-attention runs ~num_simulations/move in the search
+    # hot path — a self-play throughput cost to weigh (probe before scaling depth).
+    use_repr_attention: bool = False
+    use_dyn_attention: bool = False
+    use_pred_attention: bool = False
+    use_smolgen: bool = True          # only active when an attention body is on
+    attn_layers: int = 4              # encoder depth in rep & dyn (supervised proxy: L6 > L4)
+    attn_heads: int = 4
+    pred_attn_layers: int = 2         # only used if use_pred_attention
+    # HYBRID body (strategy_2026_07_02.md §8): when >0 and an attention body is on,
+    # prepend this many SE-residual conv blocks (local tactical primitives + Lc0-style
+    # global channel gating) before the attention encoder in rep AND dyn. Conv's
+    # data-efficient local prior for the midgame + attention's global mixing for
+    # long-range geometry, at a 2x (not 10x) parameter budget.
+    hybrid_stem_blocks: int = 0
+
     # Moves-left head (Lc0): aux categorical head predicting plies-to-game-end.
     # Breaks value saturation so search prefers faster wins over shuffling. Default
     # OFF (head not built → fully inert). support_size 10 ≈ covers ~120 plies with
@@ -457,6 +494,12 @@ class MuZeroConfig:
     # the other aux heads. The gated MCTS utility is a separate step.
     use_moves_left: bool = False
     moves_left_support_size: int = 10
+    # Whether the moves-left head uses the value-style sqrt scalar_transform before
+    # binning. False = LINEAR (raw plies → support), which keeps 1-ply resolution
+    # across the whole range instead of compressing the long-mate (15-30 ply) region
+    # into ~1.5 bins. The sqrt squash is right for value (resolution near zero) but
+    # wrong for moves-left (we need resolution at large DTM). See measure_ml_accuracy.
+    moves_left_use_transform: bool = True
     moves_left_loss_weight: float = 0.25
     # MLH MCTS utility (Lc0): among same-Q moves, prefer the faster win (and drag out
     # a loss). Added to the selection score as sign(-Q)*clip(slope*M, 0, max_effect),
@@ -466,6 +509,22 @@ class MuZeroConfig:
     ml_threshold: float = 0.3             # |raw_q| above which the utility engages
     ml_slope: float = 0.005               # per-ply effect before clipping
     ml_max_effect: float = 0.1            # clip magnitude (vs value_score in [0,1])
+    # Lc0 MLH utility: bonus uses (child_m − parent_m) PROGRESS, scaled by a smooth
+    # |Q| ramp above ml_threshold (factor = q_const + q_linear·q' + q_square·q'^2,
+    # q'=clamp((|Q|−thr)/(1−thr),0,1)). Lc0 production: thr 0.8, slope 0.0027, cap
+    # 0.0345, (0, 1.6521, −0.6521). Defaults below keep the bonus a tiebreak.
+    ml_q_const: float = 0.0
+    ml_q_linear: float = 1.6521
+    ml_q_square: float = -0.6521
+    # Auxiliary-head INPUT width. The default 1-plane 1×1 projection crushes the
+    # C-channel latent to a single map before the MLP, starving the head of the
+    # distance-to-mate signal that lives across channels (head→DTZ corr 0.035 vs
+    # MLP-on-full-latent 0.80). >1 widens it; blocks>0 adds pre-projection residual
+    # blocks. value head kept at 1 (Lc0 keeps WDL value simple); widen moves-left.
+    value_head_planes: int = 1
+    value_head_blocks: int = 0
+    moves_left_head_planes: int = 1
+    moves_left_head_blocks: int = 0
 
     # --- Root repetition-draw penalty (terminal-aware search, the AlphaZero
     # property MuZero's latent search lacks) ----------------------------------
@@ -479,6 +538,12 @@ class MuZeroConfig:
     # torch path. Off by default. chess / GPU-resident self-play only.
     root_terminal_draws: bool = False
     root_terminal_draws_min_repeats: int = 2   # 2 = avoid any repeat; 3 = only block threefold
+    # Extend the terminal-draw mask beyond repetition to STALEMATE + insufficient
+    # material (GpuChessGame.terminal_draw_move_mask, a bounded one-ply lookahead
+    # gated to <= 6-piece positions). This is the direct fix for the dominant
+    # endgame failure: the winning side walking the lone king into stalemate (79%
+    # of won <=5-man positions per the 2026-06-28 per-config diagnostic).
+    root_terminal_draws_include_stalemate: bool = True
     # Root Syzygy tablebase probing: at each self-play ply, classify the root's
     # legal moves vs tablebases (≤ tb_max_pieces) and overwrite the root children's
     # value_score toward the DTZ-optimal conversion move (tensor_mcts._select).
@@ -498,6 +563,12 @@ class MuZeroConfig:
     # positions ranked by their OWN DTZ (closer mate → closer +1, floored at
     # 1-shape so a win stays clearly above a draw).
     tb_value_dtz_shape: float = 0.5
+    # Lc0-style HARD WDL value target at TB plies. False (default): blend the TB
+    # scalar through eval_to_wdl (soft, caps W-L at ~0.88, never saturates). True:
+    # one-hot win/draw/loss — saturates Q near ±1, crisp win/draw separation, and
+    # activates the |Q|-gated MLH which then carries within-win distance. Pair with
+    # tb_value_dtz_shape=0. Warmstart (per-position Stockfish evals) stays soft.
+    tb_value_hard: bool = False
     # Moves-left (MovesLeftHead) DTM relabel — Lc0 Gaviota MLH rescoring. When > 0,
     # the moves-left target at in-TB decisive plies is replaced by |DTM| (Gaviota
     # plies-to-mate) instead of the policy-rollout plies-to-end (the shuffle length
@@ -523,6 +594,13 @@ class MuZeroConfig:
     tb_policy_anneal_frac: float = 0.0
     tb_policy_win_thresh: float = 0.5
     tb_policy_temp: float = 0.3
+    # Deferred TB relabel: when steering is OFF the value/DTM/policy targets are pure
+    # functions of each ply's board, so they run in ONE batched pass after the game
+    # batch (over the unique in-TB FENs) instead of inline per ply — removing ~56% of
+    # endgame self-play wall from the GPU hot path. >1 fans the probes across a spawn
+    # process pool (each worker opens its own tablebase handles). 0/1 = single-process
+    # deferred pass (still off the hot path, no parallelism). Ignored when steering on.
+    tb_relabel_workers: int = 0
     # Endgame SEEDING (on-policy curriculum, gpu-resident path): a fraction of each
     # self-play round starts from tablebase endgame FENs sampled from the archive, the
     # model plays them out (no random opening; relabeled with value+DTM truth). Constant
@@ -530,6 +608,80 @@ class MuZeroConfig:
     # 0 = off. Cures covariate shift (the model trains on its OWN endgame states).
     endgame_seed_frac: float = 0.0
     endgame_seed_archive: str | None = None   # path to the seed FEN list (generate_endgame_seeds.py)
+    # TB endgame ANCHOR (strategy_2026_07_02.md): inject tb_anchor_games TB-optimal
+    # demonstration games (scripts/gen_tb_anchor_games.py archive) into the rolling
+    # buffer every tb_anchor_interval steps, cycling the archive forever. This is the
+    # validated supervised-proxy signal (KQvK 0.91) as a PERSISTENT anchor — the
+    # direct TB→policy teaching channel self-play lacks. 0/None = off.
+    tb_anchor_path: str | None = None
+    tb_anchor_games: int = 0
+    tb_anchor_interval: int = 0
+    # TB ROLLOUT FILL (win adjudication by demonstration): truncate a NON-seeded
+    # self-play game at its first decisive in-TB ply when the played outcome
+    # contradicts the tablebase verdict, and finish it with TB-optimal play by both
+    # sides. The stored game_outcome becomes the TRUE result for the WHOLE trajectory
+    # (decisive z for the pre-TB middlegame plies — the channel the per-ply value
+    # relabel can't reach) and the appended tail is an on-distribution conversion
+    # demonstration. Seeded games are exempt (they'd be adjudicated at ply 0,
+    # deleting the practice data they exist to generate).
+    tb_rollout_fill: bool = False
+    # MERGED self-play batch (next-run lever #11): run normal + seeded games in ONE
+    # resident sweep (mixed start states, per-game opening masks) instead of
+    # sequential sub-batches — removes the doubled fixed overheads and the second
+    # straggler tail (~15-30% self-play wall-clock). Default off (sub-batch path).
+    merged_seed_batch: bool = False
+    # OPENING DIVERSITY ε-MIXTURE (next-run lever #14). When mean_plies > 0, each
+    # NORMAL game opens with r ~ U[1, 2·mean] plies chosen without search:
+    # with prob opening_uniform_frac a uniform-random legal move (model-INDEPENDENT
+    # diversity floor — cannot collapse as the policy sharpens), else sampled from
+    # the raw policy softmax at opening_policy_temp (KataGo initGamesWithPolicy —
+    # plausible on-distribution branching). Opening plies store ZERO policy targets
+    # (make_target's zero-CE no-op) — unlike legacy random_opening_plies, which
+    # trained the policy toward its own random moves. Seeded games never open.
+    opening_mix_mean_plies: int = 0
+    opening_policy_temp: float = 1.5
+    opening_uniform_frac: float = 0.15
+    # DTM-stratified SEED CURRICULUM (reverse curriculum, Florensa 2017): sample
+    # seeds whose |DTM| <= a cap that ramps seed_curriculum_dtm_easy ->
+    # seed_curriculum_dtm_hard over seed_curriculum_anneal_frac of training.
+    # Short mating chains first (conversion ~ p^N — benign at small N), longer
+    # technique as per-move accuracy arrives. Needs the <archive>.dtm sidecar
+    # (scripts/annotate_seed_dtm.py). Drawn seeds stay eligible throughout.
+    seed_curriculum: bool = False
+    seed_curriculum_dtm_easy: int = 8
+    seed_curriculum_dtm_hard: int = 100
+    seed_curriculum_anneal_frac: float = 0.5
+    # D4 SYMMETRY AUGMENTATION (src/training/symmetry.py): apply a random
+    # dihedral-group element to each sampled pawnless castle-free training
+    # window (obs + actions + policy targets + legal masks under ONE element;
+    # value/DTM/material are invariants). Anti-memorization pressure toward
+    # relative-geometry features — the substrate of general endgame technique
+    # (KataGo trains with Go's 8-fold symmetry the same way). Equivariance
+    # verified against python-chess move generation (tests/test_symmetry.py).
+    symmetry_augment: bool = False
+    # Reward head width (1x1 conv planes). Historically 1 — an afterthought.
+    # 2026-07-05: the dynamics-reward head is the search's in-tree mate
+    # detector and THE conversion-critical component (muted-reward diag:
+    # 0.20 -> 0.048 on identical weights). 8 matches value/moves-left heads.
+    # Kept at 1 in presets so old checkpoints load; set per-run via CLI.
+    reward_head_planes: int = 1
+    # UNIFIED BUFFER (task #19): declarative batch composition. When set,
+    # supersedes warmstart_sample_frac stratification. Piecewise schedule of
+    # (step_fraction, {channel: weight}) with channels warmstart|anchor|selfplay;
+    # weights renormalize over non-empty channels (warmup composition becomes a
+    # CHOSEN ratio, not the emergent one the 2026-07-05 histogram audit found).
+    batch_mixture_schedule: list | None = None
+    # Per-channel cap for injected TB-anchor demonstrations in the main buffer.
+    # None = legacy (anchor competes in the selfplay pool; volume emergent).
+    anchor_max_size: int | None = None
+    # Position sampling within a game: "per_game" (legacy; short games' plies
+    # oversampled) or "per_ply" (every stored ply equally likely).
+    position_sampling: str = "per_game"
+    # Activation checkpointing on the attention bodies during training:
+    # recompute layers in backward instead of storing activations. Exact same
+    # math, ~25-30% slower train steps, memory ~n_layers-fold smaller on the
+    # attention stack. Required for chess_hybrid_xl batch-512 on 32GB.
+    grad_checkpoint_attention: bool = False
     # Overlap the ~141ms single-threaded sample_batch with the GPU train step via
     # a background prefetch thread (double-buffered, lock-guarded against buffer
     # writes). ~halves per-step time during the training phase. Off by default.
@@ -746,6 +898,11 @@ def get_config(game: str) -> MuZeroConfig:
                                         # positions get a small negative push during search,
                                         # encouraging decisive moves over solid draws. Doesn't
                                         # affect training targets.
+            root_terminal_draws=True,   # Terminal-aware search: pin root children whose move leads
+                                        # to a draw to draw_score (mover-POV; winning side avoids,
+                                        # losing side keeps). Covers repetition + (once the GPU mask
+                                        # is extended) stalemate/insufficient. ON 2026-06-28 (was
+                                        # off) per the 79%-stalemate-conversion diagnosis.
             repetition_penalty=0.35,    # Training-TARGET anti-repetition (distinct from draw_score
             repetition_penalty_decay=0.93,  # above, which is tree-only). For games drawn by 3-fold /
                                         # 50-move, rewrites the value target toward loss
@@ -806,6 +963,14 @@ def get_config(game: str) -> MuZeroConfig:
                                              # dynamics (probe: cross-action cos 1.0→0.61). Predicts
                                              # a_k from (h_k, h_{k+1}); forces action-conditioned dynamics.
             inverse_dynamics_loss_weight=1.0,
+            # Smolgen self-attention rep+dyn backbone — the validated endgame-conversion
+            # win (see field defs above). attn_layers=4 is the throughput-friendlier
+            # starting point; the supervised proxy's best was L6 (the natural scale-up
+            # after a clean self-play loop confirms throughput). pred-attention stays off.
+            use_repr_attention=True,
+            use_dyn_attention=True,
+            use_smolgen=True,
+            attn_layers=4,
             value_head_init_std=0.0,    # #4 cold-start gradient-block mitigation; off by default,
                                         # enable via --value-head-init-std 0.01 to A/B.
             stockfish_injection_games=0,       # Cold-start mode (2026-05-07): no Stockfish injection.
@@ -980,5 +1145,51 @@ def get_config(game: str) -> MuZeroConfig:
         max_plies=750,               # 1024 -> 750: match the 384-parallel GPU-memory
                                      #   envelope (384*750=288k < the fitted 512*680 sweep;
                                      #   1024 would exceed the tested size and risk OOM).
+    )
+    # chess_hybrid (2026-07-03, strategy doc §8): the ~2x HYBRID — conv-SE stem +
+    # attention body in rep AND dyn (matched bodies per the EXP-0 lesson), a shared
+    # 1-layer attention prediction body before the heads split, and widened value /
+    # moves-left projections (the 1-plane heads provably under-read the latent).
+    # d128 with 4 heads fixes the head-dim-16 thinness of chess_small's d64 attention.
+    # Rationale: conv's data-efficient local prior for the midgame (the conv-vs-attn
+    # production gap at matched steps) + attention's global mixing for endgame
+    # geometry (the 4%-vs-41% supervised proxy gap), at a size the current data
+    # budget can feed. Aux SSL/inverse-dynamics heads grow with d128 (training-only);
+    # slim them further if VRAM binds.
+    configs["chess_hybrid"] = replace(
+        configs["chess_small"],
+        hidden_planes=128,           # attention d_model; 4 heads x head-dim 32
+        fc_hidden=128,
+        use_repr_attention=True,
+        use_dyn_attention=True,
+        use_smolgen=True,
+        attn_layers=4,
+        attn_heads=4,
+        hybrid_stem_blocks=2,        # conv-SE stem depth in rep & dyn
+        use_pred_attention=True,     # shared pre-head attention body (PredictionNetwork);
+                                     #   feeds policy + value + moves-left (material stays
+                                     #   on the raw latent — it's a world-model regularizer)
+        pred_attn_layers=2,          # ~12 MFLOPs/layer vs ~100 for one dynamics apply:
+                                     #   +~10%/sim per layer — depth 2 is affordable
+        value_head_planes=8,         # 1 -> 8: un-bottleneck the value projection
+        moves_left_head_planes=8,    # 1 -> 8: latent holds DTZ at corr 0.80, the
+                                     #   1-plane head reads it at 0.035
+    )
+    # chess_hybrid_xl (2026-07-06, strategy §16): the 5x SCALE TEST — same shape
+    # as chess_hybrid, 4.9x the inference params (23.97M vs 4.85M). d288 with 8
+    # heads (head-dim 36), 6-layer bodies, 3-layer prediction body, 3-block
+    # conv-SE stems, fc 256. Paired with 2x schedule (30k warmstart / 300k
+    # total). Reward head planes stay 8 (set per-run via CLI). Board-game
+    # scaling prior (Jones 2021): expect left-shifted milestones (sample
+    # efficiency), overfit risk on the unchanged 5120 buffer — watch
+    # SF-agreement as the tripwire.
+    configs["chess_hybrid_xl"] = replace(
+        configs["chess_hybrid"],
+        hidden_planes=288,
+        fc_hidden=256,
+        attn_layers=6,
+        attn_heads=8,
+        hybrid_stem_blocks=3,
+        pred_attn_layers=3,
     )
     return configs.get(game, configs["tictactoe"])

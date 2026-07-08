@@ -28,7 +28,7 @@ def get_game(name: str):
     if name == "connect4":
         from src.games.connect4 import Connect4
         return Connect4()
-    if name in ("chess", "chess_small"):
+    if name in ("chess", "chess_small", "chess_hybrid", "chess_hybrid_xl"):
         from src.games.chess import ChessGame
         return ChessGame()
     if name == "checkers":
@@ -40,7 +40,8 @@ def get_game(name: str):
 def main():
     parser = argparse.ArgumentParser(description="Train MuZero")
     parser.add_argument("--game", type=str, default="tictactoe",
-                        choices=["tictactoe", "connect4", "chess", "chess_small", "checkers"])
+                        choices=["tictactoe", "connect4", "chess", "chess_small",
+                                 "chess_hybrid", "chess_hybrid_xl", "checkers"])
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--log-dir", type=str, default="runs")
@@ -49,6 +50,11 @@ def main():
                         help="Run ID (default: auto-generate YYYY_MM_DD_NNNN). "
                              "Pass an existing ID to continue writing into that run's dirs.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--warmstart-body", type=str, default=None,
+                        help="Warm-start the body (+ shape-matching heads) from a checkpoint whose "
+                             "architecture differs (e.g. after widening the moves-left head). Loads model "
+                             "weights non-strict (changed heads keep fresh init), keeps the buffer and step, "
+                             "fresh optimizer. Mutually exclusive with --resume.")
     parser.add_argument("--sample-k", type=int, default=None,
                         help="Sampled MuZero K. None = deterministic top-K (legacy).")
     parser.add_argument("--use-gumbel", action="store_true",
@@ -220,6 +226,11 @@ def main():
                              "DTZ-shaped Syzygy position value into the VALUE target at TB plies "
                              "(override config.tb_value_weight, preset 0.0=off; 1.0=full replace). "
                              "Keep selfplay-q-ratio≈0. WDL value head only.")
+    parser.add_argument("--tb-value-hard", action="store_true", default=False,
+                        help="Lc0-style HARD WDL value target at TB plies: one-hot win/draw/loss "
+                             "instead of soft eval_to_wdl (which caps W-L ~0.88). Saturates Q near ±1, "
+                             "crisp win/draw separation, activates the |Q|-gated MLH. Pair with "
+                             "--tb-value-dtz-shape 0.0. Warmstart stays soft.")
     parser.add_argument("--tb-value-dtz-shape", type=float, default=None,
                         help="Shaping of the per-position TB value (override config.tb_value_dtz_shape, "
                              "preset 0.5): 0=flat WDL win=+1; >0 ranks wins by own DTZ "
@@ -237,7 +248,92 @@ def main():
                              "per-move distance-to-mate steering. Raise ml_max_effect with it or it clips.")
     parser.add_argument("--ml-max-effect", type=float, default=None,
                         help="Cap on the moves-left MCTS utility magnitude (override config.ml_max_effect, "
-                             "preset 0.1). Raise alongside --ml-slope so the stronger slope isn't clipped.")
+                             "preset 0.1). Lc0 production uses 0.0345 (a small tiebreak).")
+    parser.add_argument("--ml-threshold", type=float, default=None,
+                        help="|Q| above which the moves-left utility engages (override config.ml_threshold, "
+                             "preset 0.3). Lc0 uses 0.8 so the speed bonus only nudges among already-winning "
+                             "moves and never trades away the win.")
+    parser.add_argument("--moves-left-head-planes", type=int, default=None,
+                        help="Moves-left head input projection width (override config.moves_left_head_planes, "
+                             "preset 1). >1 widens the 1×1 bottleneck so the head can extract DTM from the "
+                             "latent (latent has DTZ at corr 0.80 but the 1-plane head reads 0.035).")
+    parser.add_argument("--moves-left-head-blocks", type=int, default=None,
+                        help="Pre-projection residual blocks on the moves-left head (override "
+                             "config.moves_left_head_blocks, preset 0).")
+    parser.add_argument("--value-head-planes", type=int, default=None,
+                        help="Value head input projection width (override config.value_head_planes, preset 1).")
+    parser.add_argument("--grad-checkpoint-attention", action="store_true", default=False,
+                        help="Recompute attention layers in backward (exact math, ~25-30% slower "
+                             "train steps, large activation-memory savings). Needed for "
+                             "chess_hybrid_xl batch-512 on 32GB cards.")
+    parser.add_argument("--batch-mixture-schedule", type=str, default=None,
+                        help='JSON schedule of declarative batch composition (task #19), e.g. '
+                             '\'[[0.0,{"warmstart":0.4,"anchor":0.2,"selfplay":0.4}],'
+                             '[0.6,{"warmstart":0.1,"anchor":0.1,"selfplay":0.8}]]\'. '
+                             "Supersedes warmstart-sample-frac stratification.")
+    parser.add_argument("--anchor-max-size", type=int, default=None,
+                        help="Cap the TB-anchor pool in the main buffer (three-pool eviction). "
+                             "Unset = legacy emergent anchor volume.")
+    parser.add_argument("--position-sampling", choices=["per_game", "per_ply"], default=None,
+                        help="Position sampling within games: per_game (legacy) or per_ply "
+                             "(every stored ply equally likely; removes short-game overweighting).")
+    parser.add_argument("--reward-head-planes", type=int, default=None,
+                        help="Width of the dynamics-reward head's 1x1 projection (config default 1). "
+                             "The reward head is the search's in-tree mate detector; 8 matches the "
+                             "value/moves-left heads. Changes parameter shapes (fresh run or "
+                             "--warmstart-body only).")
+    parser.add_argument("--symmetry-augment", action="store_true", default=False,
+                        help="D4 symmetry augmentation on pawnless castle-free training windows: "
+                             "random dihedral transform per sample (obs+actions+policies+masks), "
+                             "forcing relative-geometry features over absolute-square memorization.")
+    parser.add_argument("--seed-curriculum", action="store_true", default=False,
+                        help="DTM-stratified reverse curriculum for endgame seeds: sample seeds "
+                             "with |DTM| <= a cap ramping dtm_easy->dtm_hard over "
+                             "seed_curriculum_anneal_frac of training (short mating chains first). "
+                             "Needs <archive>.dtm from scripts/annotate_seed_dtm.py.")
+    parser.add_argument("--merged-seed-batch", action="store_true", default=False,
+                        help="Run normal + seeded self-play games in ONE resident sweep "
+                             "(mixed start states, per-game opening masks) instead of "
+                             "sequential sub-batches — one straggler tail, ~15-30% self-play "
+                             "wall-clock saving.")
+    parser.add_argument("--opening-mix-mean-plies", type=int, default=None,
+                        help="Opening diversity ε-mixture: normal games open with r ~ U[1, 2·mean] "
+                             "searchless plies — uniform-random w.p. --opening-uniform-frac "
+                             "(model-independent diversity floor), else raw-policy softmax at "
+                             "--opening-policy-temp (KataGo initGamesWithPolicy). Opening plies "
+                             "store ZERO policy targets. 0/unset = off.")
+    parser.add_argument("--opening-policy-temp", type=float, default=None,
+                        help="Softmax temperature for policy-sampled opening plies (config 1.5).")
+    parser.add_argument("--opening-uniform-frac", type=float, default=None,
+                        help="Fraction of games opening with uniform-random plies (config 0.15).")
+    parser.add_argument("--per-alpha", type=float, default=None,
+                        help="PER priority exponent (override config.per_alpha). 0 = uniform "
+                             "sampling — the MuZero-board-games/KataGo/Lc0-consistent choice; "
+                             "also prevents value-TD priorities from starving anchor games "
+                             "whose easy value targets hide unlearned policy content.")
+    parser.add_argument("--resign-exempt-seeded", action="store_true", default=False,
+                        help="Exempt seeded (start_fen) games from resignation: their value labels "
+                             "are TB-true regardless, and resignation truncates exactly the "
+                             "conversion-practice tails seeding exists to generate. Makes "
+                             "seed/conversion and seed/mate_rate honest skill metrics.")
+    parser.add_argument("--no-attention", action="store_true", default=False,
+                        help="Disable the attention backbone (use the conv residual tower) even "
+                             "when the game preset enables it — for conv-vs-attention A/Bs and "
+                             "resuming conv-era checkpoints.")
+    parser.add_argument("--tb-anchor-path", type=str, default=None,
+                        help="Directory of TB anchor shards (scripts/gen_tb_anchor_games.py): "
+                             "tablebase-optimal demonstration games injected into the rolling "
+                             "buffer on an interval, cycling forever (persistent endgame anchor).")
+    parser.add_argument("--tb-anchor-games", type=int, default=64,
+                        help="TB anchor games injected per interval (default 64).")
+    parser.add_argument("--tb-anchor-interval", type=int, default=256,
+                        help="Training steps between TB anchor injections (default 256).")
+    parser.add_argument("--tb-rollout-fill", action="store_true", default=False,
+                        help="Win adjudication by demonstration: truncate a non-seeded self-play "
+                             "game at its first decisive in-TB ply when the played outcome "
+                             "contradicts the TB verdict, and finish it with TB-optimal play by "
+                             "both sides (true decisive z for the whole trajectory + an "
+                             "on-distribution conversion demonstration). Needs --tb-root-probe.")
     parser.add_argument("--tb-steer-policy", action="store_true", default=False,
                         help="Restore the search-side DTZ value bias (policy steering) in _select. "
                              "OFF by default — Lc0-faithful: inject TB signal via relabels, not search.")
@@ -254,6 +350,11 @@ def main():
                         help="Softmax temperature of the relabeled policy TARGET over win-preserving moves "
                              "(override config.tb_policy_temp, preset 0.3). Lower = sharper (more mass on the "
                              "DTZ-best winning move). NOT the MCTS search temperature.")
+    parser.add_argument("--tb-relabel-workers", type=int, default=None,
+                        help="Deferred TB relabel pool size (override config.tb_relabel_workers, preset 0). "
+                             "When steering is off the value/DTM/policy targets run in one batched post-game "
+                             "pass; >1 fans the probes across this many spawn workers (each opens its own "
+                             "tablebases). 0/1 = single-process deferred pass. Removes the prober from the hot path.")
     parser.add_argument("--endgame-seed-frac", type=float, default=None,
                         help="Fraction of each self-play round seeded from tablebase endgame FENs "
                              "(on-policy curriculum; override config.endgame_seed_frac, preset 0=off).")
@@ -290,11 +391,13 @@ def main():
                              "DECISIVE games in the replay buffer ~M× longer than draws "
                              "(retention-weighted eviction), raising decisive density. "
                              "1.0 = FIFO. At ~5%% decisive inflow: M=7 → ~27%% of buffer decisive.")
-    parser.add_argument("--policy-head-type", choices=["flat", "conv"], default=None,
+    parser.add_argument("--policy-head-type", choices=["flat", "conv", "from_to"], default=None,
                         help="Override config.policy_head_type. 'conv' = AlphaZero spatial "
-                             "73-plane policy head (chess only; removes the flat head's "
-                             "channel bottleneck). Changes the policy-head shape, so a "
-                             "checkpoint trained with the other type won't load its policy head.")
+                             "73-plane policy head (chess only). 'from_to' = relational bilinear "
+                             "from/to-square head (2026-07-08 arch sweep arm C: +48%% proxy MCTS "
+                             "conversion vs conv at matched steps; codec-parity tested). Changes "
+                             "the policy-head shape, so a checkpoint trained with another type "
+                             "won't load its policy head.")
     parser.add_argument("--warmstart-buffer-size", type=int, default=None,
                         help="Override config.warmstart_buffer_size. Enables the "
                              "TWO-POOL buffer: this many slots are reserved for "
@@ -450,6 +553,8 @@ def main():
         config.tb_dtz_weight = args.tb_dtz_weight
     if args.tb_value_weight is not None:
         config.tb_value_weight = args.tb_value_weight
+    if args.tb_value_hard:
+        config.tb_value_hard = True
     if args.tb_value_dtz_shape is not None:
         config.tb_value_dtz_shape = args.tb_value_dtz_shape
     if args.tb_moves_left_weight is not None:
@@ -460,6 +565,52 @@ def main():
         config.ml_slope = args.ml_slope
     if args.ml_max_effect is not None:
         config.ml_max_effect = args.ml_max_effect
+    if args.ml_threshold is not None:
+        config.ml_threshold = args.ml_threshold
+    if args.grad_checkpoint_attention:
+        config.grad_checkpoint_attention = True
+    if args.batch_mixture_schedule is not None:
+        import json
+        sched = json.loads(args.batch_mixture_schedule)
+        config.batch_mixture_schedule = [(float(f), dict(m)) for f, m in sched]
+    if args.anchor_max_size is not None:
+        config.anchor_max_size = args.anchor_max_size
+    if args.position_sampling is not None:
+        config.position_sampling = args.position_sampling
+    if args.reward_head_planes is not None:
+        config.reward_head_planes = args.reward_head_planes
+    if args.moves_left_head_planes is not None:
+        config.moves_left_head_planes = args.moves_left_head_planes
+    if args.moves_left_head_blocks is not None:
+        config.moves_left_head_blocks = args.moves_left_head_blocks
+    if args.value_head_planes is not None:
+        config.value_head_planes = args.value_head_planes
+    if args.symmetry_augment:
+        config.symmetry_augment = True
+    if args.seed_curriculum:
+        config.seed_curriculum = True
+    if args.merged_seed_batch:
+        config.merged_seed_batch = True
+    if args.opening_mix_mean_plies is not None:
+        config.opening_mix_mean_plies = args.opening_mix_mean_plies
+    if args.opening_policy_temp is not None:
+        config.opening_policy_temp = args.opening_policy_temp
+    if args.opening_uniform_frac is not None:
+        config.opening_uniform_frac = args.opening_uniform_frac
+    if args.per_alpha is not None:
+        config.per_alpha = args.per_alpha
+    if args.resign_exempt_seeded:
+        config.resign_exempt_seeded = True
+    if args.no_attention:
+        config.use_repr_attention = False
+        config.use_dyn_attention = False
+        config.use_pred_attention = False
+    if args.tb_anchor_path is not None:
+        config.tb_anchor_path = args.tb_anchor_path
+        config.tb_anchor_games = args.tb_anchor_games
+        config.tb_anchor_interval = args.tb_anchor_interval
+    if args.tb_rollout_fill:
+        config.tb_rollout_fill = True
     if args.tb_steer_policy:
         config.tb_steer_policy = True
     if args.tb_policy_weight is not None:
@@ -470,6 +621,8 @@ def main():
         config.tb_policy_anneal_frac = args.tb_policy_anneal_frac
     if args.tb_policy_temp is not None:
         config.tb_policy_temp = args.tb_policy_temp
+    if args.tb_relabel_workers is not None:
+        config.tb_relabel_workers = args.tb_relabel_workers
     if args.endgame_seed_frac is not None:
         config.endgame_seed_frac = args.endgame_seed_frac
     if args.endgame_seed_archive is not None:
@@ -532,13 +685,18 @@ def main():
 
     game = get_game(args.game)
 
+    # Run dirs are keyed by config.game (the ENGINE name, e.g. "chess"), not the
+    # preset name passed as --game (e.g. "chess_hybrid") — the trainer's writer
+    # and checkpointer use config.game, so the banner must too or it prints
+    # paths that don't exist (chess_hybrid/... vs the real chess/...).
+    game_dir = config.game
     run_id = args.run_id or generate_run_id(
-        Path(args.checkpoints_dir) / args.game,
-        Path(args.log_dir) / args.game,
+        Path(args.checkpoints_dir) / game_dir,
+        Path(args.log_dir) / game_dir,
     )
     print(f"Run ID: {run_id}")
-    print(f"  Checkpoints: {Path(args.checkpoints_dir) / args.game / run_id}")
-    print(f"  TensorBoard: {Path(args.log_dir) / args.game / run_id}")
+    print(f"  Checkpoints: {Path(args.checkpoints_dir) / game_dir / run_id}")
+    print(f"  TensorBoard: {Path(args.log_dir) / game_dir / run_id}")
 
     network = MuZeroNetwork(
         observation_channels=game.num_planes * getattr(config, "history_frames", 1),
@@ -552,6 +710,7 @@ def main():
         fc_hidden=config.fc_hidden,
         value_support_size=config.value_support_size,
         reward_support_size=config.reward_support_size,
+        reward_head_planes=getattr(config, "reward_head_planes", 1),
         action_embed_dim=getattr(config, "action_embed_dim", 16),
         use_consistency_loss=config.use_consistency_loss,
         proj_hid=config.proj_hid,
@@ -570,7 +729,27 @@ def main():
         moves_left_support_size=getattr(config, "moves_left_support_size", 10),
         use_material_head=getattr(config, "use_material_head", False),
         material_head_support_size=getattr(config, "material_head_support_size", 8),
+        value_head_planes=getattr(config, "value_head_planes", 1),
+        value_head_blocks=getattr(config, "value_head_blocks", 0),
+        moves_left_head_planes=getattr(config, "moves_left_head_planes", 1),
+        moves_left_head_blocks=getattr(config, "moves_left_head_blocks", 0),
+        use_repr_attention=getattr(config, "use_repr_attention", False),
+        use_dyn_attention=getattr(config, "use_dyn_attention", False),
+        use_pred_attention=getattr(config, "use_pred_attention", False),
+        use_smolgen=getattr(config, "use_smolgen", True),
+        attn_layers=getattr(config, "attn_layers", 4),
+        attn_heads=getattr(config, "attn_heads", 4),
+        pred_attn_layers=getattr(config, "pred_attn_layers", 2),
+        hybrid_stem_blocks=getattr(config, "hybrid_stem_blocks", 0),
     )
+    if getattr(config, "grad_checkpoint_attention", False):
+        from src.model.attention import BoardAttentionEncoder
+        n_ck = 0
+        for m in network.modules():
+            if isinstance(m, BoardAttentionEncoder):
+                m.grad_checkpoint = True
+                n_ck += 1
+        print(f"Activation checkpointing ON for {n_ck} attention encoder(s)")
 
     trainer = MuZeroTrainer(
         config, game, network, run_id,
@@ -579,6 +758,8 @@ def main():
         checkpoints_dir=args.checkpoints_dir,
     )
 
+    if args.warmstart_body:
+        trainer.load_body_warmstart(args.warmstart_body)
     if args.resume:
         trainer.load_checkpoint(args.resume)
         if args.reset_injection_cursor:

@@ -14,7 +14,7 @@ import chess
 import chess.syzygy
 import chess.gaviota
 
-from src.games.chess import _action_to_move
+from src.games.chess import _action_to_move, _move_to_action
 from src.games.chess_gpu import CR_WK, CR_WQ, CR_BK, CR_BQ
 
 ACTION_SPACE = 4672
@@ -216,6 +216,86 @@ class SyzygyRootProber:
         self.last_position_policy = pol
         return out.to(dev)
 
+    @torch.no_grad()
+    def in_tb_mask(self, state) -> torch.Tensor:
+        """[N] bool — games whose piece count is within tablebase range. This is the
+        cheap GPU popcount gate from ``root_move_values``, factored out so the
+        self-play loop can decide which plies to stash for a *deferred* relabel pass
+        (the expensive Syzygy/Gaviota probes) without running them inline."""
+        dev = state.device
+        occ = torch.zeros(state.n, dtype=torch.int64, device=dev)
+        for p in range(12):
+            occ = occ | state.pieces[:, p]
+        bits = torch.zeros(state.n, dtype=torch.int64, device=dev)
+        for b in range(64):
+            bits = bits + ((occ >> b) & 1)
+        return bits <= self.max_pieces
+
+    def _classify_board(self, board: chess.Board) -> dict[int, float]:
+        """Board-only variant of ``_classify`` — enumerates ``board.legal_moves`` and
+        maps each to its action index (``_move_to_action``) instead of scanning a
+        precomputed legal-mask row. Used by the deferred (post-game) relabel path,
+        which carries only the FEN, not the per-ply legal mask. Produces the identical
+        {action: mover_value} mapping the inline ``_classify`` does for the same board."""
+        vals: dict[int, float] = {}
+        winners: list[tuple[int, int]] = []  # (action, zeroing-aware DTZ rank)
+        for move in board.legal_moves:
+            action = _move_to_action(move, board.turn)
+            zeroing = board.is_zeroing(move)
+            board.push(move)
+            try:
+                if board.is_checkmate():
+                    vals[action] = 1.0
+                elif board.is_stalemate() or board.is_insufficient_material():
+                    vals[action] = self.draw_score
+                else:
+                    mv = _wdl_to_mover_value(self.tb.probe_wdl(board))
+                    if mv > 0.0:
+                        # Zeroing-aware rank: a win-keeping ZEROING move completes
+                        # the DTZ phase NOW (rank 0); a non-zeroing move completes
+                        # it in child-DTZ more plies. Plain |child_dtz| ranks the
+                        # repetition shuffle ABOVE the pawn push at cur_dtz==1
+                        # (the min-DTZ trap) — the policy target must not teach it.
+                        d = 0 if zeroing else abs(int(self.tb.probe_dtz(board)))
+                        winners.append((action, d))
+                    else:
+                        vals[action] = mv if mv < 0.0 else self.draw_score
+            except (KeyError, ValueError, chess.syzygy.MissingTableError):
+                pass
+            finally:
+                board.pop()
+        if winners:
+            dz = [d for _, d in winners]
+            dmin, dmax = min(dz), max(dz)
+            span = max(1, dmax - dmin)
+            for action, d in winners:
+                vals[action] = 1.0 - self.dtz_weight * (d - dmin) / span
+        return vals
+
+    def relabel_position(self, board: chess.Board, want_policy: bool = True):
+        """FEN-pure relabel of a single board → (posval, posml, policy). This is the
+        per-POSITION work of ``root_move_values`` (the value + DTM + soft-policy
+        targets) with the live GPU state and legal mask removed, so it can run in a
+        post-game batched pass (and across a process pool). ``want_policy=False`` skips
+        the ~30-probe per-move classify (the dominant cost), matching the inline
+        ``per_move`` gate. Caches mirror the inline path (FEN-keyed)."""
+        key = board.fen()
+        pv = self._posval_cache.get(key)
+        if pv is None:
+            pv = self._position_value(board)
+            self._posval_cache[key] = pv
+        ml = self._dtm_cache.get(key)
+        if ml is None:
+            ml = self._position_moves_left(board)
+            self._dtm_cache[key] = ml
+        pol = None
+        if want_policy:
+            pol = self._polcache.get(key)
+            if pol is None and key not in self._polcache:
+                pol = self._classify_to_policy(self._classify_board(board))
+                self._polcache[key] = pol
+        return pv, ml, pol
+
     def _classify_to_policy(self, cached: dict[int, float]):
         """Soft policy target from the per-move TB values: mass on win-PRESERVING moves
         (value > policy_win_thresh), softmax-weighted by DTZ rank (policy_temp), and ~0
@@ -257,11 +337,12 @@ class SyzygyRootProber:
         """{action_index: mover_value} for the legal moves at ``board``,
         DTZ-ranked among winning moves (shortest → +1)."""
         vals: dict[int, float] = {}
-        winners: list[tuple[int, int]] = []  # (action, |child_dtz|)
+        winners: list[tuple[int, int]] = []  # (action, zeroing-aware DTZ rank)
         for action in torch.nonzero(legal_row, as_tuple=False).flatten().tolist():
             move = _action_to_move(action, board)
             if move is None or move not in board.legal_moves:
                 continue
+            zeroing = board.is_zeroing(move)
             board.push(move)
             try:
                 if board.is_checkmate():
@@ -271,7 +352,9 @@ class SyzygyRootProber:
                 else:
                     mv = _wdl_to_mover_value(self.tb.probe_wdl(board))
                     if mv > 0.0:
-                        winners.append((action, abs(int(self.tb.probe_dtz(board)))))
+                        # Zeroing-aware rank — see _classify_board (kept identical).
+                        d = 0 if zeroing else abs(int(self.tb.probe_dtz(board)))
+                        winners.append((action, d))
                     else:
                         vals[action] = mv if mv < 0.0 else self.draw_score
             except (KeyError, ValueError, chess.syzygy.MissingTableError):
@@ -286,3 +369,106 @@ class SyzygyRootProber:
             for action, d in winners:
                 vals[action] = 1.0 - self.dtz_weight * (d - dmin) / span
         return vals
+
+
+# ---------------------------------------------------------------------------
+# Deferred, pooled relabel (post-game). The per-ply inline prober serializes
+# with the GPU MCTS (GPU idle during ~30 Syzygy probes/position) and is ~56% of
+# endgame self-play wall. Since the relabel targets never feed the search when
+# steering is off (tb_steer_policy=False), they are a pure function of each ply's
+# board → defer them to one batched pass over the UNIQUE in-TB FENs, parallelized
+# across a process pool. Identical targets; only placement/timing changes.
+#
+# CUDA-safety: the parent has CUDA initialized (GPU self-play), so the pool MUST
+# use the 'spawn' start method — forked workers inheriting a CUDA context can
+# deadlock. Spawn workers are pure-CPU: each opens its own tablebase handles once
+# (initializer) and probes FENs. The pool is cached module-level and reused across
+# self-play batches (spawn startup is ~1-2s; amortize it).
+
+_WORKER_PROBER = None          # per-process SyzygyRootProber (pool workers)
+_RELABEL_POOL = None           # cached (key, pool)
+_LOCAL_PROBER = None           # cached (key, prober) for the single-process path
+
+
+def _relabel_pool_init(params: dict):
+    """Pool-worker initializer: build a process-local prober (opens its own
+    tablebase handles). Runs once per spawned worker."""
+    global _WORKER_PROBER
+    _WORKER_PROBER = SyzygyRootProber(**params)
+
+
+def _relabel_pool_task(arg):
+    """Pool task: (fen, want_policy) → (fen, posval, posml, policy)."""
+    fen, want_policy = arg
+    pv, ml, pol = _WORKER_PROBER.relabel_position(chess.Board(fen), want_policy=want_policy)
+    return fen, pv, ml, pol
+
+
+def _prober_params(prober: "SyzygyRootProber", path: str, gaviota_path):
+    """Reconstruct the __init__ kwargs needed to rebuild ``prober`` in a worker."""
+    return dict(
+        path=path,
+        max_pieces=prober.max_pieces,
+        dtz_weight=prober.dtz_weight,
+        draw_score=prober.draw_score,
+        value_dtz_shape=prober.value_dtz_shape,
+        gaviota_path=gaviota_path,
+        policy_win_thresh=prober.policy_win_thresh,
+        policy_temp=prober.policy_temp,
+    )
+
+
+def get_relabel_pool(params: dict, workers: int):
+    """Lazily create (and cache) a spawn-based process pool keyed by ``params`` +
+    ``workers``. Reused across self-play batches. Returns None if pooling is
+    disabled or unavailable (caller falls back to single-process)."""
+    global _RELABEL_POOL
+    if workers is None or workers <= 1:
+        return None
+    key = (tuple(sorted((k, str(v)) for k, v in params.items())), int(workers))
+    if _RELABEL_POOL is not None and _RELABEL_POOL[0] == key:
+        return _RELABEL_POOL[1]
+    if _RELABEL_POOL is not None:
+        try:
+            _RELABEL_POOL[1].terminate()
+        except Exception:
+            pass
+        _RELABEL_POOL = None
+    try:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        pool = ctx.Pool(processes=int(workers),
+                        initializer=_relabel_pool_init, initargs=(params,))
+        _RELABEL_POOL = (key, pool)
+        return pool
+    except Exception:
+        _RELABEL_POOL = None
+        return None
+
+
+def _get_local_prober(params: dict):
+    """Cached single-process prober for the no-pool fallback path."""
+    global _LOCAL_PROBER
+    key = tuple(sorted((k, str(v)) for k, v in params.items()))
+    if _LOCAL_PROBER is None or _LOCAL_PROBER[0] != key:
+        _LOCAL_PROBER = (key, SyzygyRootProber(**params))
+    return _LOCAL_PROBER[1]
+
+
+def relabel_fens(fens, params: dict, workers: int, want_policy: bool = True):
+    """Relabel a flat iterable of FENs (None entries ignored). Dedups, probes each
+    UNIQUE FEN exactly once (pooled when workers>1, else single-process), and returns
+    {fen: (posval, posml, policy)}. ``policy`` is (idx[], w[]) or None."""
+    uniq = list({f for f in fens if f is not None})
+    if not uniq:
+        return {}
+    pool = get_relabel_pool(params, workers)
+    if pool is not None:
+        args = [(f, want_policy) for f in uniq]
+        chunk = max(1, len(uniq) // (int(workers) * 4) or 1)
+        out = {}
+        for fen, pv, ml, pol in pool.imap_unordered(_relabel_pool_task, args, chunksize=chunk):
+            out[fen] = (pv, ml, pol)
+        return out
+    pr = _get_local_prober(params)
+    return {f: pr.relabel_position(chess.Board(f), want_policy=want_policy) for f in uniq}

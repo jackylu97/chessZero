@@ -1,6 +1,7 @@
 """Self-play game generation for MuZero."""
 
 import random
+import time
 
 import numpy as np
 import torch
@@ -89,7 +90,17 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
     # (value head said "lost" but the side did NOT actually lose) is measurable.
     holdout_frac = min(max(float(getattr(config, "resign_holdout_frac", 0.0)), 0.0), 1.0)
 
+    exempt_seeded = bool(getattr(config, "resign_exempt_seeded", False))
     for h in histories:
+        if getattr(h, "tb_filled", False):
+            # TB-rollout-filled games already carry the true (tablebase) decisive
+            # outcome and end in an actual mate demonstration — never re-truncate.
+            continue
+        if exempt_seeded and h.start_fen is not None:
+            # Seeded games: value labels are TB-true regardless (all plies in-TB),
+            # and resignation would truncate exactly the conversion-practice tails
+            # seeding exists to generate. See config.resign_exempt_seeded.
+            continue
         rv = h.root_values
         n_ply = min(len(h.actions), len(rv))
         cnt = [0, 0]                 # consecutive own-move counters: [even, odd]
@@ -106,7 +117,17 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
         if resign_ply is None or resign_ply < 1:
             continue
         p = resign_ply
-        white_resigns = (p & 1) == 0
+        # Which COLOR is to move at ply p? Normal games start white-to-move (ply 0 =
+        # white), but endgame-seeded games can start from a BLACK-to-move FEN — so derive
+        # the start side from start_fen rather than assuming ply 0 == white. Without this,
+        # black-start seeded games get their resignation OUTCOME LABEL inverted (game_outcome
+        # feeds the value target) and their correct resignations miscounted as false
+        # positives. FEN field [1] is 'w'/'b'. The cnt[] parity counters above are
+        # color-agnostic (each side owns one ply parity), so only the color attribution here
+        # needs the start side.
+        sf = getattr(h, "start_fen", None)
+        start_white = (sf.split()[1] == "w") if sf else True
+        white_resigns = (start_white == (p % 2 == 0))
         # Calibration holdout: leave this game un-resigned (natural outcome) and
         # record whether resignation WOULD have been a false positive — i.e. the
         # would-have-resigned side did NOT actually lose. resign_false_positive
@@ -131,6 +152,99 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
         h.legal_actions_list = h.legal_actions_list[:p]
         h.observations = h.observations[:p + 1]
     return histories
+
+
+def _apply_tb_rollout_fill(histories: list[GameHistory], prober_params: dict) -> int:
+    """Win adjudication by demonstration (tb_rollout_fill, strategy_2026_07_02.md).
+
+    For each NON-seeded game whose deferred-relabel ``tablebase_values`` reveal a
+    decisive in-TB ply whose verdict CONTRADICTS the played outcome (the classic
+    won-but-shuffled-to-a-draw game): truncate the history at the first such ply
+    and finish the game with TB-optimal play by BOTH sides (``tb_playout``).
+
+    Two effects the per-ply value relabel cannot deliver:
+    (1) ``game_outcome`` becomes the TRUE result for the ENTIRE trajectory — the
+        pre-TB middlegame plies get a decisive z instead of the V^π draw poison.
+    (2) The appended tail is an on-distribution conversion demonstration
+        (soft win-preserving DTZ policy targets at states the model itself
+        reached) — no search-side steering, no covariate shift.
+
+    Seeded games are exempt: they START in a decisive TB position, so filling
+    would replace the model's own practice data at ply 0 (the anchor archive
+    already supplies pure demonstrations). Mutates histories in place; returns
+    the number of games filled.
+    """
+    from ..games.chess import ChessGame
+    from ..games.syzygy_probe import _get_local_prober
+    from .tb_playout import tb_playout, TBPlayoutError
+
+    prober = _get_local_prober(prober_params)
+    game = ChessGame()
+    nan = float("nan")
+    n_filled = 0
+    for h in histories:
+        if h.start_fen is not None or not h.tablebase_values:
+            continue
+        # First decisive in-TB ply. Win magnitudes are >= 1 - value_dtz_shape
+        # (>= 0.5 at the production shape 0.5); draws are exactly 0.
+        fill_idx = None
+        for i, tv in enumerate(h.tablebase_values):
+            if tv == tv and abs(tv) >= 0.45:
+                fill_idx = i
+                break
+        if fill_idx is None or fill_idx >= len(h.actions):
+            continue
+        # TB verdict in white POV (non-seeded games start white-to-move, so ply
+        # parity gives the side to move). Skip when the played outcome already
+        # matches — the model's own conversion is on-policy gold.
+        stm_white = (fill_idx % 2 == 0)
+        verdict = 1.0 if ((h.tablebase_values[fill_idx] > 0) == stm_white) else -1.0
+        if float(h.game_outcome) == verdict:
+            continue
+        # Reconstruct the board at fill_idx by replaying the stored actions
+        # (same replay path buffer serialization uses — proven action encoding).
+        state = game.reset()
+        for a in h.actions[:fill_idx]:
+            state, _, _ = game.step(state, a)
+        try:
+            res = tb_playout(state.board.copy(), prober)
+        except TBPlayoutError:
+            continue  # missing table / 50-move risk — leave the game untouched
+        # Truncate every per-ply list at fill_idx (obs keeps the fill-start
+        # position at index fill_idx: len(obs) == len(actions) + 1 invariant).
+        L_old = len(h.actions)
+        h.actions = h.actions[:fill_idx]
+        h.policies = h.policies[:fill_idx]
+        h.root_values = h.root_values[:fill_idx]
+        h.rewards = h.rewards[:fill_idx]
+        h.legal_actions_list = h.legal_actions_list[:fill_idx]
+        h.observations = h.observations[:fill_idx + 1]
+        tbv = h.tablebase_values[:fill_idx]
+        tbm = (h.tablebase_moves_left[:fill_idx] if h.tablebase_moves_left
+               else [nan] * fill_idx)
+        tbm += [nan] * (fill_idx - len(tbm))
+        tbp = (h.tablebase_policy[:fill_idx] if h.tablebase_policy
+               else [None] * fill_idx)
+        tbp += [None] * (fill_idx - len(tbp))
+        # Append the demonstration tail, stepping ChessGame for obs + legals.
+        for k, a in enumerate(res["actions"]):
+            h.legal_actions_list.append(game.legal_actions(state))
+            h.actions.append(a)
+            h.policies.append(res["policies"][k])
+            h.root_values.append(res["root_values"][k])
+            h.rewards.append(res["rewards"][k])
+            state, _, _ = game.step(state, a)
+            h.observations.append(game.to_tensor(state))
+        h.tablebase_values = tbv + res["tablebase_values"]
+        h.tablebase_moves_left = tbm + res["tablebase_moves_left"]
+        h.tablebase_policy = tbp + res["tablebase_policy"]
+        h.game_outcome = verdict
+        h.draw_by_repetition = False
+        h.draw_by_no_progress = False
+        h.tb_filled = True
+        h.tb_authored = True   # fill-tail policies are TB demos — shield from reanalyze
+        n_filled += 1
+    return n_filled
 
 
 def get_material_value_weight(training_step: int, config) -> float:
@@ -171,6 +285,28 @@ def get_warmstart_sample_frac(training_step: int, config) -> float:
     total = max(1, int(getattr(config, "training_steps", 1)))
     t = min(1.0, max(0.0, training_step / (frac * total)))
     return f_init + (f_final - f_init) * t
+
+
+def get_batch_mixture(training_step: int, config) -> dict | None:
+    """Declarative batch composition for the current step (task #19).
+
+    ``batch_mixture_schedule`` is a list of ``(step_fraction, {channel: weight})``
+    pairs, piecewise-constant like temperature_schedule: the entry with the
+    largest step_fraction <= progress applies. None (default) = legacy
+    warmstart_sample_frac stratification. Channels: warmstart | anchor |
+    selfplay; weights renormalize over non-empty channels at sample time, so
+    during warmup (selfplay empty) the composition stays a chosen ratio.
+    """
+    sched = getattr(config, "batch_mixture_schedule", None)
+    if not sched:
+        return None
+    total = max(1, int(getattr(config, "training_steps", 1)))
+    progress = training_step / total
+    mixture = None
+    for frac, mix in sorted(sched, key=lambda e: e[0]):
+        if progress >= frac:
+            mixture = mix
+    return dict(mixture) if mixture else None
 
 
 def get_tb_policy_weight(training_step: int, config) -> float:
@@ -554,10 +690,11 @@ def play_games_parallel_gpu_resident(
         raise ValueError(
             "play_games_parallel_gpu_resident requires use_tensor_mcts=True."
         )
-    if getattr(config, "use_gumbel", False):
-        raise NotImplementedError(
-            "Gumbel root not supported in the GPU-resident path."
-        )
+    # Gumbel root IS supported in the GPU-resident path since 2026-07-04
+    # (TensorMCTS._initialize_root_gumbel + Sequential Halving root override;
+    # oracle-parity-tested vs the numpy BatchedMCTS in test_gumbel_tensor_mcts).
+    # run_batch_gpu returns gumbel_action/gumbel_policy, consumed below in
+    # place of select_action_gpu + the temperature schedule.
 
     network.eval()
     chess_game = ChessGame()
@@ -573,9 +710,16 @@ def play_games_parallel_gpu_resident(
     hidden_dtype = dtype_map[dtype_str]
     amp_str = getattr(config, "tensor_mcts_amp_dtype", None)
     amp_dtype = dtype_map[amp_str] if amp_str else None
+    select_backend = getattr(config, "tensor_mcts_select_backend", "compile")
+    if getattr(config, "use_gumbel", False) and select_backend == "triton":
+        # The Triton PUCT-walk kernel has no Sequential-Halving root-override
+        # path; fall back to the compiled selector (same math, ~10-20% slower
+        # select step — small vs the per-sim network forward).
+        tqdm.write("  gumbel: select_backend triton -> compile (root override unsupported in kernel)")
+        select_backend = "compile"
     mcts = TensorMCTS(
         network, chess_game, config, device=device, hidden_dtype=hidden_dtype,
-        select_backend=getattr(config, "tensor_mcts_select_backend", "compile"),
+        select_backend=select_backend,
         use_subtree_reuse=getattr(config, "tensor_mcts_subtree_reuse", False),
         amp_dtype=amp_dtype,
     )
@@ -583,9 +727,41 @@ def play_games_parallel_gpu_resident(
     action_space_size = chess_game.action_space_size
     n_frames = int(getattr(config, "history_frames", 1))
     seeded = start_fens is not None
-    # Seeded endgame games start mid-game; a random opening would wreck the
-    # position, so disable it for them.
-    n_random = 0 if seeded else int(getattr(config, "random_opening_plies", 0))
+    # Per-game opening plan. Seeded games (a start FEN) never open randomly — a
+    # random opening would wreck the position. start_fens may contain None
+    # entries (merged_seed_batch: normal + seeded games in ONE sweep). For
+    # NORMAL games, two opening modes:
+    #  - legacy (default): random_opening_plies uniform-random plies, ONE-HOT
+    #    policy targets (unchanged behavior);
+    #  - ε-mixture (opening_mix_mean_plies > 0): per-game r ~ U[1, 2·mean]
+    #    plies, uniform-random w.p. opening_uniform_frac (model-independent
+    #    diversity floor) else raw-policy softmax at opening_policy_temp
+    #    (KataGo initGamesWithPolicy). Opening plies store ZERO policy targets
+    #    (make_target's zero-CE no-op — no gradient toward opening moves).
+    fen_list = list(start_fens) if start_fens is not None else [None] * num_games
+    assert len(fen_list) == num_games, "start_fens must have length num_games"
+    is_seed_l = [f is not None for f in fen_list]
+    mix_mean = int(getattr(config, "opening_mix_mean_plies", 0))
+    mix_on = mix_mean > 0
+    n_random_scalar = int(getattr(config, "random_opening_plies", 0))
+    open_uniform_frac = float(getattr(config, "opening_uniform_frac", 0.15))
+    open_policy_temp = max(float(getattr(config, "opening_policy_temp", 1.5)), 1e-3)
+    open_len_l, open_uniform_l = [], []
+    for sd in is_seed_l:
+        if sd:
+            open_len_l.append(0); open_uniform_l.append(False)
+        elif mix_on:
+            open_len_l.append(random.randint(1, 2 * mix_mean))
+            open_uniform_l.append(random.random() < open_uniform_frac)
+        else:
+            open_len_l.append(n_random_scalar); open_uniform_l.append(True)
+    open_len_t = torch.tensor(open_len_l, dtype=torch.int32, device=device)
+    open_uniform_t = torch.tensor(open_uniform_l, dtype=torch.bool, device=device)
+    max_open = max(open_len_l) if open_len_l else 0
+    min_open = min(open_len_l) if open_len_l else 0
+    # Downstream batch-wide gates (subtree reuse, inline-prober skip) key on the
+    # LAST possible opening ply; keep the legacy name.
+    n_random = max_open
     temp_init = get_temperature(training_step, config)
     temp_final = float(config.temperature_final)
     temp_drop = int(config.temperature_drop_step)
@@ -594,6 +770,7 @@ def play_games_parallel_gpu_resident(
     # to draw_score in the search (TensorMCTS root-terminal-draws). Off by default.
     use_terminal_draws = bool(getattr(config, "root_terminal_draws", False))
     term_min_repeats = int(getattr(config, "root_terminal_draws_min_repeats", 2))
+    term_include_stalemate = bool(getattr(config, "root_terminal_draws_include_stalemate", True))
 
     # Root Syzygy probing: at each ply, classify the root's legal moves against
     # tablebases (≤ tb_max_pieces) and overwrite the root children's value_score
@@ -601,7 +778,10 @@ def play_games_parallel_gpu_resident(
     use_tb_root = bool(getattr(config, "tb_root_probe", False))
     tb_prober = None
     if use_tb_root:
-        from ..games.syzygy_probe import SyzygyRootProber
+        from ..games.syzygy_probe import (
+            SyzygyRootProber, state_to_board as _state_to_board,
+            relabel_fens as _relabel_fens, _prober_params,
+        )
         tb_prober = SyzygyRootProber(
             getattr(config, "tb_path", "data/syzygy"),
             max_pieces=int(getattr(config, "tb_max_pieces", 5)),
@@ -615,16 +795,31 @@ def play_games_parallel_gpu_resident(
     # Build the soft TB policy target when the policy relabel is on (needs per-move
     # _classify). Independent of search-side steering (tb_steer_policy).
     tb_policy_relabel = bool(float(getattr(config, "tb_policy_weight", 0.0)) > 0.0)
+    # Search-side steering: when ON, the prober's per-move values BIAS the search, so
+    # it MUST run inline (the original path). When OFF (Lc0-faithful default) the
+    # prober only produces TRAINING targets (value/DTM/policy) — pure functions of each
+    # ply's board — so we DEFER them to one batched, process-pooled pass after the game
+    # batch concludes (removes ~56% of endgame self-play wall from the GPU hot path).
+    steer_enabled = bool(getattr(config, "tb_steer_policy", False))
+    need_per_move = steer_enabled or tb_policy_relabel
+    defer_relabel = (tb_prober is not None) and (not steer_enabled)
+    relabel_workers = int(getattr(config, "tb_relabel_workers", 0))
+    # FENs of the pre-step root board at each ply (deferred path only); None where the
+    # game is out of TB range / in the random opening. [T] list of [N] str-or-None.
+    tb_fen_per_ply: list = []
 
     # Cap loop length so we always have a static upper bound; ChessGame.max_plies
     # does the in-engine termination, alive_mask handles per-game stopping.
     max_plies_cap = int(getattr(config, "max_plies", getattr(ChessGame, "max_plies", 400)))
 
-    if seeded:
+    if any(is_seed_l):
+        # Any seeded game present: build the batch from explicit boards. None
+        # entries (merged_seed_batch normal games) get the standard start —
+        # identical state to reset_batch, just via the python-chess bridge.
         import chess as _chess
-        assert len(start_fens) == num_games, "start_fens must have length num_games"
         state = gpu_game.from_python_chess(
-            [_chess.Board(f) for f in start_fens], device=device)
+            [_chess.Board(f) if f is not None else _chess.Board() for f in fen_list],
+            device=device)
     else:
         state = gpu_game.reset_batch(num_games, device=device)
 
@@ -692,62 +887,110 @@ def play_games_parallel_gpu_resident(
         # Stack along channel dim → [N, n_frames * C, H, W] (matches stack_with_history).
         stacked_obs = obs_window.reshape(num_games, n_frames * c, h, w)
 
-        # 3. MCTS — but skip for the random-opening plies (all alive games
-        # have move_count == ply during the opening because move_count
-        # increments by alive_mask each ply and starts at 0). For ply >=
-        # n_random, every alive game is out of opening.
-        if ply < n_random:
-            # Pure-random opening: uniform sample from legal_mask, no MCTS.
+        # Per-ply stash of in-TB root FENs for the deferred relabel (None unless the
+        # deferred branch fills it). Appended once per ply below to keep T-alignment.
+        tb_fen_row = None
+
+        # Opening-move computation, shared by the two call sites below.
+        # Uniform mode: multinomial over legal moves. Policy mode (ε-mixture):
+        # one raw initial_inference (no search), softmax at opening_policy_temp.
+        # Targets: ZERO policy rows under the mixture (make_target zero-CE
+        # no-op); legacy mode keeps the historical one-hot.
+        def _opening_actions():
             uniform_logits = legal_mask.to(torch.float32)
-            action = torch.multinomial(uniform_logits, 1).squeeze(1).long()
-            policy = torch.zeros(
-                num_games, action_space_size, device=device, dtype=torch.float32
-            )
-            policy.scatter_(1, action.unsqueeze(1), 1.0)
+            u_act = torch.multinomial(uniform_logits, 1).squeeze(1).long()
+            if mix_on and bool((~open_uniform_t).any()):
+                with torch.no_grad():
+                    _, pol_logits, _ = network.initial_inference(stacked_obs)
+                masked = pol_logits.masked_fill(~legal_mask, float("-inf"))
+                probs = torch.softmax(masked / open_policy_temp, dim=-1)
+                p_act = torch.multinomial(probs, 1).squeeze(1).long()
+                o_act = torch.where(open_uniform_t, u_act, p_act)
+            else:
+                o_act = u_act
+            o_pol = torch.zeros(
+                num_games, action_space_size, device=device, dtype=torch.float32)
+            if not mix_on:
+                o_pol.scatter_(1, o_act.unsqueeze(1), 1.0)  # legacy one-hot
+            return o_act, o_pol
+
+        # 3. MCTS — but skip while EVERY game is still inside its opening
+        # (per-game open_len; ply < min_open ⇒ all games opening). In the mixed
+        # window (min_open <= ply < max_open) the MCTS branch runs and opening
+        # games' actions/targets are overridden after it.
+        if ply < min_open:
+            action, policy = _opening_actions()
             value = torch.zeros(num_games, device=device, dtype=torch.float32)
         else:
             forced_draw_mask = (
-                gpu_game.repetition_move_mask(state, legal_mask, min_repeats=term_min_repeats)
+                gpu_game.terminal_draw_move_mask(
+                    state, legal_mask, min_repeats=term_min_repeats,
+                    include_stalemate=term_include_stalemate)
                 if use_terminal_draws else None
             )
-            # Run the prober to compute per-position RELABEL targets (value + DTM)
-            # and last_in_tb. By default we do NOT feed it into the search: the
-            # Lc0-faithful path removes policy steering (the DTZ policy boost lc0
-            # rejected) and relies on on-policy self-play + value/moves-left relabel.
-            # tb_steer_policy=True restores the old soft search bias.
-            steer_enabled = bool(getattr(config, "tb_steer_policy", False))
-            # per_move runs the ~30-probe _classify; needed by BOTH search-side steering
-            # AND the soft policy relabel. Skipped otherwise (dominant self-play CPU cost).
-            need_per_move = steer_enabled or tb_policy_relabel
-            root_tb_value = (
-                tb_prober.root_move_values(state, legal_mask, per_move=need_per_move)
-                if tb_prober is not None else None
-            )
-            if tb_prober is not None and tb_prober.last_in_tb is not None:
-                tb_reached |= tb_prober.last_in_tb.to(device) & alive_mask
-            steer = root_tb_value if steer_enabled else None
+            # TB relabel targets. Two modes (see defer_relabel above):
+            #  - STEERING ON  → run the prober inline; its per-move values bias search.
+            #  - STEERING OFF → run only the cheap GPU piece-count gate now and STASH
+            #    the in-TB root boards; the value/DTM/policy targets are produced in a
+            #    pooled post-game pass. No search bias, so deferral is target-identical.
+            steer = None
+            if tb_prober is not None and not defer_relabel:
+                root_tb_value = tb_prober.root_move_values(
+                    state, legal_mask, per_move=need_per_move)
+                if tb_prober.last_in_tb is not None:
+                    tb_reached |= tb_prober.last_in_tb.to(device) & alive_mask
+                steer = root_tb_value if steer_enabled else None
+            elif tb_prober is not None:  # deferred
+                in_tb = tb_prober.in_tb_mask(state)
+                tb_reached |= in_tb.to(device) & alive_mask
+                # Reconstruct FENs for the alive, in-TB root boards (cheap vs probing).
+                # Appended once per ply in the post-step block (keeps T-alignment).
+                tb_fen_row = [None] * num_games
+                idxs = torch.nonzero(in_tb & alive_mask, as_tuple=False).flatten().tolist()
+                for i in idxs:
+                    tb_fen_row[i] = _state_to_board(state, i).fen()
             root_data = mcts.run_batch_gpu(
                 stacked_obs, legal_mask, add_noise=True,
                 forced_draw_mask=forced_draw_mask,
                 root_tb_value=steer,
             )
 
-            # 4. Per-game temperature for sampling (AlphaZero schedule).
-            #    Picks from pre-cached tensors to avoid per-ply construction.
-            is_post_drop = move_count >= temp_drop
-            temperature = torch.where(is_post_drop, temp_final_tensor, temp_init_tensor)
-            action, policy = select_action_gpu(
-                root_data["child_actions"],
-                root_data["child_visits"],
-                temperature,
-                action_space_size,
-            )
+            if "gumbel_action" in root_data:
+                # Plain Gumbel MuZero: A_{n+1} is the deterministic argmax of
+                # g + logits + σ(q̂) (exploration lives in the Gumbel draw, so
+                # the temperature schedule does not apply) and the policy
+                # target is π' = softmax(logits + σ(completedQ)) — the
+                # improvement-guaranteed dense target, not visit fractions.
+                action = root_data["gumbel_action"]
+                policy = root_data["gumbel_policy"]
+            else:
+                # 4. Per-game temperature for sampling (AlphaZero schedule).
+                #    Picks from pre-cached tensors to avoid per-ply construction.
+                is_post_drop = move_count >= temp_drop
+                temperature = torch.where(is_post_drop, temp_final_tensor, temp_init_tensor)
+                action, policy = select_action_gpu(
+                    root_data["child_actions"],
+                    root_data["child_visits"],
+                    temperature,
+                    action_space_size,
+                )
             value = root_data["root_value"]
             # Lc0-faithful: no policy steering by default (tb_steer_policy=False).
             # Self-play is on-policy; the TB signal enters training only via the
             # value relabel (Syzygy WDL) and the moves-left relabel (Gaviota DTM),
             # not by biasing search. Mirrors lc0's rescorer (they rejected the
             # search-side DTZ policy boost). tb_steer_policy=True restores the bias.
+
+        # Mixed opening window (per-game open_len): games still inside their
+        # opening take opening actions + zero targets instead of the MCTS
+        # results computed above. Merged batches hit this every ply < max_open
+        # (seeded games have open_len 0 and need MCTS from ply 0).
+        if min_open <= ply < max_open:
+            in_open = (open_len_t > ply) & alive_mask                 # [N] bool
+            o_action, o_policy = _opening_actions()
+            action = torch.where(in_open, o_action, action)
+            policy = torch.where(in_open.unsqueeze(1), o_policy, policy)
+            value = torch.where(in_open, torch.zeros_like(value), value)
 
         # 6. Step env. ``step_batch_with_legal`` returns the new state's
         #    legal_mask alongside (already computed inside for terminal
@@ -762,8 +1005,12 @@ def play_games_parallel_gpu_resident(
         rewards_per_ply.append(rewards.to(torch.float32))
         legal_masks_per_ply.append(legal_mask)
         # Per-position TB value target (DTZ-shaped, STM POV; NaN outside TB / during
-        # random opening). Fresh from this ply's root_move_values call (else branch).
-        if (tb_prober is not None and ply >= n_random
+        # random opening). Deferred path: stash the in-TB root FENs (built pre-step);
+        # the targets are produced in the post-game pooled pass. Inline path: read
+        # fresh from this ply's root_move_values call.
+        if defer_relabel:
+            tb_fen_per_ply.append(tb_fen_row if tb_fen_row is not None else [None] * num_games)
+        elif (tb_prober is not None and ply >= n_random
                 and tb_prober.last_position_value is not None):
             tb_values_per_ply.append(tb_prober.last_position_value.to(torch.float32))
             tb_ml = tb_prober.last_position_moves_left
@@ -820,6 +1067,47 @@ def play_games_parallel_gpu_resident(
     # 9. Capture final terminal observation.
     final_obs = gpu_game.to_tensor_batch(state)                      # [N, C, H, W]
 
+    # 9b. Deferred TB relabel (steering off): one pooled pass over the UNIQUE in-TB
+    # FENs gathered during play, then scatter (value, DTM, policy) back into the
+    # per-ply accumulators the inline path would have filled. Target-identical; the
+    # ~30-probe/position work now overlaps nothing in the GPU hot path and fans out
+    # across a CPU process pool instead of serializing one ply at a time.
+    if defer_relabel:
+        T = len(obs_per_ply)
+        params = _prober_params(
+            tb_prober, getattr(config, "tb_path", "data/syzygy"),
+            getattr(config, "tb_gaviota_path", None))
+        all_fens = [f for row in tb_fen_per_ply for f in row if f is not None]
+        fenmap = _relabel_fens(
+            all_fens, params, relabel_workers, want_policy=tb_policy_relabel)
+        n_uniq = len({f for f in all_fens})
+        nan = float("nan")
+        for t in range(T):
+            row = tb_fen_per_ply[t] if t < len(tb_fen_per_ply) else None
+            valrow = torch.full((num_games,), nan, dtype=torch.float32)
+            mlrow = torch.full((num_games,), nan, dtype=torch.float32)
+            polrow = [None] * num_games
+            if row is not None:
+                for g in range(num_games):
+                    fen = row[g]
+                    if fen is None:
+                        continue
+                    res = fenmap.get(fen)
+                    if res is None:
+                        continue
+                    pv, ml, pol = res
+                    if pv is not None:
+                        valrow[g] = pv
+                    if ml is not None:
+                        mlrow[g] = ml
+                    polrow[g] = pol
+            tb_values_per_ply.append(valrow)
+            tb_moves_left_per_ply.append(mlrow)
+            tb_policy_per_ply.append(polrow)
+        tqdm.write(
+            f"  TB relabel (deferred): {len(all_fens)} in-TB plies, {n_uniq} unique "
+            f"FENs probed across {max(relabel_workers, 1)} worker(s)")
+
     # 10. Stack and bulk-transfer to CPU. ONE pass.
     obs_stack = torch.stack(obs_per_ply, dim=1)                       # [N, T, C, H, W]
     actions_stack = torch.stack(actions_per_ply, dim=1)               # [N, T]
@@ -846,9 +1134,13 @@ def play_games_parallel_gpu_resident(
     tb_reached_cpu = tb_reached.cpu().numpy()
     if tb_prober is not None:
         n_reached = int(tb_reached_cpu.sum())
+        # In deferred mode the probing happens in the post-game pooled pass (logged
+        # separately), so tb_prober.n_probed stays 0 — report the gate count instead.
+        probed_clause = ("relabel deferred (see above)" if defer_relabel
+                         else f"{tb_prober.n_probed} root positions probed this batch")
         tqdm.write(
             f"  TB probe: {n_reached}/{num_games} games reached <= {tb_prober.max_pieces} "
-            f"pieces; {tb_prober.n_probed} root positions probed this batch"
+            f"pieces; {probed_clause}"
         )
         tb_prober.close()
 
@@ -857,8 +1149,8 @@ def play_games_parallel_gpu_resident(
     for g in range(num_games):
         L = int(game_length_cpu[g])
         h_g = GameHistory(game_name=config.game)
-        if seeded:
-            h_g.start_fen = start_fens[g]   # buffer reconstruction replays from the seed
+        if fen_list[g] is not None:
+            h_g.start_fen = fen_list[g]   # buffer reconstruction replays from the seed
         h_g.reached_tb = bool(tb_reached_cpu[g])
         for t in range(L):
             # .copy() / torch.from_numpy(...).clone() materializes per-ply slices.
@@ -893,21 +1185,66 @@ def play_games_parallel_gpu_resident(
         h_g.observations.append(torch.from_numpy(final_obs_cpu[g]).clone())
         histories.append(h_g)
 
+    # 12. TB rollout fill (win adjudication by demonstration): won-but-unconverted
+    # NON-seeded games are truncated at their first decisive in-TB ply and finished
+    # with TB-optimal play. Runs BEFORE resignation (callers apply it after us);
+    # filled games are exempted there via h.tb_filled.
+    if getattr(config, "tb_rollout_fill", False) and tb_prober is not None:
+        _fill_params = _prober_params(
+            tb_prober, getattr(config, "tb_path", "data/syzygy"),
+            getattr(config, "tb_gaviota_path", None))
+        t_fill = time.time()
+        n_filled = _apply_tb_rollout_fill(histories, _fill_params)
+        if n_filled:
+            tqdm.write(
+                f"  TB rollout fill: {n_filled}/{num_games} games truncated at their "
+                f"first decisive TB ply + finished with TB-optimal play "
+                f"({time.time() - t_fill:.1f}s)")
+
     return histories
 
 
-_SEED_ARCHIVE_CACHE: dict[str, list[str]] = {}
+_SEED_ARCHIVE_CACHE: dict[str, tuple[list[str], list[int] | None]] = {}
 
 
-def _load_seed_archive(path: str) -> list[str]:
-    """Load + cache the endgame-seed FEN archive (one FEN per line)."""
+def _load_seed_archive(path: str) -> tuple[list[str], list[int] | None]:
+    """Load + cache the endgame-seed FEN archive (one FEN per line) and, when a
+    ``<path>.dtm`` sidecar exists (scripts/annotate_seed_dtm.py), the per-seed
+    |DTM| annotations (0 = drawn seed, -1 = probe failure)."""
     if path not in _SEED_ARCHIVE_CACHE:
         try:
             with open(path) as f:
-                _SEED_ARCHIVE_CACHE[path] = [ln.strip() for ln in f if ln.strip()]
+                fens = [ln.strip() for ln in f if ln.strip()]
         except Exception:
-            _SEED_ARCHIVE_CACHE[path] = []
+            fens = []
+        dtms = None
+        try:
+            with open(path + ".dtm") as f:
+                vals = [int(ln.strip()) for ln in f if ln.strip()]
+            if len(vals) == len(fens):
+                dtms = vals
+        except Exception:
+            dtms = None
+        _SEED_ARCHIVE_CACHE[path] = (fens, dtms)
     return _SEED_ARCHIVE_CACHE[path]
+
+
+def seed_curriculum_dtm_cap(training_step: int, config) -> int | None:
+    """Reverse-curriculum DTM cap for seed sampling (Florensa-style: start
+    near the goal, expand outward). Ramps linearly from
+    ``seed_curriculum_dtm_easy`` to unlimited over
+    ``seed_curriculum_anneal_frac`` of training. None = no cap (off, or ramp
+    complete)."""
+    if not getattr(config, "seed_curriculum", False):
+        return None
+    frac = float(getattr(config, "seed_curriculum_anneal_frac", 0.5))
+    total = max(1, int(getattr(config, "training_steps", 1)))
+    p = min(1.0, training_step / max(1.0, frac * total))
+    if p >= 1.0:
+        return None
+    easy = int(getattr(config, "seed_curriculum_dtm_easy", 8))
+    hard = int(getattr(config, "seed_curriculum_dtm_hard", 100))
+    return int(round(easy + p * (hard - easy)))
 
 
 def run_self_play(
@@ -950,13 +1287,41 @@ def run_self_play(
         seed_arch = getattr(config, "endgame_seed_archive", None)
         seed_fens: list[str] = []
         if use_resident and seed_frac > 0.0 and seed_arch:
-            pool = _load_seed_archive(seed_arch)
+            pool, pool_dtms = _load_seed_archive(seed_arch)
             if pool:
                 n_seed = int(round(seed_frac * num_games))
+                cap = seed_curriculum_dtm_cap(training_step, config)
+                if cap is not None and pool_dtms is not None:
+                    # Reverse curriculum: draw from seeds solvable within the
+                    # current DTM cap (short chains first; the p^N conversion
+                    # math is benign there). Drawn seeds (dtm==0) stay eligible
+                    # throughout — they feed the draw-hold metric. Fall back to
+                    # the full pool if the cap leaves too few candidates.
+                    eligible = [f for f, d in zip(pool, pool_dtms)
+                                if d == 0 or 0 < d <= cap]
+                    if len(eligible) >= max(32, n_seed):
+                        pool = eligible
                 seed_fens = [random.choice(pool) for _ in range(n_seed)]
         n_normal = num_games - len(seed_fens)
 
         histories = []
+        if (use_resident and seed_fens
+                and bool(getattr(config, "merged_seed_batch", False))):
+            # MERGED sweep (next-run lever #11): normal + seeded games in the
+            # SAME resident batches — one straggler tail and one set of fixed
+            # per-ply overheads per chunk instead of two. Interleave so every
+            # chunk carries ~the configured seed fraction.
+            slots: list = [None] * n_normal + list(seed_fens)
+            random.shuffle(slots)
+            iterator = range(0, len(slots), n_parallel)
+            if show_progress:
+                iterator = tqdm(iterator, desc=desc + " (merged)", leave=False)
+            for s in iterator:
+                chunk = slots[s:s + n_parallel]
+                histories.extend(play_fn(
+                    network, config, len(chunk), device, training_step,
+                    start_fens=chunk))
+            return _apply_resignation(histories, config)
         # 1) normal games
         rem = n_normal
         iterator = range(0, n_normal, n_parallel) if n_normal > 0 else []

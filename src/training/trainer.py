@@ -22,10 +22,14 @@ from ..config import MuZeroConfig
 from ..games.base import Game
 from ..model.muzero_net import MuZeroNetwork
 from ..model.utils import scalar_transform, scalar_to_support, support_to_scalar, inverse_scalar_transform
-from .replay_buffer import ReplayBuffer, _iter_shard_games, _shard_record_count, _sparsify_policy
+from .replay_buffer import (
+    GameHistory, ReplayBuffer, _iter_shard_games, _shard_record_count,
+    _sparsify_policy,
+)
 from .representation_probe import compute_repr_metrics
 from .self_play import (run_self_play, get_material_value_weight, get_material_head_weight,
-                        get_warmstart_sample_frac, get_tb_policy_weight)
+                        get_warmstart_sample_frac, get_tb_policy_weight,
+                        get_batch_mixture)
 
 
 def _negative_cosine_similarity(p: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -133,6 +137,7 @@ class MuZeroTrainer:
             config.replay_buffer_size,
             warmstart_max_size=getattr(config, "warmstart_buffer_size", None),
             decisive_retention_multiplier=getattr(config, "decisive_retention_multiplier", 1.0),
+            anchor_max_size=getattr(config, "anchor_max_size", None),
         )
         # Two-phase buffer sizing: during the supervised warmstart phase there is
         # no self-play to protect the anchor from, so let warmstart games fill the
@@ -159,6 +164,19 @@ class MuZeroTrainer:
         # at a time by _inject_stockfish_games to avoid re-reading each shard.
         self._injection_shard_idx: int = 0
         self._injection_shard_games: list = []
+
+        # TB endgame ANCHOR injection state (strategy_2026_07_02.md). Unlike the
+        # bounded Stockfish pool, the anchor CYCLES its archive forever — a
+        # persistent, never-annealed supply of tablebase-optimal demonstration
+        # games (the supervised-proxy signal, KQvK 0.91) injected into the
+        # rolling self-play pool. Compact dicts stay in RAM; each injection
+        # reconstructs a FRESH GameHistory so buffer entries never alias.
+        self._tb_anchor_dicts: list[dict] = []
+        self._tb_anchor_cursor: int = 0
+        self._tb_anchor_injected: int = 0
+        tb_anchor_path = getattr(config, "tb_anchor_path", None)
+        if tb_anchor_path:
+            self._load_tb_anchor(tb_anchor_path)
         # Lazily-built fixed held-out probe set for the in-loop representation
         # informativeness metric (repr/* scalars). See representation_probe.py.
         self._repr_probe_set = None
@@ -231,6 +249,19 @@ class MuZeroTrainer:
                 and step % self.config.stockfish_injection_interval == 0
             ):
                 self._inject_stockfish_games(self.config.stockfish_injection_games)
+
+            # TB endgame anchor injection: a cycling, never-exhausting supply of
+            # tablebase-optimal demonstration games (the validated supervised-
+            # proxy signal) mixed into the rolling buffer at a constant rate.
+            tb_anchor_interval = int(getattr(self.config, "tb_anchor_interval", 0))
+            if (
+                self._tb_anchor_dicts
+                and tb_anchor_interval > 0
+                and step > 0
+                and step % tb_anchor_interval == 0
+            ):
+                self._inject_tb_anchor_games(
+                    int(getattr(self.config, "tb_anchor_games", 0)))
 
             # Self-play / reanalyze gating. Two modes:
             #   (A) Explicit two-phase: if ``self_play_warmup_steps`` is set,
@@ -482,6 +513,12 @@ class MuZeroTrainer:
         self.writer.add_scalar("self_play/resign_holdout_rate", holdout_triggered / n_games, self.global_step)
         self.writer.add_scalar("self_play/resign_false_positive_rate",
                                resign_fp / max(1, holdout_triggered), self.global_step)
+        # TB rollout fill: fraction of games truncated at a decisive in-TB ply and
+        # finished with TB-optimal play (won-but-unconverted adjudications).
+        if getattr(self.config, "tb_rollout_fill", False):
+            filled = sum(1 for g in games if getattr(g, "tb_filled", False))
+            self.writer.add_scalar(
+                "self_play/tb_fill_rate", filled / n_games, self.global_step)
         # Root tablebase reach rate: fraction of games that ever simplified into a
         # ≤tb_max_pieces position (where root TB probing can fire). Tells us how
         # often the model even reaches the endgame stage the probe targets.
@@ -764,6 +801,54 @@ class MuZeroTrainer:
                 self._injection_shard_games = self._injection_shard_games[drop:]
                 return
 
+    def _load_tb_anchor(self, path: str) -> None:
+        """Load the TB anchor archive (v2 compact shards) as raw compact dicts.
+
+        Dicts (not GameHistories) are cached: observations are rebuilt per
+        injection via ``from_compact_dict`` so repeated injections of the same
+        game never share mutable state (birth stamps, reanalyze, priorities).
+        """
+        import random as _random
+        shards = sorted(Path(path).glob("*.pkl"))
+        for shard in shards:
+            with open(shard, "rb") as f:
+                header = pickle.load(f)
+                if not (isinstance(header, dict) and header.get("version") == 2):
+                    raise ValueError(f"{shard}: expected v2 compact shard")
+                for _ in range(int(header["n_records"])):
+                    self._tb_anchor_dicts.append(pickle.load(f))
+        _random.Random(0).shuffle(self._tb_anchor_dicts)
+        print(f"TB anchor archive: {len(self._tb_anchor_dicts)} games "
+              f"from {len(shards)} shard(s) at {path}")
+
+    def _inject_tb_anchor_games(self, n: int) -> None:
+        """Inject ``n`` TB anchor games into the rolling buffer, cycling the
+        archive (reshuffled each wrap). See _load_tb_anchor."""
+        if not self._tb_anchor_dicts:
+            return
+        import random as _random
+        for _ in range(n):
+            if self._tb_anchor_cursor >= len(self._tb_anchor_dicts):
+                _random.shuffle(self._tb_anchor_dicts)
+                self._tb_anchor_cursor = 0
+            d = self._tb_anchor_dicts[self._tb_anchor_cursor]
+            self._tb_anchor_cursor += 1
+            g = GameHistory.from_compact_dict(d, self.game)
+            # Anchor policies are TB demonstrations — shield from reanalyze.
+            # Stamped here (not in the archive) so existing shards are covered.
+            g.tb_authored = True
+            g.channel_tag = "anchor"  # unified-buffer channel identity (task #19)
+            with self._buffer_lock:
+                self.replay_buffer.save_game(g)
+            self._tb_anchor_injected += 1
+        self.writer.add_scalar(
+            "injection/tb_anchor_total", self._tb_anchor_injected, self.global_step
+        )
+        tqdm.write(
+            f"Step {self.global_step}: injected {n} TB anchor games "
+            f"(total {self._tb_anchor_injected}, buffer {len(self.replay_buffer)})"
+        )
+
     def _inject_stockfish_games(self, n: int) -> None:
         """Inject up to ``n`` next-un-consumed Stockfish games into the buffer.
 
@@ -894,6 +979,8 @@ class MuZeroTrainer:
                 eval_to_wdl_beta=getattr(self.config, "eval_to_wdl_beta", 2.0),
                 warmstart_sample_frac=get_warmstart_sample_frac(self.global_step, self.config),
                 decisive_sample_frac=getattr(self.config, "decisive_sample_frac", 0.0),
+                batch_mixture=get_batch_mixture(self.global_step, self.config),
+                position_sampling=getattr(self.config, "position_sampling", "per_game"),
                 q_ratio=getattr(self.config, "q_ratio", 0.0),
                 warmstart_q_ratio=getattr(self.config, "warmstart_q_ratio", None),
                 selfplay_q_ratio=getattr(self.config, "selfplay_q_ratio", None),
@@ -905,8 +992,10 @@ class MuZeroTrainer:
                 tb_value_weight=float(getattr(self.config, "tb_value_weight", 0.0)),
                 tb_moves_left_weight=float(getattr(self.config, "tb_moves_left_weight", 0.0)),
                 tb_policy_weight=get_tb_policy_weight(self.global_step, self.config),
+                tb_value_hard=bool(getattr(self.config, "tb_value_hard", False)),
                 build_legal_masks=bool(getattr(self.config, "mask_illegal_policy", False)),
                 build_material_target=bool(getattr(self.config, "use_material_head", False)),
+                symmetry_augment=bool(getattr(self.config, "symmetry_augment", False)),
             )
 
     def _next_batch(self):
@@ -1141,6 +1230,20 @@ class MuZeroTrainer:
                         * mask_k
                     )
 
+            # Reward-precision guard: under symmetry augmentation the reward
+            # head trains on CANONICAL views only (transformed samples masked;
+            # kept samples renormalized so the reward gradient magnitude is
+            # unchanged). Root cause 2026-07-05: reward = the search's in-tree
+            # mate detector (muted-reward diag: conversion 0.20 -> 0.048 on the
+            # same weights); augmented reward training traded precision for
+            # recall (false mate-fire 0.12 -> 0.41) and phantom per-edge
+            # rewards collapsed conversion 4x.
+            sym_keep = batch.get("sym_reward_keep")
+            if sym_keep is not None:
+                sym_keep = sym_keep.to(self.device)
+                scale = sym_keep.numel() / sym_keep.sum().clamp(min=1.0)
+                reward_loss = reward_loss * sym_keep * scale
+
             per_sample_loss = outer_scale * (
                 policy_loss
                 + value_weight * value_loss
@@ -1277,6 +1380,28 @@ class MuZeroTrainer:
                                     if n_warm > 0 else float("nan"))
                 policy_loss_self = (policy_per_sample[~is_warm].mean().item()
                                     if n_sp > 0 else float("nan"))
+                # Per-channel composition + anchor loss split (task #19).
+                # Realized fracs make batch composition VISIBLE — the 2026-07-05
+                # histogram audit found warmup batches were an emergent 60%
+                # anchor nobody chose; these scalars make that impossible to miss.
+                ch = batch.get("channel_ids")
+                if ch is not None:
+                    ch = ch.to(self.device)
+                    n_b = ch.numel()
+                    is_anchor = ch == 1
+                    self.writer.add_scalar("batch/frac_warmstart",
+                                           float((ch == 0).sum().item()) / n_b, self.global_step)
+                    self.writer.add_scalar("batch/frac_anchor",
+                                           float(is_anchor.sum().item()) / n_b, self.global_step)
+                    self.writer.add_scalar("batch/frac_selfplay",
+                                           float((ch == 2).sum().item()) / n_b, self.global_step)
+                    if bool(is_anchor.any()):
+                        self.writer.add_scalar(
+                            "loss/policy_loss_anchor",
+                            policy_per_sample[is_anchor].mean().item(), self.global_step)
+                        self.writer.add_scalar(
+                            "loss/value_loss_anchor",
+                            value_per_sample[is_anchor].mean().item(), self.global_step)
                 value_loss_warm = (value_per_sample[is_warm].mean().item()
                                    if n_warm > 0 else float("nan"))
                 value_loss_self = (value_per_sample[~is_warm].mean().item()
@@ -1625,6 +1750,44 @@ class MuZeroTrainer:
                 f"({saved} self-play games{cap_note}; warmstart excluded — "
                 f"re-pass --warmstart-path on resume)"
             )
+
+    def load_body_warmstart(self, checkpoint_path: str):
+        """Warm-start the BODY (+ any shape-matching heads) from a checkpoint whose
+        architecture differs from the current model — e.g. after widening the
+        moves-left head's input. Loads model weights with strict=False (matching
+        keys transfer: representation/dynamics/policy/value; changed heads keep their
+        fresh init), KEEPS the replay buffer (data is model-independent) and the step
+        counter (so anneals/schedules continue), but uses a FRESH optimizer/scheduler
+        (stale moments for reinitialized heads would corrupt their early training)."""
+        from src.config import MuZeroConfig
+        torch.serialization.add_safe_globals([MuZeroConfig])
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        ckpt_sd = ckpt["model_state_dict"]
+        model_sd = self.network.state_dict()
+        # Transfer only keys present in BOTH with MATCHING shape. Shape-changed keys
+        # (e.g. a widened head's convs) error even under strict=False, so filter them
+        # out explicitly; they keep their fresh init.
+        transfer = {k: v for k, v in ckpt_sd.items()
+                    if k in model_sd and model_sd[k].shape == v.shape}
+        fresh = sorted({k.split(".")[0] for k in model_sd if k not in transfer})
+        self.network.load_state_dict(transfer, strict=False)
+        print(f"Body warm-start from {checkpoint_path}:")
+        print(f"  transferred {len(transfer)}/{len(model_sd)} tensors; "
+              f"FRESH (absent or shape-changed): {fresh or 'none'}")
+        self.global_step = int(ckpt.get("step", 0))
+        self._injection_loaded = int(ckpt.get("injection_loaded", 0))
+        buf_path = Path(checkpoint_path).with_suffix(".buf")
+        if buf_path.exists():
+            try:
+                self.replay_buffer.load(buf_path, game=self.game)
+                print(f"  loaded replay buffer ({len(self.replay_buffer)} games)")
+            except (EOFError, pickle.UnpicklingError) as e:
+                print(f"  WARNING: {buf_path.name} corrupt ({type(e).__name__}); empty buffer")
+                self.replay_buffer.buffer = []
+                self.replay_buffer._priorities = []
+        else:
+            print("  no saved buffer found — starting with empty buffer")
+        print(f"  resuming at step {self.global_step} with a FRESH optimizer/scheduler")
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load model, optimizer, scheduler, and replay buffer from a checkpoint."""

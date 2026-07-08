@@ -1507,6 +1507,63 @@ class GpuChessGame(BatchedGame):
         # Resulting occurrence count = ring matches + 1 (this move). >= min_repeats.
         return candidate & (match_count >= (min_repeats - 1))
 
+    def terminal_draw_move_mask(
+        self,
+        state: ChessBatchedState,
+        legal_mask: torch.Tensor,
+        min_repeats: int = 2,
+        include_stalemate: bool = True,
+        max_pieces: int = 6,
+    ) -> torch.Tensor:
+        """`(N, 4672)` bool: legal moves leading to a DRAW terminal. Superset of
+        ``repetition_move_mask``: repetition (closed-form) PLUS — when
+        ``include_stalemate`` — stalemate / insufficient-material / 75-move / ply
+        cap, via a bounded one-ply lookahead. ``step_batch`` returns ``done`` and
+        mover-POV ``reward``; ``done & (reward == 0)`` is EXACTLY a draw terminal
+        (a mate sets reward=+1, and the mover can never be checkmated by its own
+        move). The lookahead is GATED to positions with <= ``max_pieces`` pieces:
+        stalemate / insufficient are impossible above that, and endgames have few
+        legal moves, so the rank-loop is short. Used by the TensorMCTS
+        root-terminal-draws override (the 79%-stalemate-conversion fix): the
+        winning side's other children normalize above ``draw_score`` so it avoids
+        the stalemating move; a losing side keeps the draw.
+        """
+        dev = state.device
+        N = state.n
+        out = self.repetition_move_mask(state, legal_mask, min_repeats)
+        if not include_stalemate:
+            return out
+        # Piece-count gate (stalemate/insufficient need few pieces; bounds cost).
+        bit_idx = torch.arange(64, device=dev, dtype=torch.int64)
+        total_pieces = ((state.pieces.unsqueeze(-1) >> bit_idx) & 1).sum(dim=(1, 2))  # [N]
+        eg = total_pieces <= max_pieces                                                # [N]
+        if not bool(eg.any()):
+            return out
+        counts = legal_mask.sum(dim=1).to(torch.long)                                  # [N]
+        eg_counts = torch.where(eg, counts, torch.zeros_like(counts))
+        max_legal = int(eg_counts.max().item())
+        if max_legal == 0:
+            return out
+        # Per-game legal action indices, padded with -1 (row-major nonzero -> rank).
+        nz = legal_mask.nonzero(as_tuple=False)                                        # [T, 2]
+        rows, cols = nz[:, 0], nz[:, 1]
+        row_off = torch.zeros(N + 1, dtype=torch.long, device=dev)
+        row_off[1:] = counts.cumsum(0)
+        within = torch.arange(nz.shape[0], device=dev) - row_off[rows]                 # rank within row
+        legal_idx = torch.full((N, int(counts.max().item())), -1, dtype=torch.long, device=dev)
+        legal_idx[rows, within] = cols
+        arange_n = torch.arange(N, device=dev)
+        for r in range(max_legal):
+            act = legal_idx[:, r]                                                      # [N]; -1 = no r-th move
+            valid = (act >= 0) & eg
+            if not bool(valid.any()):
+                continue
+            _new, reward, done, _legal = self.step_batch_with_legal(state, act.clamp(min=0))
+            draw_term = done & (reward == 0) & valid
+            if bool(draw_term.any()):
+                out[arange_n[draw_term], act[draw_term]] = True
+        return out
+
     def step_batch(
         self,
         state: ChessBatchedState,

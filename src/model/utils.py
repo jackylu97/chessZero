@@ -48,6 +48,42 @@ class ResidualBlock(nn.Module):
         return torch.relu(out + residual)
 
 
+class SEResidualBlock(nn.Module):
+    """Residual block with a Squeeze-Excitation channel gate (Lc0's conv-era
+    upgrade): Conv -> Norm -> ReLU -> Conv -> Norm -> SE-gate, add, ReLU.
+
+    The SE gate (global average pool -> FC(C->C/r) -> ReLU -> FC(C/r->C) ->
+    sigmoid, applied as a per-channel scale) gives every conv block a cheap
+    global-context signal — the standard mitigation for the conv effective-
+    receptive-field dilution problem on chess boards (long-range slider/king
+    relations). ~2k params at C=128, r=16. Used as the conv STEM of the hybrid
+    body (strategy_2026_07_02.md §8 follow-up): local tactical primitives with
+    global channel context, feeding the attention encoder.
+    """
+
+    def __init__(self, planes: int, spatial_shape: tuple[int, int], se_ratio: int = 16):
+        super().__init__()
+        self.conv1 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
+        self.bn1 = norm_layer(planes, spatial_shape)
+        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
+        self.bn2 = norm_layer(planes, spatial_shape)
+        squeezed = max(4, planes // se_ratio)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(planes, squeezed, 1),
+            nn.ReLU(),
+            nn.Conv2d(squeezed, planes, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out * self.se(out)
+        return torch.relu(out + residual)
+
+
 def mlp_head(in_features: int, hidden: int, out_features: int) -> nn.Sequential:
     """Simple MLP: Linear-ReLU-Linear."""
     return nn.Sequential(
@@ -184,7 +220,7 @@ def outcome_to_wdl(game_outcome: float, ply_idx: int) -> tuple[float, float, flo
     return (1.0, 0.0, 0.0) if stm_won else (0.0, 0.0, 1.0)
 
 
-def eval_to_wdl(stm_eval: float, alpha: float = 4.0, beta: float = 2.0) -> tuple[float, float, float]:
+def eval_to_wdl(stm_eval: float, alpha: float = 5.6, beta: float = 1.7) -> tuple[float, float, float]:
     """Convert a Stockfish per-position eval (in [-1, +1] from STM POV) to a
     soft (P_W, P_D, P_L) distribution.
 
@@ -192,14 +228,18 @@ def eval_to_wdl(stm_eval: float, alpha: float = 4.0, beta: float = 2.0) -> tuple
         P(W)  = sigmoid(α · eval - β)
         P(L)  = sigmoid(α · -eval - β)
         P(D)  = max(0, 1 - P(W) - P(L))
-    Then renormalizes to sum to 1. Default ``α=4, β=2`` gives a draw zone
-    around eval=0 (P_D ≈ 0.76 at eval=0, P_D ≈ 0.5 at |eval|=0.5, P_D ≈ 0.12
-    at |eval|=1.0). ``alpha`` controls sharpness, ``beta`` controls the
-    width of the draw zone.
+    Then renormalizes to sum to 1. The eval is normalized eval=tanh(cp/800)
+    (scripts/generate_stockfish_games.py:55), so eval=1 == mate (≈100% win) and
+    eval=0.3 == +2.5 pawns. Default ``α=5.6, β=1.7`` is calibrated against the
+    Lichess real-game win-rate logistic: P_D ≈ 0.69 at eval=0, W-L ≈ 0.43 at
+    eval=0.3, P_W ≈ 0.98 at eval=1. ``alpha`` controls sharpness, ``beta`` the
+    draw-zone width.
 
-    Reference: not in Lc0's repo (Lc0 trains pure z, not eval). Community-
-    standard sigmoid-on-cp formulation, calibrated by visual inspection
-    against expected win/draw rates at typical Stockfish-depth-8 evals.
+    Reference: not in Lc0's repo (Lc0 trains pure z, not eval). Sigmoid-on-cp
+    formulation calibrated to the Lichess win-% model (real games across ratings,
+    the right target for a net that cannot yet convert) rather than Stockfish's
+    engine-vs-engine WDL model (which saturates far too aggressively). The exact
+    calibrated W-L is tanh(1.473·atanh(eval)); α=5.6/β=1.7 matches it within ~0.07.
     """
     import math
     p_w = 1.0 / (1.0 + math.exp(-(alpha * stm_eval - beta)))

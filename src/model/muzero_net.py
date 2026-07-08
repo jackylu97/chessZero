@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from .utils import (
     ResidualBlock,
+    SEResidualBlock,
     inverse_scalar_transform,
     mlp_head,
     norm_layer,
@@ -29,22 +30,49 @@ class RepresentationNetwork(nn.Module):
         latent_w: int,
         input_h: int,
         input_w: int,
+        use_attention: bool = False,
+        attn_layers: int = 4,
+        attn_heads: int = 4,
+        use_smolgen: bool = True,
+        hybrid_stem_blocks: int = 0,
     ):
         super().__init__()
         self.latent_h = latent_h
         self.latent_w = latent_w
         self.needs_resize = (input_h != latent_h) or (input_w != latent_w)
+        self.use_attention = use_attention
 
         # Projection norm operates at the raw input resolution (may differ from
-        # latent if needs_resize); residual blocks operate at the latent size.
+        # latent if needs_resize); the body operates at the latent size.
         self.projection = nn.Sequential(
             nn.Conv2d(in_channels, hidden_planes, 3, padding=1, bias=False),
             norm_layer(hidden_planes, (input_h, input_w)),
             nn.ReLU(),
         )
-        self.blocks = nn.Sequential(
-            *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
-        )
+        if use_attention:
+            # Self-attention encoder over the latent_h*latent_w board tokens: learned
+            # positional embeddings + global self-attention + (optional) smolgen. Replaces
+            # the conv residual tower to give the representation long-range board geometry.
+            # hybrid_stem_blocks > 0 prepends SE-residual conv blocks (the HYBRID body,
+            # strategy_2026_07_02.md §8): the conv stem supplies local tactical primitives
+            # + absolute-position anchoring; the attention encoder composes them globally.
+            from .attention import BoardAttentionEncoder
+            encoder = BoardAttentionEncoder(
+                dim=hidden_planes, h=latent_h, w=latent_w,
+                n_layers=attn_layers, n_heads=attn_heads, use_smolgen=use_smolgen,
+            )
+            if hybrid_stem_blocks > 0:
+                self.blocks = nn.Sequential(
+                    *[SEResidualBlock(hidden_planes, (latent_h, latent_w))
+                      for _ in range(hybrid_stem_blocks)],
+                    encoder,
+                )
+            else:
+                self.blocks = encoder
+        else:
+            self.blocks = nn.Sequential(
+                *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
+            )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         x = self.projection(obs)
@@ -95,6 +123,12 @@ class DynamicsNetwork(nn.Module):
         fc_hidden: int,
         action_embed_dim: int = 16,
         reward_support_size: int = 1,
+        reward_head_planes: int = 1,
+        use_attention: bool = False,
+        attn_layers: int = 4,
+        attn_heads: int = 4,
+        use_smolgen: bool = True,
+        hybrid_stem_blocks: int = 0,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -112,16 +146,43 @@ class DynamicsNetwork(nn.Module):
         )
         self.bn_in = norm_layer(hidden_planes, (latent_h, latent_w))
 
-        self.blocks = nn.Sequential(
-            *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
-        )
+        # Body: conv residual tower, or a smolgen attention encoder (matching the
+        # representation so the consistency loss can align dynamics->repr — a conv
+        # dynamics cannot reproduce a smolgen-rich repr target, which craters MCTS).
+        if use_attention:
+            from .attention import BoardAttentionEncoder
+            encoder = BoardAttentionEncoder(
+                dim=hidden_planes, h=latent_h, w=latent_w,
+                n_layers=attn_layers, n_heads=attn_heads, use_smolgen=use_smolgen)
+            if hybrid_stem_blocks > 0:
+                # Hybrid body (see RepresentationNetwork): conv-SE stem before the
+                # attention encoder. In the DYNAMICS this matters most — one move's
+                # consequences are global, and dilution compounds over the K-step
+                # unroll and the search depth (matched bodies per the EXP-0 lesson).
+                self.blocks = nn.Sequential(
+                    *[SEResidualBlock(hidden_planes, (latent_h, latent_w))
+                      for _ in range(hybrid_stem_blocks)],
+                    encoder,
+                )
+            else:
+                self.blocks = encoder
+        else:
+            self.blocks = nn.Sequential(
+                *[ResidualBlock(hidden_planes, (latent_h, latent_w)) for _ in range(num_blocks)]
+            )
 
-        # Reward head outputs categorical distribution
+        # Reward head outputs categorical distribution.
+        # reward_head_planes widens the 1x1 projection (historically 1 — an
+        # afterthought). 2026-07-05: the reward head is the search's in-tree
+        # mate detector and THE conversion-critical component (muted-reward
+        # diag: 0.20 -> 0.048 conversion on identical weights); provision it
+        # like one. 8 planes matches the value/moves-left heads.
         reward_out = 2 * reward_support_size + 1
+        rhp = int(reward_head_planes)
         self.reward_head = nn.Sequential(
-            nn.Conv2d(hidden_planes, 1, 1),
+            nn.Conv2d(hidden_planes, rhp, 1),
             nn.Flatten(),
-            mlp_head(latent_h * latent_w, fc_hidden, reward_out),
+            mlp_head(rhp * latent_h * latent_w, fc_hidden, reward_out),
         )
         _zero_init_last_linear(self.reward_head)
 
@@ -230,11 +291,31 @@ class PredictionNetwork(nn.Module):
         value_head_type: str = "support",
         value_head_init_std: float = 0.0,
         policy_head_type: str = "flat",
+        value_head_planes: int = 1,
+        value_head_blocks: int = 0,
+        use_pred_attention: bool = False,
+        pred_attn_layers: int = 2,
+        pred_attn_heads: int = 4,
+        pred_use_smolgen: bool = True,
+        scalar_head_pool: str = "conv",
     ):
         super().__init__()
         self.value_support_size = value_support_size
         self.value_head_type = value_head_type
         self.policy_head_type = policy_head_type
+        self.scalar_head_pool = scalar_head_pool
+
+        # Shared attention body over the latent tokens, applied BEFORE the policy/value
+        # heads split — gives both heads attention-refined features and (unlike the
+        # representation's attention) re-attends at EVERY node, including interior MCTS
+        # nodes reached via the conv dynamics. Runs in the ~num_simulations/move hot path.
+        if use_pred_attention:
+            from .attention import BoardAttentionEncoder
+            self.pred_body = BoardAttentionEncoder(
+                dim=hidden_planes, h=latent_h, w=latent_w,
+                n_layers=pred_attn_layers, n_heads=pred_attn_heads, use_smolgen=pred_use_smolgen)
+        else:
+            self.pred_body = None
 
         # Policy head. "flat" (default, AlphaGo-style): a Conv(C->2) channel
         # squeeze + Linear to the full action space — fine for small/point-move
@@ -245,6 +326,12 @@ class PredictionNetwork(nn.Module):
             self.policy_head = ConvPolicyHead(
                 hidden_planes, action_space_size, latent_h, latent_w
             )  # zero-inits its own output conv
+        elif policy_head_type == "from_to":
+            # Relational bilinear from->to head (Lc0 transformer style; arch
+            # sweep arm C). Codec-parity tested in tests/test_arch_heads.py.
+            from .attention import FromToPolicyHead
+            assert action_space_size == 64 * 73, "from_to head is chess-specific"
+            self.policy_head = FromToPolicyHead(hidden_planes)
         elif policy_head_type == "flat":
             self.policy_head = nn.Sequential(
                 nn.Conv2d(hidden_planes, 2, 1, bias=False),
@@ -264,13 +351,34 @@ class PredictionNetwork(nn.Module):
             value_out = 3
         else:
             raise ValueError(f"Unknown value_head_type: {value_head_type!r}")
-        self.value_head = nn.Sequential(
-            nn.Conv2d(hidden_planes, 1, 1, bias=False),
-            norm_layer(1, (latent_h, latent_w)),
-            nn.ReLU(),
-            nn.Flatten(),
-            mlp_head(latent_h * latent_w, fc_hidden, value_out),
-        )
+        # Value head input width. The default 1-plane 1×1 projection crushes the
+        # full C-channel latent to a single 8×8 map BEFORE the MLP — a severe
+        # bottleneck that empirically leaves the head unable to extract the
+        # distance-to-mate (DTZ/DTM) signal the latent demonstrably contains
+        # (MLP-on-full-latent reads DTZ at corr 0.80, the 1-plane head at 0.035).
+        # value_head_planes>1 widens the projection; value_head_blocks>0 adds
+        # pre-projection residual blocks at hidden width for dedicated capacity.
+        vhp = int(value_head_planes)
+        if scalar_head_pool == "attn":
+            # Attention-pooled value head (arch sweep arm D): learned query
+            # cross-attends the 64 tokens — relational aggregation instead of
+            # a channel squeeze. See attention.AttnPoolHead.
+            from .attention import AttnPoolHead
+            self.value_head = AttnPoolHead(hidden_planes, value_out,
+                                           mlp_hidden=fc_hidden)
+        else:
+            value_layers: list[nn.Module] = [
+                ResidualBlock(hidden_planes, (latent_h, latent_w))
+                for _ in range(int(value_head_blocks))
+            ]
+            value_layers += [
+                nn.Conv2d(hidden_planes, vhp, 1, bias=False),
+                norm_layer(vhp, (latent_h, latent_w)),
+                nn.ReLU(),
+                nn.Flatten(),
+                mlp_head(vhp * latent_h * latent_w, fc_hidden, value_out),
+            ]
+            self.value_head = nn.Sequential(*value_layers)
         # Value-head output init. Default (std=0.0) zero-inits the last linear —
         # the standard MuZero/LightZero stability trick. BUT zero weights make the
         # head's Jacobian w.r.t. its input zero (grad_to_input = Wᵀ·grad_out = 0),
@@ -292,6 +400,8 @@ class PredictionNetwork(nn.Module):
               - support head: (B, 2*support_size+1)
               - wdl head:     (B, 3)  — order (W, D, L)
         """
+        if self.pred_body is not None:
+            hidden_state = self.pred_body(hidden_state)
         return self.policy_head(hidden_state), self.value_head(hidden_state)
 
 
@@ -389,16 +499,26 @@ class MovesLeftHead(nn.Module):
     """
 
     def __init__(self, hidden_planes: int, latent_h: int, latent_w: int,
-                 fc_hidden: int, support_size: int):
+                 fc_hidden: int, support_size: int,
+                 head_planes: int = 1, head_blocks: int = 0):
         super().__init__()
         self.support_size = support_size
-        self.head = nn.Sequential(
-            nn.Conv2d(hidden_planes, 1, 1, bias=False),
-            norm_layer(1, (latent_h, latent_w)),
+        # Same input-width fix as the value head: the distance-to-mate (DTM)
+        # target this head is trained on lives across the latent's channels, so a
+        # 1-plane projection starves it. head_planes>1 widens it.
+        hp = int(head_planes)
+        layers: list[nn.Module] = [
+            ResidualBlock(hidden_planes, (latent_h, latent_w))
+            for _ in range(int(head_blocks))
+        ]
+        layers += [
+            nn.Conv2d(hidden_planes, hp, 1, bias=False),
+            norm_layer(hp, (latent_h, latent_w)),
             nn.ReLU(),
             nn.Flatten(),
-            mlp_head(latent_h * latent_w, fc_hidden, 2 * support_size + 1),
-        )
+            mlp_head(hp * latent_h * latent_w, fc_hidden, 2 * support_size + 1),
+        ]
+        self.head = nn.Sequential(*layers)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         return self.head(hidden_state)  # (B, 2*support_size + 1) logits
@@ -472,6 +592,20 @@ class MuZeroNetwork(nn.Module):
         moves_left_support_size: int = 10,
         use_material_head: bool = False,
         material_head_support_size: int = 8,
+        reward_head_planes: int = 1,
+        value_head_planes: int = 1,
+        value_head_blocks: int = 0,
+        moves_left_head_planes: int = 1,
+        moves_left_head_blocks: int = 0,
+        scalar_head_pool: str = "conv",
+        use_repr_attention: bool = False,
+        attn_layers: int = 4,
+        attn_heads: int = 4,
+        use_smolgen: bool = True,
+        use_pred_attention: bool = False,
+        pred_attn_layers: int = 2,
+        use_dyn_attention: bool = False,
+        hybrid_stem_blocks: int = 0,
     ):
         super().__init__()
         self.action_space_size = action_space_size
@@ -491,12 +625,19 @@ class MuZeroNetwork(nn.Module):
         self.representation = RepresentationNetwork(
             observation_channels, hidden_planes, num_blocks,
             latent_h, latent_w, input_h, input_w,
+            use_attention=use_repr_attention, attn_layers=attn_layers,
+            attn_heads=attn_heads, use_smolgen=use_smolgen,
+            hybrid_stem_blocks=hybrid_stem_blocks,
         )
         self.dynamics = DynamicsNetwork(
             hidden_planes, num_blocks, action_space_size,
             latent_h, latent_w, fc_hidden,
             action_embed_dim=action_embed_dim,
             reward_support_size=reward_support_size,
+            reward_head_planes=reward_head_planes,
+            use_attention=use_dyn_attention, attn_layers=attn_layers,
+            attn_heads=attn_heads, use_smolgen=use_smolgen,
+            hybrid_stem_blocks=hybrid_stem_blocks,
         )
         self.prediction = PredictionNetwork(
             hidden_planes, action_space_size,
@@ -504,6 +645,13 @@ class MuZeroNetwork(nn.Module):
             value_head_type=value_head_type,
             value_head_init_std=value_head_init_std,
             policy_head_type=policy_head_type,
+            value_head_planes=value_head_planes,
+            value_head_blocks=value_head_blocks,
+            use_pred_attention=use_pred_attention,
+            pred_attn_layers=pred_attn_layers,
+            pred_attn_heads=attn_heads,
+            pred_use_smolgen=use_smolgen,
+            scalar_head_pool=scalar_head_pool,
         )
 
         # Inverse-dynamics head (ICM): predicts a_k from (h_k, h_{k+1}). Forces the
@@ -518,9 +666,14 @@ class MuZeroNetwork(nn.Module):
 
         # Moves-left head (Lc0): predicts plies-to-end; used to break value
         # saturation so the search prefers faster wins instead of shuffling.
-        if use_moves_left:
+        if use_moves_left and scalar_head_pool == "attn":
+            from .attention import AttnPoolHead
+            self.moves_left_head = AttnPoolHead(
+                hidden_planes, 2 * moves_left_support_size + 1, mlp_hidden=fc_hidden)
+        elif use_moves_left:
             self.moves_left_head = MovesLeftHead(
                 hidden_planes, latent_h, latent_w, fc_hidden, moves_left_support_size,
+                head_planes=moves_left_head_planes, head_blocks=moves_left_head_blocks,
             )
         else:
             self.moves_left_head = None
@@ -570,15 +723,34 @@ class MuZeroNetwork(nn.Module):
 
     def predict_moves_left(self, hidden: torch.Tensor) -> torch.Tensor:
         """Moves-left logits (B, 2*K+1) from a hidden state. Queried separately
-        (training: CE loss; search: gated utility). POV-independent."""
+        (training: CE loss; search: gated utility). POV-independent.
+
+        When the shared prediction body exists (use_pred_attention), the head
+        reads the BODY output — same decision features policy/value see. The
+        moves-left output is search-consumed (the MCTS utility), so its accuracy
+        matters directly; the raw latent provably under-serves thin heads
+        (DTZ corr 0.80 in the latent, 0.035 through a 1-plane head). The body
+        forward is recomputed here (prediction() computes it for policy/value);
+        redundant but small (~12 MFLOPs/layer) and keeps the query API unchanged.
+        """
         assert self.moves_left_head is not None, \
             "predict_moves_left() called with use_moves_left=False"
+        body = getattr(self.prediction, "pred_body", None)
+        if body is not None:
+            hidden = body(hidden)
         return self.moves_left_head(hidden)
 
     def predict_material(self, hidden: torch.Tensor) -> torch.Tensor:
         """Material-margin logits (B, 2*K+1) from a hidden state. Queried
         separately for the aux CE loss (training-only; not used by MCTS).
-        Target is STM-relative material, so no negamax flip."""
+        Target is STM-relative material, so no negamax flip.
+
+        DELIBERATELY reads the RAW latent, not the shared prediction body: this
+        head's entire purpose is to be a world-model regularizer — it pressures
+        the LATENT itself to encode material. Routing it through the prediction
+        body would let the body compute material while the latent stays vague,
+        defeating the regularization (its output is consumed nowhere at
+        inference, so head accuracy per se is worthless)."""
         assert self.material_head is not None, \
             "predict_material() called with use_material_head=False"
         return self.material_head(hidden)

@@ -97,6 +97,23 @@ class GameHistory:
     # alive. Drives self_play/tb_reach_rate — "how often does the model even reach
     # the stage where root TB probing fires?" Transient, not serialized.
     reached_tb: bool = False
+    # True iff this game was truncated at its first decisive in-TB ply and
+    # finished with a TB-optimal rollout (tb_rollout_fill): game_outcome is the
+    # tablebase verdict and the tail plies are demonstration targets. Exempted
+    # from resignation (the demonstration must not be re-truncated). Transient
+    # self-play stat (self_play/tb_fill_rate); not serialized.
+    tb_filled: bool = False
+    # True iff this game's POLICY targets are (partly) tablebase-authored —
+    # anchor games (stamped at injection) and rollout-filled games. Reanalyze
+    # must NEVER touch these: it would overwrite perfect demonstration targets
+    # with the (weaker-in-endgame) net's own MCTS visits. SERIALIZED, so the
+    # protection survives buffer save/load.
+    tb_authored: bool = False
+    # SAMPLING CHANNEL TAG (task #19, unified buffer): "" for organic games;
+    # "anchor" stamped at TB-anchor injection. NOT derivable from tb_authored
+    # alone (rollout-FILLED self-play games also set tb_authored for the
+    # reanalyze guard, but belong to the selfplay channel). Serialized.
+    channel_tag: str = ""
     # Per-ply STM-relative Syzygy value of the POSITION (DTZ-shaped), in [-1, 1],
     # NaN where the ply was not in TB range. Empty for games that never reached
     # the tablebase. When populated, make_target blends it into the VALUE target
@@ -136,6 +153,20 @@ class GameHistory:
 
     def __len__(self) -> int:
         return len(self.observations)
+
+    @property
+    def channel(self) -> str:
+        """Sampling channel (task #19): 'warmstart' (Stockfish-eval games),
+        'anchor' (injected TB demonstrations), or 'selfplay' (everything
+        organic, including rollout-filled games). Derived from existing
+        markers + channel_tag so legacy buffers need no migration (legacy
+        anchor games without the tag classify as selfplay — acceptable, they
+        only exist in pre-task-19 snapshots)."""
+        if self.external_values:
+            return "warmstart"
+        if self.channel_tag == "anchor":
+            return "anchor"
+        return "selfplay"
 
     def to_compact_dict(self) -> dict:
         """Pack into a minimal dict for storage: drops observations and
@@ -219,6 +250,10 @@ class GameHistory:
             d["start_fen"] = self.start_fen
         if self.reanalyze_count:
             d["reanalyze_count"] = int(self.reanalyze_count)
+        if self.tb_authored:
+            d["tb_authored"] = True
+        if self.channel_tag:
+            d["channel_tag"] = self.channel_tag
         return d
 
     @classmethod
@@ -265,6 +300,8 @@ class GameHistory:
         gh.draw_by_no_progress = bool(d.get("draw_by_no_progress", False))
 
         gh.reanalyze_count = int(d.get("reanalyze_count", 0))
+        gh.tb_authored = bool(d.get("tb_authored", False))
+        gh.channel_tag = str(d.get("channel_tag", ""))
         start_fen = d.get("start_fen")
         gh.start_fen = start_fen
         if start_fen is not None and hasattr(game, "reset_from_fen"):
@@ -339,7 +376,8 @@ class GameHistory:
                     material_value_weight: float = 0.0,
                     material_value_scale: float = 5.0,
                     tb_value_weight: float = 0.0,
-                    tb_policy_weight: float = 0.0):
+                    tb_policy_weight: float = 0.0,
+                    tb_value_hard: bool = False):
         """Create training target for a given position.
 
         Args:
@@ -504,9 +542,25 @@ class GameHistory:
             if (tb_w > 0.0 and ply_idx < len(self.tablebase_values)):
                 tv = self.tablebase_values[ply_idx]
                 if tv == tv:  # not NaN
-                    p_w, p_d, p_l = _eval_to_wdl(
-                        float(tv), alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta)
-                    tb_wdl = np.array([p_w, p_d, p_l], dtype=np.float32)
+                    if tb_value_hard:
+                        # Lc0-style HARD WDL: the tablebase outcome is certain, so
+                        # train the value head on a one-hot (win/draw/loss) instead of
+                        # softening it through eval_to_wdl (which caps W-L at ~0.88 and
+                        # never saturates). Saturates Q near ±1 → crisp win/draw
+                        # separation (refutes throws) + activates the |Q|-gated MLH,
+                        # which then carries the within-win distance. tv is the STM-POV
+                        # TB scalar (±1 / 0, or ±dtz-shaped if dtz_shape>0); threshold on
+                        # sign. Draw / cursed-win / blessed-loss → draw one-hot.
+                        if tv > 0.5:
+                            tb_wdl = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                        elif tv < -0.5:
+                            tb_wdl = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                        else:
+                            tb_wdl = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    else:
+                        p_w, p_d, p_l = _eval_to_wdl(
+                            float(tv), alpha=eval_to_wdl_alpha, beta=eval_to_wdl_beta)
+                        tb_wdl = np.array([p_w, p_d, p_l], dtype=np.float32)
                     legacy = (1.0 - tb_w) * legacy + tb_w * tb_wdl
             if q == 0.0:
                 return legacy.astype(np.float32)
@@ -739,8 +793,15 @@ class ReplayBuffer:
     """
 
     def __init__(self, max_size: int, warmstart_max_size: int | None = None,
-                 decisive_retention_multiplier: float = 1.0):
+                 decisive_retention_multiplier: float = 1.0,
+                 anchor_max_size: int | None = None):
         self.max_size = max_size
+        # Per-channel cap for injected TB-anchor demonstrations (task #19).
+        # None = legacy behavior (anchor games compete in the selfplay pool,
+        # so anchor share is EMERGENT from injection cadence vs eviction).
+        # Set => anchor becomes a third pool with its own within-pool eviction,
+        # making demonstration volume a chosen number.
+        self.anchor_max_size = anchor_max_size
         # Retention "lives": when > 1, a DECISIVE game's age counts this many times
         # slower for eviction, so it survives ~M× longer than a drawn game (lifting
         # the buffer's decisive-game density). 1.0 = plain oldest-first FIFO.
@@ -762,7 +823,7 @@ class ReplayBuffer:
         self._priorities: list[float] = []
         self.total_games = 0
 
-    def _eviction_victim(self, is_warm: bool | None) -> int | None:
+    def _eviction_victim(self, is_warm: bool | None, channel: str | None = None) -> int | None:
         """Index of the game to evict among the candidate pool.
 
         Evicts the game with the largest ``age / retention_weight`` — i.e. the one
@@ -771,12 +832,16 @@ class ReplayBuffer:
         So decisive games are evicted only once they're ~M× older than a draw would
         be → they persist ~M× longer. With multiplier 1.0 this is plain oldest-first.
 
-        ``is_warm`` selects the pool (True/False); None = legacy single pool.
+        ``channel`` (task #19) selects the candidate pool by GameHistory.channel;
+        else ``is_warm`` selects the legacy two-pool split; both None = single pool.
         """
         M = self.decisive_retention_multiplier
         best_i, best_score = None, -1.0
         for i, g in enumerate(self.buffer):
-            if is_warm is not None and bool(g.external_values) != is_warm:
+            if channel is not None:
+                if g.channel != channel:
+                    continue
+            elif is_warm is not None and bool(g.external_values) != is_warm:
                 continue
             age = self._save_counter - g.birth
             weight = M if (M > 1.0 and g.game_outcome != 0.0) else 1.0
@@ -791,7 +856,25 @@ class ReplayBuffer:
         game_history.birth = self._save_counter
         self._save_counter += 1
         is_warm = bool(game_history.external_values)
-        if self.warmstart_max_size is not None:
+        if self.anchor_max_size is not None:
+            # Three-pool eviction (task #19): each channel evicts only among
+            # itself once its cap is reached — every pool's volume is a CHOSEN
+            # number (warm = warmstart_max_size, anchor = anchor_max_size,
+            # selfplay = the remainder). Victims retention-weighted as before.
+            ch = game_history.channel
+            warm_cap = self.warmstart_max_size or 0
+            caps = {
+                "warmstart": warm_cap,
+                "anchor": self.anchor_max_size,
+                "selfplay": max(1, self.max_size - warm_cap - self.anchor_max_size),
+            }
+            cur = sum(1 for g in self.buffer if g.channel == ch)
+            if cur >= caps[ch]:
+                victim = self._eviction_victim(None, channel=ch)
+                if victim is not None:
+                    self.buffer.pop(victim)
+                    self._priorities.pop(victim)
+        elif self.warmstart_max_size is not None:
             # Two-pool eviction: if the relevant pool is at cap, evict within THAT
             # pool only (warmstart games can never be displaced by self-play). The
             # victim is retention-weighted (decisive games persist M× longer).
@@ -851,6 +934,8 @@ class ReplayBuffer:
         eval_to_wdl_beta: float = 2.0,
         warmstart_sample_frac: float = 0.0,
         decisive_sample_frac: float = 0.0,
+        batch_mixture: dict | None = None,
+        position_sampling: str = "per_game",
         q_ratio: float = 0.0,
         warmstart_q_ratio: float | None = None,
         selfplay_q_ratio: float | None = None,
@@ -862,8 +947,10 @@ class ReplayBuffer:
         tb_value_weight: float = 0.0,
         tb_moves_left_weight: float = 0.0,
         tb_policy_weight: float = 0.0,
+        tb_value_hard: bool = False,
         build_legal_masks: bool = False,
         build_material_target: bool = False,
+        symmetry_augment: bool = False,
     ) -> tuple[dict, np.ndarray, np.ndarray]:
         """Sample a batch of positions from stored games using PER.
 
@@ -892,6 +979,54 @@ class ReplayBuffer:
         #     gradient and the value head collapses to predicting "draw".
         # Modes are mutually exclusive (warmstart takes precedence). Both fall
         # back to flat PER when frac=0 or a stratum is empty.
+        _mix_indices = None
+        _mix_weights = None
+        if batch_mixture:
+            # CHANNEL MIXTURE (task #19, unified buffer): declarative batch
+            # composition over GameHistory.channel strata. Supersedes the
+            # two-stratum modes below (they still run for RNG-stream/back-compat
+            # but their picks are overridden). Mixture weights renormalize over
+            # channels that actually hold games (during warmup the selfplay
+            # channel is empty -> its share redistributes proportionally, so
+            # composition stays a CHOSEN ratio instead of an emergent one).
+            # Per-stratum PER probs + IS weights mirror the legacy math.
+            ch_indices: dict[str, list[int]] = {}
+            for i in range(n):
+                ch_indices.setdefault(self.buffer[i].channel, []).append(i)
+            active = {c: np.asarray(v, dtype=np.int64)
+                      for c, v in ch_indices.items()
+                      if v and float(batch_mixture.get(c, 0.0)) > 0.0}
+            if active:
+                tot_w = sum(float(batch_mixture[c]) for c in active)
+                # Largest-remainder rounding so counts hit batch_size exactly.
+                raw = {c: batch_size * float(batch_mixture[c]) / tot_w for c in active}
+                counts = {c: int(raw[c]) for c in active}
+                rem = batch_size - sum(counts.values())
+                for c in sorted(active, key=lambda c: raw[c] - int(raw[c]), reverse=True):
+                    if rem <= 0:
+                        break
+                    counts[c] += 1
+                    rem -= 1
+                idx_parts, w_parts = [], []
+                for c, idx_arr in active.items():
+                    k = counts[c]
+                    if k <= 0:
+                        continue
+                    p = probs[idx_arr]
+                    if position_sampling == "per_ply":
+                        # Weight games by length so every stored PLY is equally
+                        # likely — removes the hidden overweighting of short
+                        # (anchor) games under per-game-uniform sampling.
+                        p = p * np.array([max(len(self.buffer[i]), 1) for i in idx_arr],
+                                         dtype=np.float64)
+                    p = p / p.sum()
+                    picked = np.random.choice(len(idx_arr), size=k, p=p)
+                    idx_parts.append(idx_arr[picked])
+                    w_parts.append((len(idx_arr) * p[picked]) ** (-beta))
+                _mix_indices = np.concatenate(idx_parts)
+                _mix_weights = np.concatenate(w_parts)
+                _mix_weights = (_mix_weights / _mix_weights.max()).astype(np.float32)
+
         subset_idx_arr = None
         comp_idx_arr = None
         strat_frac = 0.0
@@ -940,6 +1075,11 @@ class ReplayBuffer:
             weights = (n * probs[game_indices]) ** (-beta)
             weights = (weights / weights.max()).astype(np.float32)
 
+        if _mix_indices is not None:
+            # Channel mixture supersedes the legacy pick (see block above).
+            game_indices = _mix_indices
+            weights = _mix_weights
+
         target_observations = []
         target_obs_masks = []
         actions_batch = []
@@ -949,6 +1089,7 @@ class ReplayBuffer:
         legal_masks_batch = []
         moves_left_batch = []
         material_batch = []
+        sym_reward_keep = []
 
         for g_idx in game_indices:
             game = self.buffer[g_idx]
@@ -969,7 +1110,36 @@ class ReplayBuffer:
                 material_value_scale=material_value_scale,
                 tb_value_weight=tb_value_weight,
                 tb_policy_weight=tb_policy_weight,
+                tb_value_hard=tb_value_hard,
             )
+            # D4 symmetry augmentation (src/training/symmetry.py): for pawnless,
+            # castle-free windows, apply ONE random group element to the whole
+            # sample — obs frames, unroll actions, policy targets (and the legal
+            # masks below) — value/DTM/material targets are invariants. Forces
+            # relative-geometry features over absolute-square memorization.
+            sym_g = 0
+            if symmetry_augment and game.game_name == "chess":
+                from .symmetry import (SAFE_ELEMENTS, transform_actions,
+                                       transform_obs, transform_policy_dense,
+                                       window_eligible)
+                if window_eligible(obs_list):
+                    # Draw from the parity-safe subgroup ONLY — see
+                    # symmetry.SAFE_ELEMENTS. R90/R270/diagonals corrupt
+                    # cross-ply frame consistency under STM encoding.
+                    sym_g = int(SAFE_ELEMENTS[np.random.randint(0, len(SAFE_ELEMENTS))])
+                    if sym_g:
+                        obs_list = [transform_obs(o, sym_g) for o in obs_list]
+                        actions = transform_actions(actions, sym_g)
+                        policies = [transform_policy_dense(p, sym_g) for p in policies]
+            # REWARD-PRECISION GUARD (2026-07-05 root cause): the reward head is
+            # the search's in-tree mate detector and THE conversion-critical
+            # component (muted-reward diag: 0.20 -> 0.048 conversion on the same
+            # weights). Training it on transformed views traded precision for
+            # recall (false mate-fire 0.12 -> 0.41), poisoning backups in winning
+            # subtrees. Reward learns from CANONICAL views only; the trainer
+            # renormalizes kept samples to preserve gradient magnitude. All
+            # other heads keep the full invariance pressure.
+            sym_reward_keep.append(0.0 if sym_g else 1.0)
             target_observations.append(torch.stack(obs_list))  # (K+1, C, H, W)
             target_obs_masks.append(obs_mask)
             actions_batch.append(actions)
@@ -1024,6 +1194,10 @@ class ReplayBuffer:
                             row = np.zeros(action_space_size, dtype=np.float32)
                             row[np.asarray(legal, dtype=np.int64)] = 1.0
                             lm[i] = row
+                if sym_g:
+                    from .symmetry import transform_legal_mask
+                    for i in range(num_unroll_steps + 1):
+                        lm[i] = transform_legal_mask(lm[i], sym_g)
                 legal_masks_batch.append(lm)
 
         target_observations_t = torch.stack(target_observations)  # (B, K+1, C, H, W)
@@ -1036,6 +1210,11 @@ class ReplayBuffer:
             [bool(self.buffer[i].external_values) for i in game_indices],
             dtype=bool,
         )
+        # Per-sample channel ids for composition logging + per-channel loss
+        # splits (task #19): 0=warmstart, 1=anchor, 2=selfplay.
+        _CH_ID = {"warmstart": 0, "anchor": 1, "selfplay": 2}
+        channel_ids = np.array(
+            [_CH_ID[self.buffer[i].channel] for i in game_indices], dtype=np.int64)
 
         batch = {
             # Root obs (k=0) kept at "observations" for back-compat with callers that
@@ -1052,7 +1231,12 @@ class ReplayBuffer:
             "target_policies": torch.from_numpy(np.stack(policies_batch)),
             "target_moves_left": torch.tensor(moves_left_batch, dtype=torch.float32),  # (B, K+1) plies-to-end
             "is_warmstart": torch.from_numpy(is_warmstart),
+            "channel_ids": torch.from_numpy(channel_ids),
         }
+        if symmetry_augment:
+            # 1.0 = canonical view (reward loss active), 0.0 = transformed
+            # (reward loss masked; see reward-precision guard above).
+            batch["sym_reward_keep"] = torch.tensor(sym_reward_keep, dtype=torch.float32)
         if build_material_target:
             batch["target_material"] = torch.tensor(material_batch, dtype=torch.float32)  # (B, K+1) STM material margin
         if build_legal_masks:
@@ -1181,8 +1365,14 @@ class ReplayBuffer:
         Warmstart games (``external_values`` populated) are excluded: their policy
         targets are supervised one-hots from Stockfish, and their value targets come
         from external_values directly — reanalyze would strictly degrade both.
+        TB-authored games (anchor / rollout-filled — ``tb_authored``) are excluded
+        for the same reason: their policy targets are tablebase demonstrations;
+        reanalyze would overwrite perfect targets with the net's own weaker visits.
         """
-        eligible = [i for i, g in enumerate(self.buffer) if not g.external_values]
+        eligible = [
+            i for i, g in enumerate(self.buffer)
+            if not g.external_values and not getattr(g, "tb_authored", False)
+        ]
         if not eligible:
             return np.array([], dtype=np.int64), []
         n = min(n, len(eligible))
