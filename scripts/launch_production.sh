@@ -6,6 +6,10 @@
 # Week-long run. Every setting below is either measured-in-arm or a
 # pre-registered conservative default; nothing is an inherited accident.
 # =============================================================================
+# SIMS: 800 (user decision 2026-07-08, endorsed): the compounding rule favors
+#   conservative-high search; the only production-scale datapoint (the 90%
+#   run) used 800; static 800-vs-400 flatness is not valid pricing evidence.
+#   If wall-clock forces a choice, KEEP 800 and reduce games/round.
 # HARDWARE KNOBS (set for the production GPU before launching):
 #   PAR_GAMES : parallel self-play games. 512 fits 32GB alongside training;
 #               1024 recommended on >=48GB (true replay-ratio reduction).
@@ -31,7 +35,7 @@ tmux new-session -d -s production "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:T
   --reward-head-planes 8 \
   --grad-checkpoint-attention \
   --use-gumbel --gumbel-m 16 --per-alpha 0 \
-  --num-simulations 400 \
+  --num-simulations 800 \
   --num-self-play-games $N_GAMES --num-parallel-games $PAR_GAMES \
   --replay-buffer-size $BUFFER \
   --steps $STEPS --eval-interval 2000 --mask-illegal-policy \

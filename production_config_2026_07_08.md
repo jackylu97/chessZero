@@ -22,7 +22,7 @@ principle cost us two runs to learn (strategy doc §11–13).
 | setting | value | evidence |
 |---|---|---|
 | algorithm | Plain Gumbel MuZero, m=16, root noise on in self-play | improvement guarantee; deterministic evals; validated across all arms |
-| **sims** | **400 — hard floor. Do not lower.** | 200-sim training regressed conversion 0.107→0.047 while general play soared; sweep equalized LOW (the net lost the skill, §16). **Standing rule: too little search fails compoundingly; too much costs linearly.** 800 is a legitimate upgrade if wall-clock affords it AFTER games/step is maxed |
+| **sims** | **800** (user decision; 400 remains the hard floor) | 200-sim training regressed conversion 0.107→0.047 while general play soared; sweep equalized LOW (the net lost the skill, §16). **Standing rule: too little search fails compoundingly; too much costs linearly.** if wall-clock forces a choice on the prod GPU: KEEP 800, reduce games/round — quality compounds, freshness loss is linear/visible |
 | policy targets | π′ (completed-Q), zero-target opening plies | Gumbel paper; opening ε-mixture below |
 | value targets | game z + fill + TB relabel, `--tb-value-hard` (one-hot at TB certainty) | hard-z exonerated by the near-mate gradient probe (§12); fixes the ±0.88/±1 inversion |
 | sampling | uniform (`--per-alpha 0`) | 3-way precedent consensus + protects demo channels. NOTE: PER in the old production stack was accidentally load-bearing (decisive concentration) — its jobs are now done deliberately by fill/anchor/mixture (§16 add.2) |

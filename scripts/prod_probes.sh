@@ -17,12 +17,18 @@ while true; do
     echo "-- reward precision:" >> $LOG
     CFG=chess_hybrid_xl REWARD_PLANES=8 POLICY_HEAD=from_to PYTHONPATH=. \
       .venv/bin/python -u scripts/probe_reward_precision.py "$CK" >> $LOG 2>&1
-    echo "-- conversion diag (80-ply, N=250):" >> $LOG
+    echo "-- conversion diag (80-ply, N=250, SIMS=800 = training conditions):" >> $LOG
+    CKPT="$CK" CFG=chess_hybrid_xl USE_ATTENTION=1 USE_SMOLGEN=1 USE_DYN_ATTENTION=1 \
+      USE_PRED_ATTENTION=1 MLH_PLANES=8 MLH_BLOCKS=0 USE_GUMBEL=1 SIMS=800 \
+      REWARD_PLANES=8 POLICY_HEAD=from_to N_WON=250 SKIP_TERM=1 PYTHONPATH=. \
+      .venv/bin/python -u scripts/diag_perconfig_mcts.py 2>&1 | \
+      grep -E "CONVERTED|mean plies|K.vK|OutOfMemory" >> $LOG
+    echo "-- conversion diag (SIMS=400, historical comparability):" >> $LOG
     CKPT="$CK" CFG=chess_hybrid_xl USE_ATTENTION=1 USE_SMOLGEN=1 USE_DYN_ATTENTION=1 \
       USE_PRED_ATTENTION=1 MLH_PLANES=8 MLH_BLOCKS=0 USE_GUMBEL=1 SIMS=400 \
       REWARD_PLANES=8 POLICY_HEAD=from_to N_WON=250 SKIP_TERM=1 PYTHONPATH=. \
       .venv/bin/python -u scripts/diag_perconfig_mcts.py 2>&1 | \
-      grep -E "CONVERTED|mean plies|K.vK|OutOfMemory" >> $LOG
+      grep -E "CONVERTED|mean plies" >> $LOG
     SEEN="$SEEN $CK"
   done
   sleep 1800
