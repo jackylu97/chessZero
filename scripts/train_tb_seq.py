@@ -111,6 +111,7 @@ def evaluate(mcts_sims=None):
     gconv = play(greedy)
     mconv = None
     if mcts_sims:
+      try:
         from src.mcts.tensor_mcts import TensorMCTS
         cfg.num_simulations = mcts_sims; cfg.moves_left_mcts = True; cfg.tb_root_probe = False
         m = TensorMCTS(net, game, cfg, device=DEV, hidden_dtype=torch.float32, select_backend="eager")
@@ -127,6 +128,10 @@ def evaluate(mcts_sims=None):
                 res.append(mv if (mv is not None and mv in b.legal_moves) else list(b.legal_moves)[0])
             return res
         mconv = play(mmove)
+      except torch.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        print("  (MCTS eval skipped: OOM under co-running load)", flush=True)
+        mconv = None
     net.train(); return vacc, pacc, gconv, mconv, mlw, mld
 
 print(f"params: {sum(p.numel() for p in net.parameters())/1e6:.2f}M", flush=True)

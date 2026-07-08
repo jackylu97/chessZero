@@ -391,11 +391,13 @@ def main():
                              "DECISIVE games in the replay buffer ~M× longer than draws "
                              "(retention-weighted eviction), raising decisive density. "
                              "1.0 = FIFO. At ~5%% decisive inflow: M=7 → ~27%% of buffer decisive.")
-    parser.add_argument("--policy-head-type", choices=["flat", "conv"], default=None,
+    parser.add_argument("--policy-head-type", choices=["flat", "conv", "from_to"], default=None,
                         help="Override config.policy_head_type. 'conv' = AlphaZero spatial "
-                             "73-plane policy head (chess only; removes the flat head's "
-                             "channel bottleneck). Changes the policy-head shape, so a "
-                             "checkpoint trained with the other type won't load its policy head.")
+                             "73-plane policy head (chess only). 'from_to' = relational bilinear "
+                             "from/to-square head (2026-07-08 arch sweep arm C: +48%% proxy MCTS "
+                             "conversion vs conv at matched steps; codec-parity tested). Changes "
+                             "the policy-head shape, so a checkpoint trained with another type "
+                             "won't load its policy head.")
     parser.add_argument("--warmstart-buffer-size", type=int, default=None,
                         help="Override config.warmstart_buffer_size. Enables the "
                              "TWO-POOL buffer: this many slots are reserved for "
