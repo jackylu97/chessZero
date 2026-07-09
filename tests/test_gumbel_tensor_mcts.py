@@ -169,3 +169,79 @@ def test_gumbel_matches_numpy_oracle():
             f"game {i}: tensor chose {t_act[i]}, numpy oracle {a_np}")
         np.testing.assert_allclose(t_pol[i], pi_np, atol=2e-3,
                                    err_msg=f"game {i} π' mismatch")
+
+
+def _unzero_all(net):
+    """Head-agnostic un-zeroing: randomize EVERY policy-head parameter so root
+    logits are distinct. Works for any head (conv/flat/from_to) without needing
+    to know its internal param names. Zero-init heads tie -> ambiguous Gumbel
+    top-m tie-break -> spurious parity mismatch."""
+    torch.manual_seed(11)
+    for p in net.prediction.policy_head.parameters():
+        torch.nn.init.normal_(p, std=0.05)
+    return net
+
+
+@pytest.mark.skipif(DEV == "cpu", reason="tensor MCTS targets CUDA")
+def test_gumbel_from_to_head_matches_numpy_oracle():
+    """PRODUCTION-PATH coverage: the run uses --policy-head-type from_to, but the
+    shipped Gumbel tests only build the conv head. Both MCTS engines consume the
+    same net logits, so parity should hold — verify the GPU-resident Gumbel
+    (run_batch_gpu) matches the numpy BatchedMCTS oracle with the from_to
+    relational head at the production m=16."""
+    from src.mcts.mcts import BatchedMCTS, select_action_gumbel
+    from src.mcts.tensor_mcts import TensorMCTS
+    game = ChessGame()
+    cfg = _gumbel_cfg(num_sims=32, m=16)
+    cfg.policy_head_type = "from_to"
+    net = _unzero_all(_tiny_net(game, cfg))
+    obs, legal_mask, legal_lists = _obs_and_legal(game)
+
+    t_mcts = TensorMCTS(net, game, cfg, device=DEV,
+                        hidden_dtype=torch.float32, select_backend="eager")
+    rd = t_mcts.run_batch_gpu(obs, legal_mask, add_noise=True)
+    t_act = rd["gumbel_action"].cpu().numpy()
+    t_pol = rd["gumbel_policy"].cpu().numpy()
+
+    A = game.action_space_size
+    for i, ll in enumerate(legal_lists):
+        assert int(t_act[i]) in ll, "from_to+gumbel chose an illegal action"
+        assert abs(t_pol[i].sum() - 1.0) < 1e-4
+        illegal = np.setdiff1d(np.arange(A), np.asarray(ll))
+        assert t_pol[i][illegal].max() == 0.0, "π' nonzero on illegal action"
+
+    n_mcts = BatchedMCTS(net, game, cfg, DEV)
+    roots = n_mcts.run_batch([obs[i].cpu() for i in range(2)],
+                             legal_lists, add_noise=True)
+    for i, root in enumerate(roots):
+        a_np, pi_np = select_action_gumbel(root, cfg, game.action_space_size)
+        assert int(t_act[i]) == int(a_np), (
+            f"from_to game {i}: tensor chose {t_act[i]}, numpy oracle {a_np}")
+        np.testing.assert_allclose(t_pol[i], pi_np, atol=2e-3,
+                                   err_msg=f"from_to game {i} π' mismatch")
+
+
+@pytest.mark.skipif(DEV == "cpu", reason="tensor MCTS targets CUDA")
+def test_gumbel_compile_backend_matches_eager():
+    """PRODUCTION-PATH coverage: self-play runs select_backend='compile' (or
+    triton->compile downgrade under gumbel); the other tests use 'eager'. The
+    compiled selector must produce byte-identical Gumbel output to eager."""
+    from src.mcts.tensor_mcts import TensorMCTS
+    game = ChessGame()
+    cfg = _gumbel_cfg(num_sims=32, m=16)
+    cfg.policy_head_type = "from_to"
+    net = _unzero_all(_tiny_net(game, cfg))
+    obs, legal_mask, _ = _obs_and_legal(game)
+
+    def run(backend):
+        m = TensorMCTS(net, game, cfg, device=DEV, hidden_dtype=torch.float32,
+                       select_backend=backend)
+        rd = m.run_batch_gpu(obs.clone(), legal_mask.clone(), add_noise=True)
+        return rd["gumbel_action"].cpu().numpy(), rd["gumbel_policy"].cpu().numpy()
+
+    a_eager, p_eager = run("eager")
+    a_comp, p_comp = run("compile")
+    assert np.array_equal(a_eager, a_comp), (
+        f"compile chose {a_comp} vs eager {a_eager}")
+    np.testing.assert_allclose(p_comp, p_eager, atol=1e-5,
+                               err_msg="compile π' != eager π'")
