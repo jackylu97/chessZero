@@ -1493,13 +1493,15 @@ class MuZeroTrainer:
         self.network.eval()
         # MCTS backend dispatch. Default: numpy BatchedMCTS (same path the
         # codebase shipped with). Opt-in: GPU TensorMCTS via the same factory
-        # self-play uses — significantly faster per position. Gumbel root not
-        # supported in TensorMCTS yet, so we hard-fail if the user combines flags.
+        # self-play uses — significantly faster per position. This reanalyze path
+        # uses TensorMCTS.run_batch, which does not route the Gumbel root (that
+        # lives on run_batch_gpu / GPU-resident self-play), so we hard-fail the combo.
         if getattr(self.config, "reanalyze_use_tensor_mcts", False):
             if use_gumbel:
                 raise NotImplementedError(
                     "reanalyze_use_tensor_mcts=True is not compatible with "
-                    "use_gumbel=True (TensorMCTS lacks Gumbel root)."
+                    "use_gumbel=True: the reanalyze TensorMCTS.run_batch path "
+                    "does not route the Gumbel root (only run_batch_gpu does)."
                 )
             from ..mcts.tensor_mcts import TensorMCTS
             _dtype_map = {

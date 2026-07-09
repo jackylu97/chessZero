@@ -24,9 +24,18 @@ v1 scope (per ``plan_tensor_mcts_implementation.md``):
   same conceptual subtree. Dedup happens in the compat shim before priors and
   visit counts are exposed to ``select_action``.
 
+Added after v1:
+
+- Gumbel MuZero root (Sequential Halving + completed-Q, Danihelka 2022),
+  2026-07-04. Enabled via ``config.use_gumbel``; see ``__init__`` (``_use_gumbel``)
+  and ``_initialize_root_gumbel``. Oracle-parity-tested vs ``BatchedMCTS`` in
+  ``tests/test_gumbel_tensor_mcts``. The GPU-resident self-play path
+  (``play_games_parallel_gpu_resident``) drives it directly via ``run_batch_gpu``.
+  NOTE: the ``triton`` select backend has no root-override; it auto-downgrades to
+  ``compile`` when ``use_gumbel`` is set.
+
 Out of scope for v1:
 
-- Gumbel root (Sequential Halving). Caller must keep ``use_gumbel=False``.
 - Full-action root expansion. ``config.sample_k`` must be set; for tiny action
   spaces fall back to the existing ``BatchedMCTS``.
 """

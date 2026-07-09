@@ -16,16 +16,21 @@ def _make_batched_mcts(network, game, config, device):
     """Build the configured batched-MCTS implementation.
 
     Default: numpy-backed ``BatchedMCTS``. With ``config.use_tensor_mcts``
-    set, swap in the GPU tensor-native ``TensorMCTS`` (0 syncs/sim, 1 sync/ply,
-    Sampled MuZero only — Gumbel root not yet implemented in the tensor path).
+    set, swap in the GPU tensor-native ``TensorMCTS`` (0 syncs/sim, 1 sync/ply).
     Both expose the same ``run_batch(observations, legal_actions_list,
     add_noise=True)`` signature returning a list of ``MCTSNode``-equivalents.
+    NOTE: TensorMCTS's Gumbel root (added 2026-07-04) is wired only on its
+    GPU-resident ``run_batch_gpu`` path (used by
+    ``play_games_parallel_gpu_resident``); this ``run_batch`` factory path is
+    Sampled-MuZero-only, hence the guard below.
     """
     if getattr(config, "use_tensor_mcts", False):
         if getattr(config, "use_gumbel", False):
             raise NotImplementedError(
-                "TensorMCTS does not support Gumbel root (use_gumbel=True). "
-                "Either disable use_gumbel or use BatchedMCTS."
+                "This make_mcts path uses TensorMCTS.run_batch, which does not "
+                "route the Gumbel root — that lives on run_batch_gpu (the "
+                "GPU-resident self-play path). Use use_gpu_resident_self_play, "
+                "or BatchedMCTS, with use_gumbel=True."
             )
         from ..mcts.tensor_mcts import TensorMCTS
         dtype_str = getattr(config, "tensor_mcts_hidden_dtype", "float32")
