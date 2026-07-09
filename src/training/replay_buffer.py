@@ -862,7 +862,16 @@ class ReplayBuffer:
             # number (warm = warmstart_max_size, anchor = anchor_max_size,
             # selfplay = the remainder). Victims retention-weighted as before.
             ch = game_history.channel
-            warm_cap = self.warmstart_max_size or 0
+            # warmstart_max_size=None means UNBOUNDED — warmstart fills the whole
+            # non-anchor remainder. Matches the two-pool branch's treatment of None
+            # and is what the warmup two-phase sizing relies on (trainer sets
+            # warmstart_max_size=None so warmstart fills the buffer before the
+            # self-play boundary trims it to warmstart_buffer_size). Without this,
+            # `None or 0` capped warmstart at 0 and every injected game was evicted.
+            if self.warmstart_max_size is not None:
+                warm_cap = self.warmstart_max_size
+            else:
+                warm_cap = self.max_size - self.anchor_max_size
             caps = {
                 "warmstart": warm_cap,
                 "anchor": self.anchor_max_size,

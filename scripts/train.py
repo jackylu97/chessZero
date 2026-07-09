@@ -398,6 +398,11 @@ def main():
                              "conversion vs conv at matched steps; codec-parity tested). Changes "
                              "the policy-head shape, so a checkpoint trained with another type "
                              "won't load its policy head.")
+    parser.add_argument("--replay-buffer-size", type=int, default=None,
+                        help="Override config.replay_buffer_size (total games held "
+                             "in the replay buffer). Scale with games/round to keep "
+                             "passes-per-position near target (~3): 5120 @512 games, "
+                             "10240 @1024.")
     parser.add_argument("--warmstart-buffer-size", type=int, default=None,
                         help="Override config.warmstart_buffer_size. Enables the "
                              "TWO-POOL buffer: this many slots are reserved for "
@@ -645,6 +650,8 @@ def main():
         config.mask_illegal_policy = True
     if args.illegal_policy_penalty is not None:
         config.illegal_policy_penalty = args.illegal_policy_penalty
+    if args.replay_buffer_size is not None:
+        config.replay_buffer_size = args.replay_buffer_size
     if args.warmstart_buffer_size is not None:
         if args.warmstart_buffer_size >= config.replay_buffer_size:
             parser.error(

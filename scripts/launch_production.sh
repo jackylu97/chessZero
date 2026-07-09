@@ -10,6 +10,11 @@
 #   conservative-high search; the only production-scale datapoint (the 90%
 #   run) used 800; static 800-vs-400 flatness is not valid pricing evidence.
 #   If wall-clock forces a choice, KEEP 800 and reduce games/round.
+# GAMES/ROUND: 2026-07-09 — cut 1024->512 (resumed @ checkpoint_31000). XL
+#   dynamics-attention self-play is ~10x chess_small: at 1024 games/800 sims one
+#   round is ~2h and BLOCKS training -> ~94-day ETA. Halving -> ~7-8wk, reuse
+#   ~1.65->3.3. Kept 800 sims + max_plies per user (further trims cost quality).
+#   See memory prod-run-halved-games-selfplay. Resume via RESUME=<ckpt.pt> knob.
 # HARDWARE KNOBS (set for the production GPU before launching):
 #   PAR_GAMES : parallel self-play games. 512 fits 32GB alongside training;
 #               1024 recommended on >=48GB (true replay-ratio reduction).
@@ -25,15 +30,16 @@ N_GAMES="${N_GAMES:-512}"
 BUFFER="${BUFFER:-5120}"
 STEPS="${STEPS:-600000}"
 RUN="${RUN:-2026_07_08_production}"
+RESUME="${RESUME:-}"   # optional: path to checkpoint_*.pt to resume from (buffer auto-loaded from sibling .buf)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 tmux kill-session -t production 2>/dev/null
 tmux new-session -d -s production "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. \
   .venv/bin/python -u scripts/_faulthandler_bootstrap.py scripts/train.py \
   --game chess_hybrid_xl --run-id $RUN --device cuda \
+  ${RESUME:+--resume $RESUME} \
   --policy-head-type from_to \
   --reward-head-planes 8 \
-  --grad-checkpoint-attention \
   --use-gumbel --gumbel-m 16 --per-alpha 0 \
   --num-simulations 800 \
   --num-self-play-games $N_GAMES --num-parallel-games $PAR_GAMES \
