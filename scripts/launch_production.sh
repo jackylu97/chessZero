@@ -45,11 +45,11 @@ tmux new-session -d -s production "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:T
   --num-self-play-games $N_GAMES --num-parallel-games $PAR_GAMES \
   --replay-buffer-size $BUFFER \
   --steps $STEPS --eval-interval 2000 --mask-illegal-policy \
-  --self-play-warmup-steps 30000 --warmstart-buffer-size 300 \
+  --self-play-warmup-frac 0.05 --warmstart-buffer-size 300 \
   --stockfish-injection-path data/stockfish_injection \
   --stockfish-injection-games 300 --stockfish-injection-interval 256 \
   --warmstart-sample-frac 0.4 --warmstart-sample-frac-final 0.1 --warmstart-anneal-frac 0.6 \
-  --batch-mixture-schedule '[[0.00,{\"warmstart\":0.70,\"anchor\":0.30,\"selfplay\":0.00}],[0.10,{\"warmstart\":0.40,\"anchor\":0.15,\"selfplay\":0.45}],[0.40,{\"warmstart\":0.20,\"anchor\":0.10,\"selfplay\":0.70}],[0.60,{\"warmstart\":0.10,\"anchor\":0.10,\"selfplay\":0.80}]]' \
+  --batch-mixture-schedule '[[0.00,{\"warmstart\":0.70,\"anchor\":0.30,\"selfplay\":0.00}],[0.05,{\"warmstart\":0.40,\"anchor\":0.15,\"selfplay\":0.45}],[0.40,{\"warmstart\":0.20,\"anchor\":0.10,\"selfplay\":0.70}],[0.60,{\"warmstart\":0.10,\"anchor\":0.10,\"selfplay\":0.80}]]' \
   --anchor-max-size 1024 \
   --merged-seed-batch \
   --opening-mix-mean-plies 6 \

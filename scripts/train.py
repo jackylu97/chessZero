@@ -120,6 +120,14 @@ def main():
                              "warmstart pretrain), then flip on for the rest of "
                              "training. The warmstart anchor persists into phase 2. "
                              "0 = legacy pool-exhaustion gate.")
+    parser.add_argument("--self-play-warmup-frac", type=float, default=None,
+                        help="Fractional form of --self-play-warmup-steps (fraction "
+                             "of training_steps), for notation consistency with "
+                             "--batch-mixture-schedule. Resolves to "
+                             "round(frac * training_steps); takes precedence over "
+                             "--self-play-warmup-steps if both are given. Keeps the "
+                             "self-play boundary aligned with the mixture's self-play "
+                             "onset when training_steps changes.")
     parser.add_argument("--warmstart-q-ratio", type=float, default=None,
                         help="Override config.warmstart_q_ratio. Weight on the "
                              "GAME-OUTCOME blend into the Stockfish-eval WDL target "
@@ -502,6 +510,15 @@ def main():
         config.warmstart_anneal_frac = args.warmstart_anneal_frac
     if args.self_play_warmup_steps is not None:
         config.self_play_warmup_steps = args.self_play_warmup_steps
+    # Fractional form takes precedence and resolves against the FINAL training_steps
+    # (set above from --steps), so it stays aligned with the mixture schedule.
+    if args.self_play_warmup_frac is not None:
+        config.self_play_warmup_frac = args.self_play_warmup_frac
+        config.self_play_warmup_steps = int(round(args.self_play_warmup_frac
+                                                   * config.training_steps))
+        print(f"self-play warmup: frac {args.self_play_warmup_frac:.4f} x "
+              f"{config.training_steps} steps = {config.self_play_warmup_steps} "
+              f"(fractional; matches --batch-mixture-schedule notation)")
     if args.warmstart_q_ratio is not None:
         config.warmstart_q_ratio = args.warmstart_q_ratio
     if args.selfplay_q_ratio is not None:

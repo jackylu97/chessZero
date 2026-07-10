@@ -95,6 +95,14 @@ class MuZeroConfig:
     # self-play phase. 0 = disabled → fall back to the legacy pool-exhaustion
     # gate (self-play turns on when the injection pool runs dry).
     self_play_warmup_steps: int = 0
+    # Optional FRACTIONAL form of the above, for notation consistency with the
+    # batch-mixture schedule (which is expressed in fractions of training_steps).
+    # When set (not None), resolves to self_play_warmup_steps = round(frac *
+    # training_steps) at launch, so the self-play-generation boundary and the
+    # mixture's self-play-onset scale together instead of drifting apart when
+    # training_steps changes (the 30k-vs-60k misalignment). None = use the
+    # absolute self_play_warmup_steps above.
+    self_play_warmup_frac: float | None = None
     num_parallel_games: int = 1    # games to run simultaneously in batched MCTS (1 = serial)
     random_opening_plies: int = 0  # play N random legal moves before MCTS; 0 = disabled
 
