@@ -31,6 +31,7 @@ BUFFER="${BUFFER:-5120}"
 STEPS="${STEPS:-600000}"
 RUN="${RUN:-2026_07_08_production}"
 RESUME="${RESUME:-}"   # optional: path to checkpoint_*.pt to resume from (buffer auto-loaded from sibling .buf)
+INTERVAL="${INTERVAL:-}"  # optional: training steps between self-play rounds; scale with N_GAMES to hold reuse
 set -uo pipefail
 cd "$(dirname "$0")/.."
 tmux kill-session -t production 2>/dev/null
@@ -43,6 +44,7 @@ tmux new-session -d -s production "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:T
   --use-gumbel --gumbel-m 16 --per-alpha 0 \
   --num-simulations 800 \
   --num-self-play-games $N_GAMES --num-parallel-games $PAR_GAMES \
+  ${INTERVAL:+--self-play-interval $INTERVAL} \
   --replay-buffer-size $BUFFER \
   --steps $STEPS --eval-interval 2000 --mask-illegal-policy \
   --self-play-warmup-frac 0.05 --warmstart-buffer-size 300 \

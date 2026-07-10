@@ -102,6 +102,10 @@ def main():
                         help="Override config.num_parallel_games.")
     parser.add_argument("--num-self-play-games", type=int, default=None,
                         help="Override config.num_self_play_games (games per self-play phase).")
+    parser.add_argument("--self-play-interval", type=int, default=None,
+                        help="Override config.self_play_interval (training steps between "
+                             "self-play rounds). Scale with num_self_play_games to hold the "
+                             "reuse ratio (batch*interval)/(games*avg_len) constant.")
     parser.add_argument("--warmstart-sample-frac", type=float, default=None,
                         help="Override config.warmstart_sample_frac. Set to 0.0 "
                              "for a pure-self-play run with no warmstart anchor "
@@ -502,6 +506,8 @@ def main():
         config.num_parallel_games = args.num_parallel_games
     if args.num_self_play_games is not None:
         config.num_self_play_games = args.num_self_play_games
+    if args.self_play_interval is not None:
+        config.self_play_interval = args.self_play_interval
     if args.warmstart_sample_frac is not None:
         config.warmstart_sample_frac = args.warmstart_sample_frac
     if args.warmstart_sample_frac_final is not None:
