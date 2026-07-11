@@ -436,13 +436,18 @@ def game(i: int):
     })
 
 
-def load_or_build_records(buffer_path: str, force_rebuild: bool = False) -> list[GameRecord]:
+def load_or_build_records(buffer_path: str, force_rebuild: bool = False,
+                          max_games: int | None = None) -> list[GameRecord]:
     """Return decoded GameRecords for a buffer, using a sidecar cache when fresh.
 
     Cache path: `<buffer_path>.viewer.pkl`. Rebuilt if missing, older than the
-    buffer, or if --rebuild-cache is passed.
+    buffer, or if --rebuild-cache is passed. ``max_games`` decodes only the last
+    N games (most recent), which skips the expensive per-game replay of the whole
+    buffer — the file is still fully unpickled, but decoding dominates. Subsets
+    get their own cache so they don't clobber the full one.
     """
-    cache_path = buffer_path + ".viewer4.pkl"  # v4: policy_top carries uci (for arrows)
+    suffix = f".m{max_games}" if max_games else ""
+    cache_path = buffer_path + f".viewer4{suffix}.pkl"  # v4: policy_top carries uci (for arrows)
     if not force_rebuild and os.path.exists(cache_path):
         if os.path.getmtime(cache_path) >= os.path.getmtime(buffer_path):
             print(f"Loading cache {cache_path} ...")
@@ -461,6 +466,9 @@ def load_or_build_records(buffer_path: str, force_rebuild: bool = False) -> list
     rb = ReplayBuffer(max_size=10_000_000)
     rb.load(buffer_path, game=GAME_REGISTRY["chess"]())
     buf = rb.buffer
+    if max_games and len(buf) > max_games:
+        buf = buf[-max_games:]  # most-recent N games
+        print(f"  --max-games {max_games}: keeping last {len(buf)} of {len(rb.buffer)} games")
     print(f"  unpickled in {time.time()-t0:.1f}s, {len(buf)} games. Decoding moves...")
     t1 = time.time()
     recs = [decode_game(g, i) for i, g in enumerate(buf)]
@@ -483,10 +491,14 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--rebuild-cache", action="store_true",
                         help="Ignore existing viewer cache and rebuild from the buffer.")
+    parser.add_argument("--max-games", type=int, default=None,
+                        help="Only decode the last N (most-recent) games — much faster "
+                             "first-load on big buffers.")
     args = parser.parse_args()
     BUFFER_PATH = args.buffer
 
-    recs = load_or_build_records(args.buffer, force_rebuild=args.rebuild_cache)
+    recs = load_or_build_records(args.buffer, force_rebuild=args.rebuild_cache,
+                                 max_games=args.max_games)
     recs.sort(key=lambda r: (r.captures, r.num_plies))
     RECORDS = recs
     print(f"  Sorted {len(RECORDS)} games by (captures asc, length asc). "
