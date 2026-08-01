@@ -22,10 +22,14 @@ from src.training.replay_buffer import stack_with_history
 
 # endgame type -> (white extra pieces, black extra pieces). Kings always present.
 TYPES = {
-    "KQ_v_K":   ([chess.QUEEN], []),
-    "KR_v_K":   ([chess.ROOK], []),
-    "KRR_v_K":  ([chess.ROOK, chess.ROOK], []),
-    "KQ_v_KR":  ([chess.QUEEN], [chess.ROOK]),
+    # <=5-man baselines (IN the 5-man syzygy tablebase -> directly supervised)
+    "5man_KQ_v_K":     ([chess.QUEEN], []),                                                 # 3 total
+    "5man_KQ_v_KR":    ([chess.QUEEN], [chess.ROOK]),                                       # 4 total
+    # 6-8 man (OUT of the tablebase -> conversion must GENERALIZE past direct supervision)
+    "6man_KQRR_v_KR":  ([chess.QUEEN, chess.ROOK, chess.ROOK], [chess.ROOK]),               # 6 total
+    "7man_KQRR_v_KRN": ([chess.QUEEN, chess.ROOK, chess.ROOK], [chess.ROOK, chess.KNIGHT]), # 7 total
+    "8man_KQQR_v_KRNB":([chess.QUEEN, chess.QUEEN, chess.ROOK],
+                        [chess.ROOK, chess.KNIGHT, chess.BISHOP]),                          # 8 total
 }
 
 
@@ -33,6 +37,8 @@ def load_network(ckpt_path, game, cfg, device):
     torch.serialization.add_safe_globals([MuZeroConfig])
     sd = torch.load(ckpt_path, map_location=device, weights_only=True)["model_state_dict"]
     has_conv = any(".policy_head.mix." in k or ".policy_head.proj." in k for k in sd)
+    has_from_to = any(".policy_head.q_proj." in k or ".policy_head.k_proj." in k for k in sd)
+    policy_head_type = "from_to" if has_from_to else ("conv" if has_conv else "flat")
     has_ml = any(k.startswith("moves_left_head.") for k in sd)
     has_cons = any(k.startswith("projection.") for k in sd)
     has_inv = any(k.startswith("inverse_dynamics_head.") for k in sd)
@@ -42,21 +48,33 @@ def load_network(ckpt_path, game, cfg, device):
         outw = next((v for k, v in sd.items() if k.startswith("material_head.")
                      and v.ndim == 2 and v.shape[0] % 2 == 1 and v.shape[0] < v.shape[1]*4), None)
         if outw is not None: ms = (outw.shape[0]-1)//2
+    rhp = getattr(cfg, "reward_head_planes", 1)
+    rw = sd.get("dynamics.reward_head.0.weight")
+    if rw is not None: rhp = int(rw.shape[0])
     net = MuZeroNetwork(
         observation_channels=game.num_planes*getattr(cfg,"history_frames",1),
         action_space_size=game.action_space_size, hidden_planes=cfg.hidden_planes,
         num_blocks=cfg.num_residual_blocks, latent_h=cfg.latent_h, latent_w=cfg.latent_w,
         input_h=game.board_size[0], input_w=game.board_size[1], fc_hidden=cfg.fc_hidden,
         value_support_size=cfg.value_support_size, reward_support_size=cfg.reward_support_size,
+        reward_head_planes=rhp,
         action_embed_dim=getattr(cfg,"action_embed_dim",16),
         use_consistency_loss=has_cons, proj_hid=cfg.proj_hid, proj_out=cfg.proj_out,
         pred_hid=cfg.pred_hid, pred_out=cfg.pred_out, use_scalar_transform=cfg.use_scalar_transform,
         value_target_scale=cfg.value_target_scale, value_head_type=getattr(cfg,"value_head_type","support"),
         draw_score=getattr(cfg,"draw_score",0.0),
         use_inverse_dynamics_loss=has_inv, inverse_dynamics_hidden=getattr(cfg,"inverse_dynamics_hidden",256),
-        policy_head_type="conv" if has_conv else "flat",
+        policy_head_type=policy_head_type,
         use_moves_left=has_ml, moves_left_support_size=getattr(cfg,"moves_left_support_size",10),
         use_material_head=has_mat, material_head_support_size=ms,
+        value_head_planes=getattr(cfg,"value_head_planes",1), value_head_blocks=getattr(cfg,"value_head_blocks",0),
+        moves_left_head_planes=getattr(cfg,"moves_left_head_planes",1),
+        moves_left_head_blocks=getattr(cfg,"moves_left_head_blocks",0),
+        use_repr_attention=getattr(cfg,"use_repr_attention",False),
+        use_dyn_attention=getattr(cfg,"use_dyn_attention",False),
+        use_pred_attention=getattr(cfg,"use_pred_attention",False), use_smolgen=getattr(cfg,"use_smolgen",True),
+        attn_layers=getattr(cfg,"attn_layers",4), attn_heads=getattr(cfg,"attn_heads",4),
+        pred_attn_layers=getattr(cfg,"pred_attn_layers",2), hybrid_stem_blocks=getattr(cfg,"hybrid_stem_blocks",0),
     )
     net.load_state_dict(sd); net.to(device); net.eval()
     return net

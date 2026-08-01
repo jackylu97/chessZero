@@ -189,6 +189,14 @@ def main():
     parser.add_argument("--reanalyze-interval", type=int, default=None,
                         help="Override config.reanalyze_interval (training steps between "
                              "reanalyze calls; 0 = disabled). Preset 1024.")
+    parser.add_argument("--reanalyze-batch-size", type=int, default=None,
+                        help="Override config.reanalyze_batch_size (games re-searched per "
+                             "reanalyze call). Preset 1400 (chess).")
+    parser.add_argument("--reanalyze-sims", type=int, default=None,
+                        help="Override config.reanalyze_num_simulations (MCTS sims per "
+                             "position during reanalyze; default None = num_simulations). "
+                             "Set low (e.g. 128) to make reanalyze affordable on big nets — "
+                             "Gumbel keeps its policy-improvement guarantee at low sim counts.")
     parser.add_argument("--material-value-weight", type=float, default=None,
                         help="Override config.material_value_weight (KataGo c_score "
                              "analogue). w in [0,1]: blends a material-margin WDL into the "
@@ -383,6 +391,11 @@ def main():
                         help="Override config.resign_holdout_frac (AlphaZero-style): fraction of "
                              "would-resign games played to completion to measure the false-positive "
                              "rate (self_play/resign_false_positive_rate; tune threshold to <5%%). Preset 0.15.")
+    parser.add_argument("--resign-draws-only", action="store_true", default=False,
+                        help="2026-07-20 relabel policy: resignation never overwrites a decisive "
+                             "natural outcome (true losses keep label+tail, comeback wins keep the "
+                             "win); only oracle-free DRAWS are flipped to a loss, with a TB-drawn-"
+                             "final veto. See resignation_relabel_policy_2026_07_20.md.")
     parser.add_argument("--resign-threshold", type=float, default=None,
                         help="Override config.resign_threshold (STM-POV root value; ≈≤5%% "
                              "expected score). Preset -0.9.")
@@ -553,6 +566,10 @@ def main():
         config.decisive_sample_frac = args.decisive_sample_frac
     if args.reanalyze_interval is not None:
         config.reanalyze_interval = args.reanalyze_interval
+    if args.reanalyze_batch_size is not None:
+        config.reanalyze_batch_size = args.reanalyze_batch_size
+    if args.reanalyze_sims is not None:
+        config.reanalyze_num_simulations = args.reanalyze_sims
     if args.material_value_weight is not None:
         config.material_value_weight = args.material_value_weight
     if args.material_value_scale is not None:
@@ -665,6 +682,8 @@ def main():
         config.resign_consecutive = args.resign_consecutive
     if args.resign_holdout_frac is not None:
         config.resign_holdout_frac = args.resign_holdout_frac
+    if args.resign_draws_only:
+        config.resign_draws_only = True
     if args.decisive_retention_multiplier is not None:
         config.decisive_retention_multiplier = args.decisive_retention_multiplier
     if args.policy_head_type is not None:

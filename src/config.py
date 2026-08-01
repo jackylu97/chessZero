@@ -140,11 +140,21 @@ class MuZeroConfig:
     # False → True on 2026-05-08 after observing reanalyze take ~22 min/call
     # (113K positions / numpy BatchedMCTS @ ~12 ms/position) vs the GPU path's
     # estimated ~2 min/call. Tests in tests/test_reanalyze_tensor_mcts.py
-    # cover both paths; falls back gracefully (raises NotImplementedError on
-    # use_gumbel=True). Independent of ``use_tensor_mcts`` so self-play and
-    # reanalyze can be A/B'd separately by flipping either knob.
+    # cover both paths. Under use_gumbel=True the tensor path routes
+    # run_batch_gpu (the only tensor entry with the Gumbel root); its
+    # gumbel_policy/root_value match the numpy select_action_gumbel write path
+    # (_gumbel_finalize is the batched port of select_action_gumbel).
+    # Independent of ``use_tensor_mcts`` so self-play and reanalyze can be
+    # A/B'd separately by flipping either knob.
     # Subtree reuse is N/A for reanalyze (each position is independent).
     reanalyze_use_tensor_mcts: bool = True
+    # Search budget for reanalyze MCTS. None = use num_simulations (self-play
+    # budget — expensive on big nets: 800 sims x 1400 games ~ hours/call).
+    # Set lower (e.g. 128) to make reanalyze affordable: Gumbel keeps its
+    # policy-improvement guarantee at low sim counts (m considered actions),
+    # and a FRESH net at 128 sims beats a buffer-lifetime-stale 800-sim target
+    # for target consistency.
+    reanalyze_num_simulations: int | None = None
 
     # Stockfish injection — inject pre-generated Stockfish games into the buffer
     # as if they were self-play rounds. Pool (shards of list[GameHistory] with
@@ -363,6 +373,18 @@ class MuZeroConfig:
     # "conversions" were resignations). With the exemption, seed/conversion and
     # seed/mate_rate become honest on-policy skill metrics.
     resign_exempt_seeded: bool = False
+    # 2026-07-20 relabel policy (resignation_relabel_policy_2026_07_20.md):
+    # when True, resignation NEVER overwrites a decisive natural outcome —
+    # true losses keep their label AND their tail (the winner's conversion
+    # demonstration, previously discarded by truncation); comeback wins keep
+    # the win (anti-pessimism signal for the value head). Only oracle-free
+    # DRAWS are flipped to a loss for the trigger side (+ truncated), and a
+    # TB-certified drawn final position vetoes the flip (never override an
+    # oracle with the value head's opinion). Trigger/FP stats are logged on
+    # the FULL population (self_play/resign_trigger_*), holdout kept as the
+    # historical estimator. False = legacy behavior (all triggered games
+    # flipped + truncated regardless of natural outcome).
+    resign_draws_only: bool = False
 
     # Stratified sampling: at every training batch, sample
     # floor(batch_size * warmstart_sample_frac) games from warmstart-only

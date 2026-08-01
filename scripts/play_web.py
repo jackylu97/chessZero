@@ -20,11 +20,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import chess
+import chess.engine
 import torch
 from flask import Flask, jsonify, request
 
 from src.config import MuZeroConfig, get_config
-from src.games.chess import ChessGame
+from src.games.chess import ChessGame, _move_to_action
 from src.mcts.mcts import MCTS, BatchedMCTS, select_action, select_action_gumbel
 from src.model.muzero_net import MuZeroNetwork
 from src.model.utils import support_to_scalar, inverse_scalar_transform
@@ -53,12 +55,30 @@ HTML = """<!DOCTYPE html>
   .evalhint { color: #888; font-size: 12px; margin-top: 4px; }
   button { padding: 8px 16px; margin-right: 8px; font-size: 14px; cursor: pointer; border: 1px solid #bbb; background: white; border-radius: 4px; }
   button:hover { background: #f0f0f0; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  #nav { margin: 8px 0; display: flex; align-items: center; gap: 6px; }
+  #nav button { padding: 4px 10px; margin-right: 0; }
+  .plyind { font-family: ui-monospace, monospace; font-size: 13px; min-width: 56px; text-align: center; }
+  #histbadge { color: #b06000; font-size: 12px; margin-left: 8px; }
+  #sf { font-family: ui-monospace, monospace; font-size: 13px; margin: 6px 0 4px; padding: 8px 10px; background: #eef4ff; border-radius: 4px; }
+  #sf .label { color: #666; margin-right: 6px; }
+  #board .check-square { box-shadow: inset 0 0 4px 4px #c00; background: #ff9a9a !important; }
+  #board .legal-dest { box-shadow: inset 0 0 2px 3px rgba(20, 85, 30, 0.45); }
 </style>
 </head>
 <body>
 <h1>ChessZero</h1>
 <p class="hint">You play Black. Drag a piece to move. Pawn promotion defaults to queen.</p>
 <div id="board"></div>
+<div id="nav">
+  <button id="nav_first" onclick="navTo(0)" title="start">&#9198;</button>
+  <button id="nav_prev" onclick="navTo(viewIdx - 1)" title="back (left arrow)">&#9664;</button>
+  <span id="ply" class="plyind">0/0</span>
+  <button id="nav_next" onclick="navTo(viewIdx + 1)" title="forward (right arrow)">&#9654;</button>
+  <button id="nav_last" onclick="navTo(latest())" title="latest">&#9197;</button>
+  <span id="histbadge" style="display:none">viewing history &mdash; board locked</span>
+</div>
+<div id="sf"><span class="label">SF d8 top moves:</span><span id="sfmoves">&mdash;</span></div>
 <div id="evals">
   <div><span class="label">Raw eval:</span><span class="val" id="raw_eval">—</span></div>
   <div><span class="label">Search eval:</span><span class="val" id="mcts_eval">—</span></div>
@@ -77,6 +97,55 @@ HTML = """<!DOCTYPE html>
 <script>
 let board = null;
 let busy = false;
+let viewIdx = 0;
+let sfToken = 0;
+let S = { fens: ['start'], checks: [null], legal: [], modelToMove: false, gameOver: false };
+
+function latest() { return S.fens.length - 1; }
+
+function clearHighlights(cls) {
+    document.querySelectorAll('#board .' + cls).forEach(el => el.classList.remove(cls));
+}
+
+function navTo(i) {
+    viewIdx = Math.max(0, Math.min(latest(), i));
+    renderView();
+}
+
+function renderView() {
+    if (viewIdx > latest()) viewIdx = latest();
+    board.position(S.fens[viewIdx], false);
+    document.getElementById('ply').textContent = viewIdx + '/' + latest();
+    document.getElementById('histbadge').style.display = (viewIdx < latest()) ? 'inline' : 'none';
+    document.getElementById('nav_first').disabled = (viewIdx === 0);
+    document.getElementById('nav_prev').disabled = (viewIdx === 0);
+    document.getElementById('nav_next').disabled = (viewIdx === latest());
+    document.getElementById('nav_last').disabled = (viewIdx === latest());
+    clearHighlights('check-square');
+    clearHighlights('legal-dest');
+    const ck = S.checks[viewIdx];
+    if (ck) {
+        const el = document.querySelector('#board .square-' + ck);
+        if (el) el.classList.add('check-square');
+    }
+    fetchHints();
+}
+
+async function fetchHints() {
+    const tok = ++sfToken;
+    const el = document.getElementById('sfmoves');
+    el.textContent = '\\u2026';
+    try {
+        const resp = await fetch('/sf?ply=' + viewIdx);
+        const d = await resp.json();
+        if (tok !== sfToken) return;   // stale response for an old view
+        if (d.unavailable) { el.textContent = 'engine unavailable'; return; }
+        if (!d.moves || !d.moves.length) { el.textContent = '\\u2014'; return; }
+        el.textContent = d.moves.map((m, i) => (i + 1) + ') ' + m.san + ' ' + m.eval).join('    ');
+    } catch (e) {
+        if (tok === sfToken) el.textContent = '\\u2014';
+    }
+}
 
 function setStatus(text) { document.getElementById('status').textContent = text; }
 function setResult(text) { document.getElementById('result').textContent = text ? '— ' + text : ''; }
@@ -105,12 +174,32 @@ function setMoves(sanMoves) {
 }
 
 function applyState(data) {
-    if (data.fen) board.position(data.fen);
+    S.fens = data.fens || [data.fen];
+    S.checks = data.checks || [];
+    S.legal = data.legalMoves || [];
+    S.modelToMove = !!data.model_to_move;
+    S.gameOver = !!data.game_over;
+    viewIdx = latest();   // any state change jumps the view back to live
     setStatus(data.status);
     setMoves(data.sanMoves || []);
     setResult(data.game_over ? data.result : '');
     setEval('raw_eval', data.value_raw);
     setEval('mcts_eval', data.value_mcts);
+    renderView();
+}
+
+function onDragStart(source, piece) {
+    // Board is interactive only at the live position, on the user's (Black) turn.
+    if (busy || S.gameOver || S.modelToMove) return false;
+    if (viewIdx !== latest()) return false;
+    if (piece[0] === 'w') return false;
+    const from = S.legal.filter(u => u.slice(0, 2) === source);
+    if (!from.length) return false;   // piece has no legal move
+    from.forEach(u => {
+        const el = document.querySelector('#board .square-' + u.slice(2, 4));
+        if (el) el.classList.add('legal-dest');
+    });
+    return true;
 }
 
 async function modelMove() {
@@ -131,11 +220,14 @@ async function newGame() {
 }
 
 async function onDrop(source, target, piece) {
-    if (busy) return 'snapback';
+    clearHighlights('legal-dest');
+    if (busy || viewIdx !== latest()) return 'snapback';
     let uci = source + target;
     if ((piece === 'bP' && target[1] === '1') || (piece === 'wP' && target[1] === '8')) {
         uci += 'q';
     }
+    // Client-side legality: reject illegal moves without a server round-trip.
+    if (S.legal.indexOf(uci) === -1) return 'snapback';
     busy = true;
     const resp = await fetch('/user_move', {
         method: 'POST',
@@ -157,7 +249,12 @@ window.addEventListener('DOMContentLoaded', () => {
         draggable: true,
         orientation: 'black',
         pieceTheme: 'https://cdn.jsdelivr.net/gh/oakmac/chessboardjs@master/website/img/chesspieces/wikipedia/{piece}.png',
+        onDragStart: onDragStart,
         onDrop: onDrop,
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowLeft') { navTo(viewIdx - 1); e.preventDefault(); }
+        else if (e.key === 'ArrowRight') { navTo(viewIdx + 1); e.preventDefault(); }
     });
     newGame();
 });
@@ -173,13 +270,13 @@ class GameSession:
         self.network = network
         self.config = config
         self.device = device
-        # Use Gumbel path (via BatchedMCTS) if configured, matching trainer._agent_action.
-        # Serial MCTS.run() is PUCT-only and ignores config.use_gumbel entirely.
+        # Always BatchedMCTS: run_batch is the only search path wired for the
+        # root-terminal-draws override (forced_draw_actions). It runs PUCT when
+        # config.use_gumbel is False and Gumbel otherwise, matching training/eval.
+        # (The serial MCTS.run() can't take forced draws, which let the model walk a
+        # won position into stalemate/repetition during interactive play.)
         self.use_gumbel = bool(getattr(config, "use_gumbel", False))
-        if self.use_gumbel:
-            self.mcts = BatchedMCTS(network, game, config, device)
-        else:
-            self.mcts = MCTS(network, game, config, device)
+        self.mcts = BatchedMCTS(network, game, config, device)
         self.history_frames = getattr(config, "history_frames", 1)
         self.state = None
         self.san_history: list[str] = []
@@ -196,6 +293,23 @@ class GameSession:
         self.san_history = []
         self.frame_history = []
         self.last_mcts_value = None
+        # Per-ply position record for the move navigator: FEN after each ply
+        # (index 0 = start position) and, when the side to move is in check,
+        # the square of their king (for the red check highlight).
+        self.fen_history = [self.state.board.fen()]
+        self.check_history = [self._check_square()]
+
+    def _check_square(self):
+        board = self.state.board
+        if not self.state.done and board.is_check():
+            return chess.square_name(board.king(board.turn))
+        if self.state.done and board.is_checkmate():
+            return chess.square_name(board.king(board.turn))
+        return None
+
+    def _record_position(self):
+        self.fen_history.append(self.state.board.fen())
+        self.check_history.append(self._check_square())
 
     def _stacked_obs(self):
         """T-frame history-stacked observation for the current position (matches
@@ -223,6 +337,10 @@ class GameSession:
     def to_json(self):
         return {
             "fen": self.state.board.fen(),
+            "fens": list(self.fen_history),
+            "checks": list(self.check_history),
+            "legalMoves": ([] if self.state.done
+                           else [m.uci() for m in self.state.board.legal_moves]),
             "sanMoves": self.san_history,
             "status": self._status(),
             "game_over": self.state.done,
@@ -254,18 +372,35 @@ class GameSession:
         # Record this ply's frame before stepping, so it becomes history for later plies.
         self.frame_history.append(self.game.to_tensor(self.state))
         self.state, _, _ = self.game.step(self.state, action)
+        self._record_position()
         return True
+
+    def _forced_draw_actions(self) -> set:
+        """Root-terminal-draws veto set for the current position (shared helper —
+        see src/games/chess.py:forced_draw_root_actions). Empty when disabled."""
+        if not getattr(self.config, "root_terminal_draws", False):
+            return set()
+        from src.games.chess import forced_draw_root_actions
+        return forced_draw_root_actions(
+            self.state.board,
+            int(getattr(self.config, "root_terminal_draws_min_repeats", 2)),
+            bool(getattr(self.config, "root_terminal_draws_include_stalemate", True)),
+        )
 
     def apply_model_move(self):
         if self.state.done or self.state.current_player != 1:
             return
         obs = self._stacked_obs()
         legal = self.game.legal_actions(self.state)
+        # Root-terminal-draws override: veto moves that hand the opponent a draw
+        # (stalemate / repetition / insufficient material) while the model is winning.
+        # Works on both PUCT and Gumbel root paths (Gumbel support added 2026-07-18).
+        fd = self._forced_draw_actions()
+        root = self.mcts.run_batch(
+            [obs], [legal], add_noise=False, forced_draw_actions=[fd])[0]
         if self.use_gumbel:
-            root = self.mcts.run_batch([obs], [legal], add_noise=False)[0]
             action, _ = select_action_gumbel(root, self.config, self.game.action_space_size)
         else:
-            root = self.mcts.run(obs, legal, add_noise=False)
             action, _ = select_action(root, temperature=0)
         # root.value is STM POV — STM at root is White (the model). No sign flip needed.
         self.last_mcts_value = float(root.value)
@@ -273,15 +408,59 @@ class GameSession:
         # Record this ply's frame before stepping.
         self.frame_history.append(self.game.to_tensor(self.state))
         self.state, _, _ = self.game.step(self.state, action)
+        self._record_position()
 
 
 app = Flask(__name__)
 session: GameSession | None = None
+sf_engine: chess.engine.SimpleEngine | None = None
+_SF_CACHE: dict = {}   # fen -> hint list (depth-8 MultiPV-3)
 
 
 @app.route("/")
 def index():
     return HTML
+
+
+@app.route("/sf")
+def sf_hints():
+    """Stockfish depth-8 top-3 moves for the VIEWED position (?ply=N indexes
+    fen_history). Evals White-POV in pawns; '#N' for mates. Cached per FEN."""
+    if sf_engine is None or session is None:
+        return jsonify({"moves": [], "unavailable": True})
+    try:
+        ply = int(request.args.get("ply", -1))
+    except ValueError:
+        ply = -1
+    fens = session.fen_history
+    if not fens:
+        return jsonify({"moves": []})
+    if ply < 0 or ply >= len(fens):
+        ply = len(fens) - 1
+    fen = fens[ply]
+    if fen in _SF_CACHE:
+        return jsonify({"moves": _SF_CACHE[fen]})
+    board = chess.Board(fen)
+    if board.is_game_over(claim_draw=False):
+        _SF_CACHE[fen] = []
+        return jsonify({"moves": []})
+    infos = sf_engine.analyse(board, chess.engine.Limit(depth=8), multipv=3)
+    if isinstance(infos, dict):
+        infos = [infos]
+    moves = []
+    for info in infos:
+        pv = info.get("pv")
+        if not pv:
+            continue
+        mv = pv[0]
+        sc = info["score"].white()
+        mate = sc.mate()
+        ev = f"#{mate}" if mate is not None else f"{sc.score() / 100.0:+.2f}"
+        moves.append({"san": board.san(mv), "uci": mv.uci(), "eval": ev})
+    if len(_SF_CACHE) > 2000:
+        _SF_CACHE.clear()
+    _SF_CACHE[fen] = moves
+    return jsonify({"moves": moves})
 
 
 @app.route("/reset", methods=["POST"])
@@ -352,12 +531,23 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
 
     has_inverse = any(k.startswith("inverse_dynamics_head.") for k in state_dict)
 
-    # Detect the policy head type from the weights so conv-head and flat-head
-    # checkpoints both load: the AlphaZero conv head has policy_head.mix/proj,
-    # the flat (AlphaGo) head is an nn.Sequential (policy_head.0/.1/.4).
-    policy_head_type = "conv" if any(
-        ".policy_head.mix." in k or ".policy_head.proj." in k for k in state_dict
-    ) else "flat"
+    # Detect the policy head type from the weights so from_to, conv and flat
+    # checkpoints all load: from_to (relational) has policy_head.q_proj/k_proj,
+    # the AlphaZero conv head has policy_head.mix/proj, the flat (AlphaGo) head
+    # is an nn.Sequential (policy_head.0/.1/.4).
+    if any(".policy_head.q_proj." in k or ".policy_head.k_proj." in k for k in state_dict):
+        policy_head_type = "from_to"
+    elif any(".policy_head.mix." in k or ".policy_head.proj." in k for k in state_dict):
+        policy_head_type = "conv"
+    else:
+        policy_head_type = "flat"
+
+    # Reward-head planes: the 1x1 projection width (historically 1; widened for the
+    # mate-beacon head). Recover from the first conv so 8-plane checkpoints load.
+    reward_head_planes = getattr(config, "reward_head_planes", 1)
+    rw = state_dict.get("dynamics.reward_head.0.weight")
+    if rw is not None:
+        reward_head_planes = int(rw.shape[0])
 
     # Moves-left head (Lc0): detect so moves-head checkpoints load.
     has_moves_left = any(k.startswith("moves_left_head.") for k in state_dict)
@@ -386,6 +576,8 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
         fc_hidden=config.fc_hidden,
         value_support_size=config.value_support_size,
         reward_support_size=config.reward_support_size,
+        reward_head_planes=reward_head_planes,
+        action_embed_dim=getattr(config, "action_embed_dim", 16),
         use_consistency_loss=has_consistency,
         proj_hid=config.proj_hid,
         proj_out=config.proj_out,
@@ -404,6 +596,19 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
         inverse_dynamics_hidden=getattr(config, "inverse_dynamics_hidden", 256),
         use_material_head=has_material,
         material_head_support_size=material_support,
+        # Head/body shape params — needed for XL/attention checkpoints (from config preset).
+        value_head_planes=getattr(config, "value_head_planes", 1),
+        value_head_blocks=getattr(config, "value_head_blocks", 0),
+        moves_left_head_planes=getattr(config, "moves_left_head_planes", 1),
+        moves_left_head_blocks=getattr(config, "moves_left_head_blocks", 0),
+        use_repr_attention=getattr(config, "use_repr_attention", False),
+        use_dyn_attention=getattr(config, "use_dyn_attention", False),
+        use_pred_attention=getattr(config, "use_pred_attention", False),
+        use_smolgen=getattr(config, "use_smolgen", True),
+        attn_layers=getattr(config, "attn_layers", 4),
+        attn_heads=getattr(config, "attn_heads", 4),
+        pred_attn_layers=getattr(config, "pred_attn_layers", 2),
+        hybrid_stem_blocks=getattr(config, "hybrid_stem_blocks", 0),
     )
     network.load_state_dict(state_dict)
     network.to(device)
@@ -412,7 +617,7 @@ def load_network(checkpoint_path: str, game: ChessGame, config: MuZeroConfig, de
 
 
 def main():
-    global session
+    global session, sf_engine
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default=None,
                         help="Path to a chess checkpoint .pt file. If omitted, auto-selects the "
@@ -436,6 +641,9 @@ def main():
                              "Gumbel vs PUCT on the same checkpoint.")
     parser.add_argument("--num-simulations", type=int, default=None,
                         help="Override config.num_simulations for faster/slower play.")
+    parser.add_argument("--stockfish", default="tools/stockfish/stockfish",
+                        help="Stockfish binary for the depth-8 hint panel "
+                             "(hints disabled if missing).")
     args = parser.parse_args()
 
     if args.device is None:
@@ -452,6 +660,13 @@ def main():
     game = ChessGame()
     network = load_network(checkpoint, game, config, device)
     session = GameSession(game, network, config, device)
+
+    try:
+        sf_engine = chess.engine.SimpleEngine.popen_uci(args.stockfish)
+        print(f"SF hint engine: {args.stockfish} (depth 8, MultiPV 3)")
+    except Exception as e:
+        sf_engine = None
+        print(f"SF hint engine unavailable ({e}) — hint panel disabled")
 
     print(f"Open http://{args.host}:{args.port} to play "
           f"[use_gumbel={config.use_gumbel}, num_simulations={config.num_simulations}]")

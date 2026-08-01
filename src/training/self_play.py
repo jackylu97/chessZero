@@ -88,6 +88,7 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
         return histories
     thr = float(getattr(config, "resign_threshold", -0.9))
     need = int(getattr(config, "resign_consecutive", 5))
+    draws_only = bool(getattr(config, "resign_draws_only", False))
     if need <= 0:
         return histories
     # AlphaZero-style calibration holdout: this fraction of would-resign games is
@@ -133,15 +134,43 @@ def _apply_resignation(histories: list[GameHistory], config) -> list[GameHistory
         sf = getattr(h, "start_fen", None)
         start_white = (sf.split()[1] == "w") if sf else True
         white_resigns = (start_white == (p % 2 == 0))
+        actually_lost = (h.game_outcome == -1.0) if white_resigns else (h.game_outcome == 1.0)
+        # Full-population trigger stats (2026-07-20): every game is played out,
+        # so trigger-accuracy is measurable on ALL triggered games, not just the
+        # holdout (self_play/resign_trigger_{rate,fp_rate}). The holdout below
+        # remains as the historical estimator / behavioral control group.
+        h.resign_triggered = True
+        h.resign_trigger_fp = not actually_lost
         # Calibration holdout: leave this game un-resigned (natural outcome) and
         # record whether resignation WOULD have been a false positive — i.e. the
         # would-have-resigned side did NOT actually lose. resign_false_positive
         # over the holdout sample is AlphaZero's <5% threshold-calibration metric.
         if holdout_frac > 0.0 and random.random() < holdout_frac:
             h.resign_holdout = True
-            actually_lost = (h.game_outcome == -1.0) if white_resigns else (h.game_outcome == 1.0)
             h.resign_false_positive = not actually_lost
             continue
+        if draws_only:
+            # 2026-07-20 relabel policy (resignation_relabel_policy_2026_07_20.md):
+            # decisive natural outcomes are NEVER overwritten by the value head.
+            #  - True losses keep their label AND their tail — the winner's
+            #    conversion demonstration, previously discarded by truncation.
+            #  - Comeback wins keep the win: "positions my value head called dead
+            #    sometimes convert" is exactly the anti-pessimism signal it needs.
+            # Only oracle-free draws (threefold / no-progress / stalemate /
+            # insufficient / ply-cap) are flipped, protecting the decisive label
+            # a weak policy shuffled away — the mechanic's original purpose.
+            if h.game_outcome != 0.0:
+                continue
+            # TB veto: if the FINAL position is tablebase-certified drawn, the
+            # defender's hold was real — never override an oracle with the
+            # value head's opinion. (tablebase_values: STM-POV, ±1 decisive,
+            # 0.0 draw, NaN out-of-TB; scan from the end for the last in-TB ply.)
+            tbv = getattr(h, "tablebase_values", None)
+            if tbv:
+                last_tb = next((v for v in reversed(tbv) if v == v), None)
+                if last_tb is not None and abs(last_tb) < 0.5:
+                    h.resign_tb_veto = True
+                    continue
         # Side to move at ply p resigns (even ply = white = player 1). Outcome is
         # player-1 POV: white resigns → black wins → -1; black resigns → +1.
         h.game_outcome = -1.0 if white_resigns else 1.0

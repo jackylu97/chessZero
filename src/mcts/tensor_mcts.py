@@ -479,12 +479,17 @@ class TensorMCTS:
         observations: list[torch.Tensor],
         legal_actions_list: list[list[int]],
         add_noise: bool = True,
+        forced_draw_actions: list | None = None,
     ) -> list[MCTSNode]:
         """Run num_simulations MCTS sims for N games in parallel on GPU.
 
         Returns N ``MCTSNode`` objects (compat shim) populated with deduped
         ``child_actions`` / ``child_visits`` / ``child_priors`` so the
         existing ``select_action`` helpers work unchanged.
+
+        forced_draw_actions: optional per-game container of root actions that
+        force a draw (numpy ``BatchedMCTS.run_batch`` signature parity) —
+        converted to the dense mask ``run_batch_gpu`` consumes.
         """
         n = len(observations)
         num_sims = int(self.config.num_simulations)
@@ -504,6 +509,15 @@ class TensorMCTS:
             legal_actions_list,
             add_noise,
         )
+
+        fdm = None
+        if forced_draw_actions is not None and any(forced_draw_actions):
+            fdm = torch.zeros(n, self.action_space_size, dtype=torch.bool,
+                              device=self.device)
+            for g_i, fda in enumerate(forced_draw_actions):
+                if fda:
+                    fdm[g_i, list(fda)] = True
+        self._apply_root_term_mask(fdm)
 
         for _ in range(num_sims):
             (
@@ -609,17 +623,7 @@ class TensorMCTS:
                 )
             self.has_prior_search = False
 
-        # Map the per-action repetition mask [N, A] onto the root's K sampled
-        # children [N, K] (gather by action, mask invalid slots). Consumed in
-        # _select to pin repeating root children to draw_score.
-        if self._use_terminal_draws and forced_draw_mask is not None:
-            root_acts = self.child_actions[:, 0, :]                  # [N, K] int32
-            self._root_term_mask = (
-                torch.gather(forced_draw_mask, 1, root_acts.clamp(min=0).long())
-                & (root_acts != -1)
-            )
-        else:
-            self._root_term_mask = None
+        self._apply_root_term_mask(forced_draw_mask)
 
         # Map the per-action tablebase value [N, A] onto the root's K children
         # [N, K] (NaN where unmapped / invalid slot). Consumed in _select to
@@ -679,6 +683,34 @@ class TensorMCTS:
         return out
 
     # ---------------------------------------------------------------- helpers
+
+    def _apply_root_term_mask(self, forced_draw_mask):
+        """Map the per-action forced-draw mask [N, A] (or None) onto the
+        root's K sampled children → ``_root_term_mask`` [N, K]. Consumed in
+        _select / _gumbel_root_q_norm to pin those children to draw_score.
+
+        Pinned children are TERMINAL: never expanded, each visit backs up the
+        0.0 draw value (numpy parity — mcts.py run_batch terminal-leaf branch;
+        the -0.05 contempt is selection-only). Sever any subtree carried over
+        by root reuse and clear its stats so no phantom network value survives
+        into Q/π'/root_value. (2026-07-22: before this, the pin was
+        selection-only in the tensor engine — π' targets and A_{n+1} kept full
+        phantom-win mass on drawing moves.) Must be called on EVERY search
+        entry so a stale mask from a previous batch can never leak.
+        """
+        if self._use_terminal_draws and forced_draw_mask is not None:
+            root_acts = self.child_actions[:, 0, :]                  # [N, K] int32
+            self._root_term_mask = (
+                torch.gather(forced_draw_mask, 1, root_acts.clamp(min=0).long())
+                & (root_acts != -1)
+            )
+            tm = self._root_term_mask
+            self.child_node_idx[:, 0, :].masked_fill_(tm, -1)
+            self.child_visits[:, 0, :].masked_fill_(tm, 0)
+            self.child_value_sum[:, 0, :].masked_fill_(tm, 0.0)
+            self.child_rewards[:, 0, :].masked_fill_(tm, 0.0)
+        else:
+            self._root_term_mask = None
 
     def _initialize_root(
         self,
@@ -1031,6 +1063,18 @@ class TensorMCTS:
             visits_m > 0, value_sums / visits_m.clamp(min=1.0),
             torch.zeros_like(value_sums))
         raw_q_m = rewards - float(self.config.discount) * child_value
+
+        # Root-terminal-draws: pin forced-draw candidates' Q to the 0.0 draw
+        # backup in BOTH the π' target and the A_{n+1} scores (numpy parity —
+        # select_action_gumbel sees the terminal child's genuine 0.0 backups).
+        # With the terminal no-expand backup in _expand this is normally
+        # already true; the explicit pin also covers reused-subtree edges and
+        # makes the semantics visible here. (2026-07-22: _gumbel_finalize used
+        # to ignore _root_term_mask entirely — stored π' kept phantom-win mass
+        # on drawing moves and A_{n+1} could still play them.)
+        if self._use_terminal_draws and self._root_term_mask is not None:
+            raw_q_m = torch.where(
+                self._root_term_mask[:, :m], torch.zeros_like(raw_q_m), raw_q_m)
 
         actions_m = self.child_actions[:, 0, :m]                      # [N, m] int32
         valid = actions_m != -1
@@ -1602,6 +1646,17 @@ class TensorMCTS:
         dev = self.device
         arange_n = self._arange_n
 
+        # Root-terminal-draws: a leaf that is a PINNED ROOT CHILD is terminal —
+        # it is never expanded (child_node_idx stays -1, so every future visit
+        # stops here again) and its backup value is the 0.0 draw. The
+        # recurrent_inference output for those games is discarded (numpy
+        # parity: mcts.py run_batch terminal-leaf branch — correctness > speed).
+        term_leaf = None
+        if self._use_terminal_draws and self._root_term_mask is not None:
+            term_leaf = (leaf_parent_node == 0) & torch.gather(
+                self._root_term_mask, 1, leaf_slot.long().unsqueeze(1)
+            ).squeeze(1)                                          # [N] bool
+
         # Gather parent hidden states.
         parent_l = leaf_parent_node.long()
         parent_hidden = self.node_hidden[arange_n, parent_l]  # [N, C, H, W]
@@ -1631,8 +1686,13 @@ class TensorMCTS:
         new_l = new_node_idx.long()
         slot_l = leaf_slot.long()
 
-        # Write new node fields.
+        # Write new node fields. Terminal (pinned-draw) leaves zero the reward
+        # so backprop's R_path carries no phantom dynamics reward through the
+        # orphaned node.
         rewards_f32 = rewards.view(-1).to(torch.float32)
+        if term_leaf is not None:
+            rewards_f32 = torch.where(
+                term_leaf, torch.zeros_like(rewards_f32), rewards_f32)
         self.node_hidden[arange_n, new_l] = next_hidden.to(self.hidden_dtype)
         self.node_reward[arange_n, new_l] = rewards_f32
         if self._use_ml_utility:
@@ -1649,12 +1709,24 @@ class TensorMCTS:
         # child_visits / child_value_sum / child_rewards / child_node_idx for
         # the new node remain 0/-1 from _reset.
 
-        # Hook up parent's slot.
-        self.child_node_idx[arange_n, parent_l, slot_l] = new_node_idx
-        # Mirror reward into parent's child_rewards so PUCT picks it up.
+        # Hook up parent's slot — EXCEPT terminal leaves, which stay unlinked
+        # (child_node_idx -1 ⇒ selection can never descend past them; the
+        # orphan node allocated above is simply never referenced again).
+        hook_idx = new_node_idx
+        if term_leaf is not None:
+            hook_idx = torch.where(
+                term_leaf, torch.full_like(new_node_idx, -1), new_node_idx)
+        self.child_node_idx[arange_n, parent_l, slot_l] = hook_idx
+        # Mirror reward into parent's child_rewards so PUCT picks it up
+        # (rewards_f32 already zeroed at terminal leaves).
         self.child_rewards[arange_n, parent_l, slot_l] = rewards_f32
 
-        return new_node_idx, leaf_values.view(-1).to(torch.float32)
+        leaf_value = leaf_values.view(-1).to(torch.float32)
+        if term_leaf is not None:
+            # Draw backup: 0.0 in every POV (the contempt never backs up).
+            leaf_value = torch.where(
+                term_leaf, torch.zeros_like(leaf_value), leaf_value)
+        return new_node_idx, leaf_value
 
     def _backprop(
         self,

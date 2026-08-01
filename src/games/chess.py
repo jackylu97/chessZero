@@ -68,6 +68,35 @@ def _move_to_action(move: chess.Move, turn: bool = chess.WHITE) -> int:
     return from_sq * NUM_MOVE_TYPES + move_type
 
 
+def forced_draw_root_actions(board: chess.Board,
+                             min_repeats: int = 2,
+                             include_stalemate: bool = True) -> set[int]:
+    """Root action indices whose move leads to a FORCED draw, mirroring the
+    training-time root-terminal-draws override (chess_gpu.terminal_draw_move_mask):
+    repetition (>= min_repeats occurrences after the move) plus — when
+    ``include_stalemate`` — stalemate / insufficient material / 75-move.
+
+    Passed as ``forced_draw_actions`` to ``BatchedMCTS.run_batch``, these children
+    are pinned to the draw value in search (NOT masked out): a winning side avoids
+    them, a losing side keeps its draw resource. The veto is an INTRINSIC part of
+    inference — the vetoed continuations are never played in training, so nothing
+    ever teaches the net their draw value (2026-07-18); any evaluation of the
+    deployed agent should therefore include it (used by trainer eval + play_web).
+    """
+    forced: set[int] = set()
+    turn = board.turn
+    for move in board.legal_moves:
+        board.push(move)
+        draw = board.is_repetition(min_repeats)
+        if include_stalemate and not draw:
+            draw = (board.is_stalemate() or board.is_insufficient_material()
+                    or board.is_seventyfive_moves())
+        board.pop()
+        if draw:
+            forced.add(_move_to_action(move, turn))
+    return forced
+
+
 def _action_to_move(action: int, board: chess.Board) -> chess.Move | None:
     """Decode flat action index (STM perspective) back to a chess move.
 

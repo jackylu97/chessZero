@@ -6,8 +6,11 @@ Each game: both sides play TB-optimally from the seed to checkmate; per-ply
 targets carry the soft win-preserving DTZ policy, the DTZ-shaped STM value,
 and Gaviota |DTM| — the exact recipe the supervised endgame proxy validated
 (KQvK 0.91 conversion, endgame_attention_findings_2026_06_28.md), packaged as
-buffer games. game_outcome uses the ply-0-mover POV convention make_target's
-``_outcome_onehot`` expects (NOT white-POV — seeds can be black-to-move).
+buffer games. game_outcome is WHITE-POV (the buffer-wide convention;
+make_target's ``_outcome_onehot`` derives STM parity from start_fen since
+2026-07-22). Dicts carry ``outcome_pov="white"`` via to_compact_dict; legacy
+first-mover-POV archives are normalized at injection (trainer) / load
+(from_compact_dict).
 
 Run (CPU-only, safe alongside GPU training):
   PYTHONPATH=. .venv/bin/python scripts/gen_tb_anchor_games.py \
@@ -38,7 +41,6 @@ def _worker_task(fen: str):
     from src.training.tb_playout import tb_playout, TBPlayoutError
 
     board = chess.Board(fen)
-    entry_turn = board.turn
     try:
         res = tb_playout(board, _PROBER)
     except TBPlayoutError:
@@ -52,8 +54,8 @@ def _worker_task(fen: str):
     h.tablebase_values = res["tablebase_values"]
     h.tablebase_moves_left = res["tablebase_moves_left"]
     h.tablebase_policy = res["tablebase_policy"]
-    # Ply-0-mover POV (make_target's _outcome_onehot assumes ply 0 == "player 1").
-    h.game_outcome = 1.0 if res["winner"] == entry_turn else -1.0
+    # White-POV (buffer-wide convention since 2026-07-22).
+    h.game_outcome = 1.0 if res["winner"] == chess.WHITE else -1.0
     return h.to_compact_dict()
 
 

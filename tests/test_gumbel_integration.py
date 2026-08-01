@@ -334,9 +334,14 @@ def test_reanalyze_rewrites_policies_as_pi_prime(ttt, gumbel_cfg):
             tr.replay_buffer.save_game(g)
 
         # Corrupt stored policies so we can detect the in-place overwrite.
+        # NOT zeros: an all-zero policy is the opening-mix loss mask and
+        # reanalyze deliberately skips it since 2026-07-22 (see
+        # _policy_is_empty). Uniform-over-everything (illegal included) is
+        # unambiguously not a π' output.
+        A = ttt.action_space_size
         for g in tr.replay_buffer.buffer:
             for i in range(len(g.policies)):
-                g.policies[i] = [0.0] * ttt.action_space_size
+                g.policies[i] = [1.0 / A] * A
 
         # Gumbel reanalyze must run through BatchedMCTS — TensorMCTS has no Gumbel
         # root, and the trainer now guards that combo. Pin the legacy reanalyze path.

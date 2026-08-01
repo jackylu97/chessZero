@@ -613,6 +613,18 @@ class BatchedMCTS(MCTS):
                 priors_np = priors_np / s if s > 0 else priors_np
                 self._expand_from_priors(roots[g], actions_np, priors_np)
                 roots[g].root_sampled_perturbed = perturbed_sampled
+                # Root-terminal-draws override under Gumbel (2026-07-18): pin
+                # forced-draw candidates via child_terminal_value, same as the
+                # PUCT branch below. The terminal-leaf backup (0.0) is branch-
+                # agnostic, so pinned candidates sink in completedQ/π' and in
+                # the A_{n+1} argmax once visited by the halving schedule.
+                if forced_draw_actions is not None and forced_draw_actions[g]:
+                    fd = forced_draw_actions[g]
+                    ctv = np.full(len(roots[g].child_actions), np.nan, dtype=np.float64)
+                    for ci, a in enumerate(roots[g].child_actions):
+                        if int(a) in fd:
+                            ctv[ci] = draw_score
+                    roots[g].child_terminal_value = ctv
 
                 schedule = sequential_halving_schedule(self.config.num_simulations, m)
                 state = _GumbelRootState(

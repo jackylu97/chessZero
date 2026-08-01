@@ -513,6 +513,18 @@ class MuZeroTrainer:
         self.writer.add_scalar("self_play/resign_holdout_rate", holdout_triggered / n_games, self.global_step)
         self.writer.add_scalar("self_play/resign_false_positive_rate",
                                resign_fp / max(1, holdout_triggered), self.global_step)
+        # Full-population trigger accuracy (2026-07-20, resign_draws_only policy):
+        # since every game plays out, trigger-fired and trigger-was-wrong are
+        # measurable on ALL games — ~7x the holdout's sample. Under
+        # resign_draws_only, resignation_rate above becomes the DRAW-FLIP rate
+        # (expected ~6%), while resign_trigger_rate keeps the old ~40% semantics.
+        triggered = sum(1 for g in games if getattr(g, "resign_triggered", False))
+        trigger_fp = sum(1 for g in games if getattr(g, "resign_trigger_fp", False))
+        tb_vetoed = sum(1 for g in games if getattr(g, "resign_tb_veto", False))
+        self.writer.add_scalar("self_play/resign_trigger_rate", triggered / n_games, self.global_step)
+        self.writer.add_scalar("self_play/resign_trigger_fp_rate",
+                               trigger_fp / max(1, triggered), self.global_step)
+        self.writer.add_scalar("self_play/resign_tb_veto_rate", tb_vetoed / n_games, self.global_step)
         # TB rollout fill: fraction of games truncated at a decisive in-TB ply and
         # finished with TB-optimal play (won-but-unconverted adjudications).
         if getattr(self.config, "tb_rollout_fill", False):
@@ -838,6 +850,15 @@ class MuZeroTrainer:
             # Stamped here (not in the archive) so existing shards are covered.
             g.tb_authored = True
             g.channel_tag = "anchor"  # unified-buffer channel identity (task #19)
+            # POV migration (2026-07-22): legacy archives (gen_tb_anchor_games
+            # pre-fix) stored game_outcome in FIRST-MOVER POV without an
+            # outcome_pov marker; in-RAM convention is white-POV. The dict
+            # lacks tb_authored (stamped above), so from_compact_dict's
+            # tb_authored-gated flip cannot see it — normalize here instead.
+            if d.get("outcome_pov") != "white" and g.start_fen:
+                parts = g.start_fen.split()
+                if len(parts) > 1 and parts[1] == "b":
+                    g.game_outcome = -g.game_outcome
             with self._buffer_lock:
                 self.replay_buffer.save_game(g)
             self._tb_anchor_injected += 1
@@ -874,13 +895,29 @@ class MuZeroTrainer:
         while inserted < n:
             if not self._injection_shard_games:
                 if not self._advance_injection_shard():
+                    # Pool exhausted → CYCLE instead of disabling (2026-07-26).
+                    # Warmstart is the ONLY opening teacher; the non-cycling
+                    # "bounded signal" design silently starved it to 0% once the
+                    # 128k-game pool ran dry — batch_warmstart_frac collapsed to
+                    # 0 after the crash-recovery restarts because .buf excludes
+                    # warmstart games and there was nothing left to re-inject.
+                    # The warmstart SHARE is still governed by the mixture
+                    # schedule + sample-frac anneal (and should taper only when
+                    # the graduation test says we're near the teacher); this
+                    # only guarantees the supply never vanishes. NOT reshuffled:
+                    # preserves the seed-0 attach order so the resume
+                    # fast-forward (keyed on _injection_loaded) stays correct.
+                    self._injection_shard_idx = 0
+                    self._injection_loaded = 0
+                    self._injection_shard_games = []
+                    if not self._advance_injection_shard():
+                        # Genuinely empty pool (no shards / all empty) — give up.
+                        self._injection_shards = []
+                        break
                     tqdm.write(
-                        f"Step {self.global_step}: Stockfish injection pool exhausted "
-                        f"after {self._injection_loaded} games; injection disabled for "
-                        f"remainder of window."
+                        f"Step {self.global_step}: Stockfish injection pool CYCLED "
+                        f"— re-serving from the top ({len(self._injection_shards)} shards)."
                     )
-                    self._injection_shards = []
-                    break
             g = self._injection_shard_games.pop(0)
             with self._buffer_lock:
                 self.replay_buffer.save_game(g)
@@ -1475,34 +1512,63 @@ class MuZeroTrainer:
             return
 
         # Flatten all non-terminal positions across sampled games into one list.
-        # Each entry: (obs tensor, legal_actions list, game ref, position index).
+        # Each entry: (obs tensor, legal_actions list, game ref, position index,
+        # forced-draw action set or None).
         # Reanalyze observations: rebuild the same T-frame stack the network
         # was trained on, so the model sees positions in the same encoding it
         # was trained on (otherwise input distribution shifts vs training).
+        #
+        # Two target-consistency guards (2026-07-22 buffer investigation):
+        #  * VETO-AWARE: self-play searches run under the root-terminal-draws
+        #    veto; reanalyzing without it restored π' mass on repetition/
+        #    stalemate moves that self-play suppressed (measured +60-80%
+        #    relative mass on vetoed moves). The board is replayed from the
+        #    stored actions to recover the repetition state the observation
+        #    alone cannot carry.
+        #  * OPENING-AWARE: opening-mix random plies store an EMPTY policy (no
+        #    search ran; zero policy gradient by design). Backfilling them with
+        #    fresh π' silently unmasked them — and opening roots are where flat
+        #    values make π' tie-chaotic. Skip them; the mask is the target.
+        from .replay_buffer import _policy_is_empty
         n_frames = getattr(self.config, "history_frames", 1)
+        use_veto = bool(getattr(self.config, "root_terminal_draws", False))
+        fd_min_repeats = int(getattr(self.config, "root_terminal_draws_min_repeats", 2))
+        fd_stalemate = bool(getattr(self.config, "root_terminal_draws_include_stalemate", True))
         items = []
+        skipped_opening = 0
         for game in games:
+            fd_sets = (self._forced_draw_sets(game, fd_min_repeats, fd_stalemate)
+                       if use_veto else None)
             for pos in range(len(game.policies)):
                 if pos < len(game.legal_actions_list):
+                    if _policy_is_empty(game.policies[pos]):
+                        skipped_opening += 1
+                        continue
                     obs_at_pos = game._stack_history(pos, n_frames)
-                    items.append((obs_at_pos, game.legal_actions_list[pos], game, pos))
+                    items.append((obs_at_pos, game.legal_actions_list[pos], game, pos,
+                                  fd_sets[pos] if fd_sets is not None else None))
 
         if not items:
             return
 
         self.network.eval()
+        # Reanalyze search budget: optionally fewer sims than self-play
+        # (reanalyze_num_simulations). A shallow-copied config keeps every other
+        # knob identical; the MCTS object reads num_simulations from the config
+        # it was constructed with.
+        from dataclasses import replace as _dc_replace
+        _re_sims = getattr(self.config, "reanalyze_num_simulations", None)
+        search_cfg = (_dc_replace(self.config, num_simulations=int(_re_sims))
+                      if _re_sims else self.config)
         # MCTS backend dispatch. Default: numpy BatchedMCTS (same path the
         # codebase shipped with). Opt-in: GPU TensorMCTS via the same factory
-        # self-play uses — significantly faster per position. This reanalyze path
-        # uses TensorMCTS.run_batch, which does not route the Gumbel root (that
-        # lives on run_batch_gpu / GPU-resident self-play), so we hard-fail the combo.
+        # self-play uses — significantly faster per position. Under Gumbel the
+        # tensor path must route run_batch_gpu (the only tensor entry with the
+        # Gumbel root); its gumbel_policy / root_value are exactly the π' /
+        # mean-Q that the numpy select_action_gumbel write path produces
+        # (_gumbel_finalize is the batched port of select_action_gumbel).
+        tensor_gumbel = False
         if getattr(self.config, "reanalyze_use_tensor_mcts", False):
-            if use_gumbel:
-                raise NotImplementedError(
-                    "reanalyze_use_tensor_mcts=True is not compatible with "
-                    "use_gumbel=True: the reanalyze TensorMCTS.run_batch path "
-                    "does not route the Gumbel root (only run_batch_gpu does)."
-                )
             from ..mcts.tensor_mcts import TensorMCTS
             _dtype_map = {
                 "float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16,
@@ -1510,34 +1576,103 @@ class MuZeroTrainer:
             hidden_dtype = _dtype_map[getattr(self.config, "tensor_mcts_hidden_dtype", "float32")]
             amp_str = getattr(self.config, "tensor_mcts_amp_dtype", None)
             amp_dtype = _dtype_map[amp_str] if amp_str else None
+            # Gumbel root override is unsupported in the Triton select kernel —
+            # remap to compile, mirroring self_play.make_mcts.
+            select_backend = getattr(self.config, "tensor_mcts_select_backend", "compile")
+            if use_gumbel and select_backend == "triton":
+                select_backend = "compile"
             batched_mcts = TensorMCTS(
-                self.network, self.game, self.config,
+                self.network, self.game, search_cfg,
                 device=self.device,
                 hidden_dtype=hidden_dtype,
                 amp_dtype=amp_dtype,
-                select_backend=getattr(self.config, "tensor_mcts_select_backend", "compile"),
+                select_backend=select_backend,
                 use_subtree_reuse=False,  # N/A: each reanalyze position is independent.
             )
+            tensor_gumbel = use_gumbel
         else:
-            batched_mcts = BatchedMCTS(self.network, self.game, self.config, self.device)
+            batched_mcts = BatchedMCTS(self.network, self.game, search_cfg, self.device)
         chunk = max(1, getattr(self.config, "num_parallel_games", 1))
         action_space_size = self.game.action_space_size
 
         positions_updated = 0
         num_games = len(games)
-        tqdm.write(f"Step {self.global_step}: reanalyzing {num_games} games ({len(items)} positions)...")
+        tqdm.write(
+            f"Step {self.global_step}: reanalyzing {num_games} games "
+            f"({len(items)} positions, sims={search_cfg.num_simulations}, "
+            f"backend={'tensor-gumbel' if tensor_gumbel else type(batched_mcts).__name__})..."
+        )
+        if tensor_gumbel:
+            # Reclaim cached blocks (self-play tree, train activations) before
+            # the first big tree allocation. At 800 sims the per-chunk tree is
+            # ~18-28 GB; allocator fragmentation across cycles made this OOM
+            # mid-call at step 70060 (2026-07-16) even though earlier calls fit.
+            torch.cuda.empty_cache()
         for start in range(0, len(items), chunk):
             batch = items[start : start + chunk]
             obs_list = [x[0] for x in batch]
             legal_list = [x[1] for x in batch]
 
-            roots = batched_mcts.run_batch(obs_list, legal_list, add_noise=False)
+            if tensor_gumbel:
+                # GPU-resident Gumbel path: run_batch_gpu wants a stacked obs
+                # tensor and a dense bool legal mask; returns the π' policy
+                # (gumbel_policy, [B, A]) and root mean-Q (root_value, [B]).
+                # Self-healing under memory pressure: on OOM, empty the cache
+                # and halve the sub-batch (halves the tree alloc) until it fits
+                # instead of crashing the run.
+                pending = [batch]
+                while pending:
+                    sub = pending.pop()
+                    try:
+                        obs_batch = torch.stack([x[0] for x in sub]).to(self.device)
+                        legal_mask = torch.zeros(
+                            len(sub), action_space_size, dtype=torch.bool)
+                        for i, x in enumerate(sub):
+                            legal_mask[i, list(x[1])] = True
+                        # Forced-draw mask (root-terminal-draws): same veto the
+                        # self-play search that authored the original targets ran.
+                        fd_mask = None
+                        if use_veto and any(x[4] for x in sub):
+                            fd_mask = torch.zeros(
+                                len(sub), action_space_size, dtype=torch.bool)
+                            for i, x in enumerate(sub):
+                                if x[4]:
+                                    fd_mask[i, list(x[4])] = True
+                            fd_mask = fd_mask.to(self.device)
+                        root_data = batched_mcts.run_batch_gpu(
+                            obs_batch, legal_mask.to(self.device), add_noise=False,
+                            forced_draw_mask=fd_mask)
+                    except torch.cuda.OutOfMemoryError:
+                        if len(sub) == 1:
+                            raise
+                        obs_batch = legal_mask = fd_mask = None  # release before retry
+                        torch.cuda.empty_cache()
+                        mid = len(sub) // 2
+                        tqdm.write(
+                            f"  reanalyze chunk OOM at n={len(sub)} — cache "
+                            f"emptied, retrying as 2x{mid}"
+                        )
+                        pending.extend([sub[:mid], sub[mid:]])
+                        continue
+                    g_policy = root_data["gumbel_policy"].cpu().numpy()
+                    r_value = root_data["root_value"].cpu().tolist()
+                    with self._buffer_lock:
+                        for i, x in enumerate(sub):
+                            game, pos = x[2], x[3]
+                            game.policies[pos] = _sparsify_policy(g_policy[i])
+                            game.root_values[pos] = float(r_value[i])
+                            positions_updated += 1
+                continue
+
+            roots = batched_mcts.run_batch(
+                obs_list, legal_list, add_noise=False,
+                forced_draw_actions=([x[4] for x in batch] if use_veto else None))
 
             # Lock the in-place freshening: sample_batch (prefetch thread) reads
             # these same game.policies/root_values. The GPU run_batch above is
             # outside the lock; only the cheap write loop holds it.
             with self._buffer_lock:
-                for (_, _, game, pos), root in zip(batch, roots):
+                for (_, _, game, pos, _), root in zip(batch, roots):
                     if float(root.child_visits.sum()) > 0:
                         if use_gumbel:
                             # Plain Gumbel MuZero: π' = softmax(logits + σ(completedQ)) over legals.
@@ -1563,13 +1698,60 @@ class MuZeroTrainer:
         # game's reanalyze_count is the exact number of times its policy/value
         # targets were recomputed by a (newer) net — decoupling them from the
         # originally-played moves. Persisted via to_compact_dict.
-        touched = {id(g): g for (_, _, g, _) in items}
+        touched = {id(g): g for (_, _, g, _, _) in items}
         for g in touched.values():
             g.reanalyze_count += 1
 
         tqdm.write(f"Step {self.global_step}: reanalyze done ({positions_updated} positions updated, "
-                   f"{len(touched)} games marked)")
+                   f"{len(touched)} games marked, {skipped_opening} opening plies preserved)")
         self.writer.add_scalar("reanalyze/positions_updated", positions_updated, self.global_step)
+        self.writer.add_scalar("reanalyze/opening_plies_skipped", skipped_opening, self.global_step)
+
+    @staticmethod
+    def _forced_draw_sets(game_history, min_repeats: int, include_stalemate: bool):
+        """Per-ply forced-draw root action sets for a buffered game (chess only).
+
+        Reanalyze holds only observations; the repetition state lives in the
+        move history, so the board is reconstructed by replaying the stored
+        actions. Mirrors self-play's ``terminal_draw_move_mask`` semantics so
+        reanalyzed π'/root_value run under the same veto as the original
+        search. Returns a list aligned with ``actions`` whose entries are
+        ``set[int]`` (possibly empty→None) — or None for non-chess games.
+
+        Cheap gates skip the per-move scan where no forced draw is reachable:
+        a repetition needs ≥3 reversible plies behind the root
+        (halfmove_clock ≥ 3), and stalemate/insufficient-material/75-move
+        deliveries outside that window realistically need ≤8 pieces or a
+        near-expired clock. (A fresh-clock many-piece stalemate delivery is
+        composition-land; the GPU mask would catch it, this replay skips it.)
+        """
+        if game_history.game_name != "chess":
+            return None
+        import chess as _chess
+        from ..games.chess import forced_draw_root_actions, _action_to_move
+
+        board = (_chess.Board(game_history.start_fen)
+                 if game_history.start_fen else _chess.Board())
+        out: list = []
+        for a in game_history.actions:
+            fd = None
+            gate = (board.halfmove_clock >= 3
+                    or (include_stalemate
+                        and (len(board.piece_map()) <= 8
+                             or board.halfmove_clock >= 140)))
+            if gate:
+                fd = forced_draw_root_actions(
+                    board, min_repeats=min_repeats,
+                    include_stalemate=include_stalemate)
+            out.append(fd if fd else None)
+            mv = _action_to_move(a, board)
+            if mv is None or mv not in board.legal_moves:
+                # Corrupt decode (should not happen — from_compact_dict already
+                # replayed these actions). Fail open: no veto for the remainder.
+                out.extend([None] * (len(game_history.actions) - len(out)))
+                break
+            board.push(mv)
+        return out
 
     def _policy_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Per-sample cross-entropy between predicted policy and MCTS visit distribution."""
@@ -1884,6 +2066,17 @@ class MuZeroTrainer:
 
         use_gumbel = bool(getattr(self.config, "use_gumbel", False))
         n_frames = getattr(self.config, "history_frames", 1)
+        # Root-terminal-draws veto at eval (2026-07-18): the veto is an intrinsic
+        # part of inference — vetoed continuations are never played in training,
+        # so the net is never taught their draw value, and evaluating without the
+        # veto measures a deliberately-untrained counterfactual (it showed up as
+        # a persistent ~25% stalemate/shuffle draw floor vs random). Chess only.
+        use_draw_veto = False
+        if bool(getattr(self.config, "root_terminal_draws", False)):
+            from ..games.chess import ChessGame, forced_draw_root_actions
+            use_draw_veto = isinstance(self.game, ChessGame)
+            veto_min_repeats = int(getattr(self.config, "root_terminal_draws_min_repeats", 2))
+            veto_stalemate = bool(getattr(self.config, "root_terminal_draws_include_stalemate", True))
         batched = BatchedMCTS(self.network, self.game, self.config, self.device)
         states = [self.game.reset() for _ in range(n_games)]
         ply_obs_history: list[list] = [[] for _ in range(n_games)]
@@ -1910,7 +2103,10 @@ class MuZeroTrainer:
             for k, i in enumerate(agent_idx):
                 ply_obs_history[i].append(single_frames[k])
             legal_list = [self.game.legal_actions(states[i]) for i in agent_idx]
-            roots = batched.run_batch(obs_list, legal_list, add_noise=False)
+            fd_list = ([forced_draw_root_actions(states[i].board, veto_min_repeats, veto_stalemate)
+                        for i in agent_idx] if use_draw_veto else None)
+            roots = batched.run_batch(obs_list, legal_list, add_noise=False,
+                                      forced_draw_actions=fd_list)
             for k, i in enumerate(agent_idx):
                 if use_gumbel:
                     a, _ = select_action_gumbel(roots[k], self.config, self.game.action_space_size)

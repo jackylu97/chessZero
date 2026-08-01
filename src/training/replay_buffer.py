@@ -25,6 +25,22 @@ def _sparsify_policy(dense) -> tuple:
     return (idx, d[idx].astype(np.float32))
 
 
+def _policy_is_empty(p) -> bool:
+    """True for the deliberately-empty (all-zero) policy marker.
+
+    Opening-mix random plies store an all-zero policy: no search ran there and
+    the trainer's policy CE masks zero-sum targets, so the ply carries no
+    policy gradient BY DESIGN. Consumers that rewrite policies (reanalyze) must
+    preserve that mask rather than backfill a target. Accepts the sparse
+    (indices, values) tuple, a dense ndarray, or None.
+    """
+    if p is None:
+        return True
+    if isinstance(p, tuple):
+        return len(p[0]) == 0
+    return not np.any(p)
+
+
 # Standard piece values for the material-margin utility, indexed by the chess
 # observation plane order P,N,B,R,Q (planes 0-4 own / 6-10 opponent). King
 # (plane 5/11) excluded — both sides always have exactly one, so it cancels.
@@ -93,6 +109,15 @@ class GameHistory:
     # resigned side did NOT actually lose (a wrong resignation we avoided).
     resign_holdout: bool = False
     resign_false_positive: bool = False
+    # Full-population trigger stats (2026-07-20, resign_draws_only policy):
+    # resign_triggered — the value head's resign trigger fired in this game
+    # (whether or not any relabel was applied). resign_trigger_fp — the trigger
+    # side did NOT actually lose (trigger accuracy over ALL games, not just the
+    # holdout). resign_tb_veto — a draw-flip was vetoed because the final
+    # position is tablebase-certified drawn. Transient; not serialized.
+    resign_triggered: bool = False
+    resign_trigger_fp: bool = False
+    resign_tb_veto: bool = False
     # True iff this game ever reached a ≤tb_max_pieces (tablebase) position while
     # alive. Drives self_play/tb_reach_rate — "how often does the model even reach
     # the stage where root TB probing fires?" Transient, not serialized.
@@ -254,6 +279,11 @@ class GameHistory:
             d["tb_authored"] = True
         if self.channel_tag:
             d["channel_tag"] = self.channel_tag
+        # POV convention marker (2026-07-22): in-RAM game_outcome is white-POV
+        # everywhere. Legacy anchor archives (gen_tb_anchor_games pre-fix)
+        # wrote first-mover POV WITHOUT this key — from_compact_dict flips
+        # those on load; the marker makes the flip one-shot and idempotent.
+        d["outcome_pov"] = "white"
         return d
 
     @classmethod
@@ -304,6 +334,18 @@ class GameHistory:
         gh.channel_tag = str(d.get("channel_tag", ""))
         start_fen = d.get("start_fen")
         gh.start_fen = start_fen
+        # POV migration (2026-07-22): legacy TB-anchor dicts (both the on-disk
+        # anchor archive and anchors inside pre-fix .buf saves) stored
+        # game_outcome in FIRST-MOVER POV and carry no outcome_pov marker.
+        # Everything else was already white-POV (chess_gpu winner). For an
+        # unmarked tb_authored game with a black-to-move start, first-mover POV
+        # differs from white-POV by a sign — normalize once here. Post-fix
+        # dicts always carry outcome_pov="white" (see to_compact_dict), so the
+        # flip can never double-apply.
+        if d.get("outcome_pov") != "white" and gh.tb_authored and start_fen:
+            parts = start_fen.split()
+            if len(parts) > 1 and parts[1] == "b":
+                gh.game_outcome = -gh.game_outcome
         if start_fen is not None and hasattr(game, "reset_from_fen"):
             state = game.reset_from_fen(start_fen)
         else:
@@ -414,11 +456,25 @@ class GameHistory:
         # Lazy import to avoid model→buffer import cycle.
         from src.model.utils import eval_to_wdl as _eval_to_wdl
 
+        # Ply-parity → color. Ply 0 is white ONLY for standard starts; a
+        # black-to-move start_fen (≈half the endgame seed archive) inverts the
+        # parity. game_outcome is white-POV everywhere (chess_gpu winner;
+        # legacy first-mover-POV anchor dicts are normalized in
+        # from_compact_dict). Before 2026-07-22 this assumed ply 0 = white,
+        # inverting targets on black-start games wherever the TB blend didn't
+        # mask it (exposed at the terminal index; a landmine at every ply the
+        # moment tb_value_weight < 1).
+        start_is_white = True
+        if self.start_fen:
+            parts = self.start_fen.split()
+            if len(parts) > 1 and parts[1] == "b":
+                start_is_white = False
+
         def _outcome_onehot(ply_idx: int) -> np.ndarray:
             """STM-relative one-hot of the actual game outcome at ply_idx."""
             if self.game_outcome == 0.0:
                 return wdl_draw
-            stm_is_white = (ply_idx % 2 == 0)
+            stm_is_white = start_is_white == (ply_idx % 2 == 0)
             stm_won = (self.game_outcome > 0.0) == stm_is_white
             return wdl_w if stm_won else wdl_l
 
@@ -592,7 +648,9 @@ class GameHistory:
                     # Warmstart path: external targets are already side-to-move-relative.
                     value = self.external_values[idx]
                 elif td_steps == -1:
-                    sign = 1.0 if (idx % 2 == 0) else -1.0
+                    # STM-POV sign of the white-POV outcome (start_fen-aware,
+                    # same parity rule as _outcome_onehot above).
+                    sign = 1.0 if (start_is_white == (idx % 2 == 0)) else -1.0
                     value = sign * self.game_outcome
                 else:
                     bootstrap_idx = idx + td_steps
